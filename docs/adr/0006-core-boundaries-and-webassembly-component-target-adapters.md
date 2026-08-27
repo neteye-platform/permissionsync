@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
@@ -221,6 +221,20 @@ reviewable. Any failed gate keeps the ADR Proposed.
     adapter lifecycle state. FAIL: unmanaged assignment or constraint state
     changes, or shared persistence is required for correctness.
 
+## Validation
+
+All eleven feasibility gates above pass with executable, reviewable evidence.
+An executable suite (`tests/architecture/adr-0006-wasm/`) runs a Wasmtime 48
+host carriage of guest-agnostic Target Adapters across two independent guest
+toolchains (Rust and TinyGo) and machine-checks every gate against the real host
+stdout/stderr and the fake servers' observable state.
+
+The recorded evidence is at
+[`evidence/0006-wasm-feasibility.md`](evidence/0006-wasm-feasibility.md). It is
+historical architecture evidence: the host runtime, WIT contract, and adapter
+implementations there are feasibility stand-ins and do not constrain the
+production implementation. The deferred decisions remain open.
+
 ## Consequences
 
 Adapters can be built, tested, versioned, distributed, and replaced separately
@@ -228,9 +242,10 @@ from PermissionSync. Compatible implementations can come from multiple language
 toolchains, while the core keeps its generic orchestration boundary.
 
 The approach adds runtime, contract, sandbox, compatibility, operational, and
-testing complexity. It is not accepted until the feasibility gates establish
-that at least one viable host runtime can uphold the stated boundaries; this
-ADR still does not select the production runtime engine.
+testing complexity. The feasibility gates establish that at least one viable
+host runtime (Wasmtime, here) can uphold the stated boundaries, and the ADR is
+accepted on that basis; it still does not select the production runtime engine.
+
 
 ## Deferred Decisions
 

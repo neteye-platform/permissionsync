@@ -1,0 +1,113 @@
+// Poison component for Gate 2 (admission compatibility) — "unprovided import"
+// case. Unlike bad-adapter (wrong exports), this one has the correct
+// `adapter-api` export shape but declares an ADDITIONAL import interface
+// (`secret-vault`) that the host does not supply in its linker. The host's
+// deny-by-default linker only provides `http`, `runtime`, and the WASI p2
+// imports; a component that imports anything else fails instantiation at
+// admission, before any provider resolution / reconcile / target mutation.
+
+package permissionsync:adr0006@0.1.0;
+
+/// ADR 0005 canonical v1 desired-permission model (transport stand-in).
+interface permissions {
+    enum propagation {
+        self-only,
+        descendants,
+    }
+
+    record scope {
+        scope-type: string,
+        id: string,
+        propagation: propagation,
+    }
+
+    enum assignment-kind {
+        role,
+        group,
+        entitlement,
+    }
+
+    record assignment {
+        kind: assignment-kind,
+        id: string,
+        scope: option<scope>,
+    }
+
+    record constraint {
+        constraint-type: string,
+        values: list<string>,
+    }
+
+    record document {
+        version: u32,
+        assignments: list<assignment>,
+        constraints: list<constraint>,
+    }
+}
+
+interface runtime {
+    record context-item {
+        key: string,
+        value: string,
+    }
+
+    record snapshot {
+        config: list<context-item>,
+        secrets: list<context-item>,
+    }
+
+    get-context: func() -> snapshot;
+
+    remaining-deadline: func() -> option<u64>;
+}
+
+interface http {
+    record header {
+        name: string,
+        value: string,
+    }
+
+    record http-response {
+        status: u16,
+        body: list<u8>,
+    }
+
+    call: func(
+        method: string,
+        url: string,
+        headers: list<header>,
+        body: option<list<u8>>,
+    ) -> result<http-response, string>;
+}
+
+interface adapter-api {
+    use permissions.{document};
+
+    record target-effect {
+        assignment-id: string,
+        action: string,
+    }
+
+    record outcome {
+        received: document,
+        effects: list<target-effect>,
+        diagnostics: list<string>,
+        context-keys: list<string>,
+    }
+
+    reconcile: func(doc: document) -> result<outcome, string>;
+}
+
+/// Extra capability a conforming adapter does NOT declare. The host does not
+/// provide it, so a component importing it is refused at admission.
+interface secret-vault {
+    get: func(key: string) -> string;
+}
+
+world adapter-missing-import {
+    import http;
+    import runtime;
+    import secret-vault;
+
+    export adapter-api;
+}

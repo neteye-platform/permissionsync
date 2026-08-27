@@ -1,0 +1,140 @@
+// ADR 0006 feasibility PoC — shared WebAssembly Component Model contract.
+//
+// This is a PoC implementation choice. The exact production WIT packages,
+// worlds, functions, types, and errors are deferred by ADR 0006 (see
+// "Deferred Decisions"). This world is deliberately as small as possible so
+// that a host-mediated, least-privilege runtime context is the only surface
+// a guest adapter can reach: there are no WASI filesystem, environment,
+// process, or exit imports in this world.
+//
+// The vocabulary below mirrors ADR 0005's canonical v1 desired-permission
+// model. The host and every guest toolchain compile against this single file,
+// which is what makes Gate 3 (language independence) and Gate 2 (admission
+// compatibility) meaningful: all artifacts must satisfy one unchanged
+// contract.
+
+package permissionsync:adr0006@0.1.0;
+
+/// The ADR 0005 canonical v1 desired-permission model, transported intact.
+interface permissions {
+    // `self-only` is the WIT spelling of ADR 0005's `self` propagation value
+    // ("self" is a reserved word in WIT identifiers).
+    enum propagation {
+        /// Scope applies to the object itself only (ADR 0005 `self`).
+        self-only,
+        /// Scope applies to the object and its descendants.
+        descendants,
+    }
+
+    record scope {
+        scope-type: string,
+        id: string,
+        propagation: propagation,
+    }
+
+    enum assignment-kind {
+        role,
+        group,
+        entitlement,
+    }
+
+    record assignment {
+        kind: assignment-kind,
+        id: string,
+        scope: option<scope>,
+    }
+
+    record constraint {
+        constraint-type: string,
+        values: list<string>,
+    }
+
+    record document {
+        version: u32,
+        assignments: list<assignment>,
+        constraints: list<constraint>,
+    }
+}
+
+/// Adapter runtime context: configuration and secrets for the *selected*
+/// target only. This is the conceptual stand-in for the deferred
+/// `config.get`-style or `secrets.get`-style APIs named in ADR 0006.
+interface runtime {
+    record context-item {
+        key: string,
+        value: string,
+    }
+
+    record snapshot {
+        config: list<context-item>,
+        secrets: list<context-item>,
+    }
+
+    /// Configuration + secrets visible to the current component invocation for
+    /// the selected target only. Keys and values are both present here; the
+    /// host guarantees the adapter can only ever see its own target's items.
+    get-context: func() -> snapshot;
+
+    /// Millisecond budget remaining for this reconciliation, if the host
+    /// imposed a deadline. Lets well-behaved adapters bound their own work
+    /// (Gate 8).
+    remaining-deadline: func() -> option<u64>;
+}
+
+/// Host-mediated outbound HTTPS. The host enforces the destination allowlist,
+/// supplies explicit TLS trust (a CA specific to the configured target), and
+/// bounds the operation by the remaining deadline. The guest never talks to
+/// the network directly; there is no unrestricted egress path available to it.
+interface http {
+    record header {
+        name: string,
+        value: string,
+    }
+
+    record http-response {
+        status: u16,
+        body: list<u8>,
+    }
+
+    call: func(
+        method: string,
+        url: string,
+        headers: list<header>,
+        body: option<list<u8>>,
+    ) -> result<http-response, string>;
+}
+
+/// The interface a Target Adapter implements (its exports to the host).
+interface adapter-api {
+    use permissions.{document};
+
+    record target-effect {
+        assignment-id: string,
+        action: string,
+    }
+
+    record outcome {
+        /// Faithful, validated echo of the document the component actually
+        /// saw. Used to prove no value is dropped, rewritten, weakened, or
+        /// defaulted (Gate 4).
+        received: document,
+        /// Effects the adapter asked the target to apply (e.g. grant/revoke).
+        effects: list<target-effect>,
+        /// Safe diagnostics only — never secrets, never desired-state bodies.
+        diagnostics: list<string>,
+        /// Keys of the config/secrets the component could actually read for
+        /// its selected target (keys only, never values) — Gate 5 evidence.
+        context-keys: list<string>,
+    }
+
+    /// The single reconciliation entry point the host invokes exactly once per
+    /// request (Gate 9).
+    reconcile: func(doc: document) -> result<outcome, string>;
+}
+
+world adapter {
+    import http;
+    import runtime;
+
+    export adapter-api;
+}

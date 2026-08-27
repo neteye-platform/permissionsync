@@ -1,0 +1,19 @@
+[package]
+name = "adapter-process"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "permissionsync:adr0006"
+
+# Point cargo-component at the single shared canonical WIT (../../wit) instead of
+# carrying a per-crate copy, so bindings.rs is regenerated from one source of truth.
+[package.metadata.component.target]
+path = "../../wit"
+world = "adapter"
+
+[dependencies]
+wit-bindgen-rt = { version = "0.44.0", features = ["bitflags"] }
