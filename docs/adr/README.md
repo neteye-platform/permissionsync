@@ -55,4 +55,4 @@ Each ADR uses these sections:
 7. [0007](0007-runtime-configuration-oci-and-observability.md) Runtime
    Configuration, Stateless OCI Operation, and Safe Observability (Accepted)
 8. [0008](0008-target-adapter-packaging-distribution-and-lifecycle.md) Target
-   Adapter Packaging, Distribution, and Lifecycle (Proposed)
+   Adapter Packaging, Distribution, and Lifecycle (Accepted)

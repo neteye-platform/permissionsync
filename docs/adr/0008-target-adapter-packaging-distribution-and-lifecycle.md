@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
@@ -188,29 +188,33 @@ artifact retention work, and requires two-stage coordination between artifact
 release and deployment staging. Rolling replacement is simpler and more
 auditable than hot reload.
 
-## Validation Before Acceptance
+## Acceptance Validation
 
-Before ADR activation, a small deployment spike validates operational
-realizability. Acceptance follows architecture and team review plus confirmation
-of these scenarios; this is not a new feasibility-gate framework.
+The three technical validation scenarios below passed, exercised by a small
+deployment spike
+([`tests/architecture/adr-0008-packaging/spike.py`](../../tests/architecture/adr-0008-packaging/spike.py))
+and recorded as historical evidence in
+[`docs/adr/evidence/0008-packaging-validation.md`](evidence/0008-packaging-validation.md).
+Final activation occurs through review and merge of the change marking this
+ADR Accepted. This was not a new feasibility-gate framework.
 
 - **Offline replica recovery.** After successful staging, with external Internet
-  unavailable and deployment-local infrastructure available, recreate a fresh
-  Pod or replica, including cold-node scheduling. The loader obtains the exact
+  unavailable and deployment-local infrastructure available, a fresh replica,
+  including cold-node scheduling, is recreated. The loader obtains the exact
   selected artifacts only from the deployment-local source, and PermissionSync
   starts without public or external access or a warm cache.
-- **Atomic selected-set materialization.** Configure at least two selected
-  artifacts, A and B. A is available and valid; B is missing, digest-mismatched,
-  or untrusted. Expected result: the loader fails, the PermissionSync
-  application container does not start, and no partial A-only adapter set
-  becomes active. Then make B valid and available and confirm startup succeeds.
-- **Exact-version and no-fallback enforcement.** Make two versions or digests of
-  one adapter available locally, A@sha256:OLD and A@sha256:NEW. Configure the
-  deployment to select A@sha256:NEW, then make NEW unavailable or invalid while
-  OLD remains available. Expected result: startup fails and OLD is not selected
-  automatically. Restore NEW and verify that the replica starts using exactly
-  NEW. This proves that deployment configuration is authoritative and that no
-  previous version or digest is selected automatically.
+- **Atomic selected-set materialization.** With at least two selected artifacts,
+  A and B, where A is available and valid and B is missing, digest-mismatched,
+  or untrusted: the loader fails, the PermissionSync application container does
+  not start, and no partial A-only adapter set becomes active. Making B valid
+  and available yields a successful startup.
+- **Exact-version and no-fallback enforcement.** With two versions or digests of
+  one adapter available locally, A@sha256:OLD and A@sha256:NEW, and the
+  deployment selecting A@sha256:NEW: making NEW unavailable or invalid while OLD
+  remains available fails startup and OLD is not selected automatically.
+  Restoring NEW has the replica start using exactly NEW. This confirms that
+  deployment configuration is authoritative and that no previous version or
+  digest is selected automatically.
 
 ## Deferred Decisions
 

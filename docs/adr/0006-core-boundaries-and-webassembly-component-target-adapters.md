@@ -101,6 +101,13 @@ core branches are rejected.
 
 ### Routing and Invocation
 
+This section governs target-local routing and component behavior **after** the
+deployment-selected adapter artifact set has been successfully materialized for
+that deployment. Artifact selection, exact-version pinning, atomic
+materialization of the selected set, and offline availability are owned by
+ADR 0008; an unmaterialized or partially materialized selected set is a
+deployment/lifecycle condition handled there, not here.
+
 `client_id` resolves target routing. An unconfigured `client_id` and an
 explicitly unmanaged target return `200` as no-ops, with no provider or
 component call. A selected managed component that is unavailable, disabled,
