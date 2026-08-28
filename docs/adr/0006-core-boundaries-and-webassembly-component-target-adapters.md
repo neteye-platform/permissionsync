@@ -246,7 +246,6 @@ testing complexity. The feasibility gates establish that at least one viable
 host runtime (Wasmtime, here) can uphold the stated boundaries, and the ADR is
 accepted on that basis; it still does not select the production runtime engine.
 
-
 ## Deferred Decisions
 
 This ADR defers:

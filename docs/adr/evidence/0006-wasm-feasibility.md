@@ -37,13 +37,13 @@ environment, process, or exit imports** in this world.
 
 ---
 
-# Gate 1 — Independent lifecycle
+## Gate 1 — Independent lifecycle
 
 - **Verdict:** PASS
 - **Requirement:** ≥2 independently built component artifacts are selectable /
   replaceable without rebuilding core.
 - **Implementation:** two separately built components (`rust-adapter`,
-  `go-adapter`) are run by the *same* prebuilt host binary.
+  `go-adapter`) are run by the _same_ prebuilt host binary.
 - **Tests:** `gate1_independent_lifecycle` runs host against rust then go.
 - **Evidence:** both `rc=0` with `RECEIVED=` + `EFFECT grant`. Lifecycle rust &
   go both PASS.
@@ -51,13 +51,13 @@ environment, process, or exit imports** in this world.
 - **Caveats:** the host does no per-component release/build; swapping is a
   config selection of an already-compiled `.wasm`.
 
-# Gate 2 — Admission compatibility
+## Gate 2 — Admission compatibility
 
 - **Verdict:** PASS
 - **Requirement:** an incompatible component is rejected during admission,
   before provider resolution / reconciliation / target mutation.
 - **Implementation:** host `admit()` instantiates the component (which must
-  export `adapter-api`) *before* the provider is contacted.
+  export `adapter-api`) _before_ the provider is contacted.
 - **Tests:** `gate2_admission_compatibility` uses two distinct incompatibility
   cases:
   - `bad-adapter` — component with **no `adapter-api` export**.
@@ -78,7 +78,7 @@ environment, process, or exit imports** in this world.
   catch — a wrong export shape **and** an unprovided import — proving the
   deny-by-default linker refuses both before any work is done.
 
-# Gate 3 — Language independence
+## Gate 3 — Language independence
 
 - **Verdict:** PASS
 - **Requirement:** two guest toolchains, incl. one non-Rust, produce components
@@ -92,7 +92,7 @@ environment, process, or exit imports** in this world.
   `adapters/go-adapter/wit-build/` via `tinygo build -target=wasip2
   -wit-package=./wit-build -wit-world=adapter-build -o adapter_go.wasm .`.
 
-# Gate 4 — Model fidelity
+## Gate 4 — Model fidelity
 
 - **Verdict:** PASS
 - **Requirement:** role/group/entitlement, unscoped, `self`+`descendants`
@@ -103,37 +103,38 @@ environment, process, or exit imports** in this world.
   saw; adapters validate against allow-lists before reconciling.
 - **Tests:**
   - `valid` variant → task: role `editor` (scoped `resource-boundary`/`self`),
-    group `release-managers` (scoped `org`), entitlement `packet-capture-
-    download` (unscoped), constraints `network:[collector-a,collector-b]` +
-    `interface:[collector-a]`, `version:1`. In addition to the keyword probes,
-    a **deep-equal fidelity assert** normalizes the host's `RECEIVED` (WIT
-    records serialize snake_case) back to the provider's kebab-case transport
-    doc and requires field-for-field equality with the served `/document`.
+    group `release-managers` (scoped `org`), entitlement
+    `packet-capture-download` (unscoped), constraints
+    `network:[collector-a,collector-b]` + `interface:[collector-a]`,
+    `version:1`. In addition to the keyword probes, a **deep-equal fidelity
+    assert** normalizes the host's `RECEIVED` (WIT records serialize
+    snake_case) back to the provider's kebab-case transport doc and requires
+    field-for-field equality with the served `/document`.
   - `repeat-scope` → the same role id `editor` granted across two distinct
     scopes with a mixed group/entitlement set: a VALID multi-scope transport,
     both adapters accept (`EFFECT grant`).
-  - `descendants` → rust accepts, go rejects `unsupported propagation
-    'descendants'`.
+  - `descendants` → rust accepts, go rejects
+    `unsupported propagation 'descendants'`.
   - `unsupported-role` → both reject `unsupported role`.
   - `unsupported-version` → both reject `unsupported model version 99`.
   - Adapter-semantic rejection variants (structurally valid, so the adapter
     IS invoked and rejects; suite asserts one provider fetch, the adapter's
     diagnostic, and no mutation) for both rust and go:
-    `unknown-group` → `unsupported group 'ops-admin'`, `unknown-entitlement`
-    → `unsupported entitlement 'log-export'`, `unsupported-scope-type` →
-    `unsupported scope type 'team'`, `unknown-scope-id` → `unsupported scope
-    id 'zanzibar'`, `unsupported-constraint-type` → `unsupported constraint
-    type 'budget'`, `invalid-constraint-value` → `unsupported interface value
-    'collector-zzz'`, `unsupported-combination` → `unsupported
-    assignment/constraint combination` (interface constraint with no
-    role/group assignment; the mirror `allowed`-with-no-entitlement rule is
-    implemented in both adapters).
+    `unknown-group` → `unsupported group 'ops-admin'`,
+    `unknown-entitlement` → `unsupported entitlement 'log-export'`,
+    `unsupported-scope-type` → `unsupported scope type 'team'`,
+    `unknown-scope-id` → `unsupported scope id 'zanzibar'`,
+    `unsupported-constraint-type` → `unsupported constraint type 'budget'`,
+    `invalid-constraint-value` → `unsupported interface value 'collector-zzz'`,
+    `unsupported-combination` → `unsupported assignment/constraint combination`
+    (interface constraint with no role/group assignment; the mirror
+    `allowed`-with-no-entitlement rule is implemented in both adapters).
   - Core-side structural variants (rejected by the host before the adapter is
     invoked, so provider fetch == 1 and no component invocation / mutation):
-    `duplicate-constraint` → `duplicate constraint type 'X'`, `malformed-constraint`
-    → `malformed constraint: empty constraint-type`, `partial-scope` → `partial
-    scope: missing propagation`, `unsupported-kind` → `unknown assignment kind
-    'superuser'`.
+    `duplicate-constraint` → `duplicate constraint type 'X'`,
+    `malformed-constraint` → `malformed constraint: empty constraint-type`,
+    `partial-scope` → `partial scope: missing propagation`,
+    `unsupported-kind` → `unknown assignment kind 'superuser'`.
 - **Evidence:** all fidelity checks PASS; the deep-equal assert confirms the
   whole v1 model (assignments minus order-independence quirk aside — see below
   — incl. scopes + constraints + version) survives intact; `repeat-scope` shows
@@ -152,12 +153,12 @@ environment, process, or exit imports** in this world.
   arrays are compared positionally; the transport is lossless for the v1 model
   shape used here.
 
-# Gate 5 — Context isolation
+## Gate 5 — Context isolation
 
 - **Verdict:** PASS
-- **Requirement:** desired state has no config/secrets; selected target config
-  + ≥1 secret can be provided; unrelated target config/secrets unavailable;
-  secrets absent from logs.
+- **Requirement:** desired state has no config/secrets; the selected target
+  configuration and at least one secret can be provided; unrelated target
+  config/secrets unavailable; secrets absent from logs.
 - **Implementation:** host passes only the selected target's config
   (`endpoint`, `client`) + secret (`token`) via `runtime::get_context`, plus
   per-route extra `context_config`/`context_secrets` items.
@@ -178,7 +179,7 @@ environment, process, or exit imports** in this world.
   tokens (that is their purpose); the gate requires them absent from
   **logs/output**, which the host and fake-target both satisfy.
 
-# Gate 6 — Default-deny capabilities
+## Gate 6 — Default-deny capabilities
 
 - **Verdict:** PASS
 - **Requirement:** ungranted filesystem/environment/process denied; allowlisted
@@ -207,7 +208,7 @@ environment, process, or exit imports** in this world.
 - **Caveats:** the fake target cert is trusted via the explicit `ca.crt`; this
   is the "explicitly supplied trust" the gate names.
 
-# Gate 7 — Bounded resources
+## Gate 7 — Bounded resources
 
 - **Verdict:** PASS
 - **Requirement:** deliberate memory exhaustion is denied/trapped before host
@@ -220,7 +221,7 @@ environment, process, or exit imports** in this world.
 - **Caveats:** limits cover linear memory; the store-limiter path is the
   general trap table used by the boundary.
 
-# Gate 8 — Deadline and cancellation
+## Gate 8 — Deadline and cancellation
 
 - **Verdict:** PASS
 - **Requirement:** CPU-bound component and stalled outbound are interrupted /
@@ -239,7 +240,7 @@ environment, process, or exit imports** in this world.
   `500`); effects already issued before a deadline are intentionally left
   uncertain — the PoC issues no rollback, matching the gate's wording.
 
-# Gate 9 — Invocation accounting
+## Gate 9 — Invocation accounting
 
 - **Verdict:** PASS
 - **Requirement:** one provider call, one component call, no automatic retry.
@@ -260,7 +261,7 @@ environment, process, or exit imports** in this world.
   because the host performs no retry; the instrumented counter makes that
   invariant machine-visible rather than assumed.
 
-# Gate 10 — Routing isolation
+## Gate 10 — Routing isolation
 
 - **Verdict:** PASS
 - **Requirement:** an unconfigured/unmanaged route performs zero provider or
@@ -269,7 +270,7 @@ environment, process, or exit imports** in this world.
 - **Implementation:** host `route <registry.json> <route-key>` subcommand resolves
   a key from an explicit multi-route registry. The three reachable states are
   distinct per ADR 0006 (an unconfigured/unmanaged route is a successful no-op
-  with provider=0 and adapter=0; a *managed* route whose component is missing or
+  with provider=0 and adapter=0; a _managed_ route whose component is missing or
   incompatible is an error): admission before provider fetch isolates bad routes.
 - **Tests:** `gate10_routing_isolation` with a registry containing an unmanaged
   route, a managed-missing route, a managed-incompatible route, and a valid
@@ -288,7 +289,7 @@ environment, process, or exit imports** in this world.
 - **Caveats:** routing here is a per-process CLI; the registry JSON models the
   persistent multi-route config the ADR anticipates.
 
-# Gate 11 — Managed authority and statelessness
+## Gate 11 — Managed authority and statelessness
 
 - **Verdict:** PASS
 - **Requirement:** only managed assignment/constraint state mutates; unmanaged
@@ -309,21 +310,21 @@ environment, process, or exit imports** in this world.
 
 ---
 
-# Overall Verdict
+## Overall Verdict
 
-| Gate | Name                          | Verdict |
-|------|-------------------------------|---------|
-| 1    | Independent lifecycle         | PASS    |
-| 2    | Admission compatibility       | PASS    |
-| 3    | Language independence         | PASS    |
-| 4    | Model fidelity                | PASS    |
-| 5    | Context isolation             | PASS    |
-| 6    | Default-deny capabilities     | PASS    |
-| 7    | Bounded resources             | PASS    |
-| 8    | Deadline and cancellation     | PASS    |
-| 9    | Invocation accounting         | PASS    |
-| 10   | Routing isolation             | PASS    |
-| 11   | Managed authority & statelessness | PASS |
+| Gate | Name                              | Verdict |
+| ---- | --------------------------------- | ------- |
+| 1    | Independent lifecycle             | PASS    |
+| 2    | Admission compatibility           | PASS    |
+| 3    | Language independence             | PASS    |
+| 4    | Model fidelity                    | PASS    |
+| 5    | Context isolation                 | PASS    |
+| 6    | Default-deny capabilities         | PASS    |
+| 7    | Bounded resources                 | PASS    |
+| 8    | Deadline and cancellation         | PASS    |
+| 9    | Invocation accounting             | PASS    |
+| 10   | Routing isolation                 | PASS    |
+| 11   | Managed authority & statelessness | PASS    |
 
 **Overall feasibility verdict:** Feasible — all 11 feasibility gates PASS with
 executable, reviewable evidence. A Wasmtime 48 host carriage of guest-agnostic

@@ -54,3 +54,5 @@ Each ADR uses these sections:
    Core Boundaries and WebAssembly Component Target Adapters (Accepted)
 7. [0007](0007-runtime-configuration-oci-and-observability.md) Runtime
    Configuration, Stateless OCI Operation, and Safe Observability (Accepted)
+8. [0008](0008-target-adapter-packaging-distribution-and-lifecycle.md) Target
+   Adapter Packaging, Distribution, and Lifecycle (Proposed)

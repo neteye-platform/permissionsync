@@ -28,17 +28,20 @@ The recorded, machine-checked evidence lives at
 
 ## Layout
 
-```
+```text
 wit/permissions.wit            Single shared WIT contract (world `adapter`)
 host/                          Wasmtime 48 host (load, admit, context, egress)
 adapters/                      Guest adapters (one per toolchain / scenario)
   rust-adapter/                Rust (wasm32-wasip2) — supports self + descendants
   go-adapter/                  TinyGo (wasip2) — rejects descendants (Gate 4 negative)
   bad-adapter/                 Non-conforming component (Gate 2 admission reject)
-  missing-import-adapter/      Correct export shape but an unprovided import (Gate 2)
-  egress-adapter/              Valid component that tries egress outside allowlist (Gate 6)
+  missing-import-adapter/      Correct export shape but an unprovided import
+                                (Gate 2)
+  egress-adapter/              Valid component that tries egress outside
+                                allowlist (Gate 6)
   wasi-adapter/                Valid component that tries env/fs access (Gate 6)
-  process-adapter/             Valid component that tries process execution (Gate 6)
+  process-adapter/             Valid component that tries process execution
+                                (Gate 6)
   runaway-mem-adapter/         OOM runaway (Gate 7)
   runaway-cpu-adapter/         CPU runaway (Gate 8)
 fake-provider/                 Serves canonical desired-permission documents + variants
