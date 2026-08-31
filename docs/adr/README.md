@@ -51,8 +51,11 @@ Each ADR uses these sections:
 5. [0005](0005-bounded-desired-permission-model.md) Bounded Desired-Permission
    Model (Accepted)
 6. [0006](0006-core-boundaries-and-webassembly-component-target-adapters.md)
-   Core Boundaries and WebAssembly Component Target Adapters (Accepted)
+   Core Boundaries and WebAssembly Component Target Adapters
+   (Superseded by ADR 0009)
 7. [0007](0007-runtime-configuration-oci-and-observability.md) Runtime
    Configuration, Stateless OCI Operation, and Safe Observability (Accepted)
 8. [0008](0008-target-adapter-packaging-distribution-and-lifecycle.md) Target
-   Adapter Packaging, Distribution, and Lifecycle (Accepted)
+   Adapter Packaging, Distribution, and Lifecycle (Superseded by ADR 0009)
+9. [0009](0009-compile-time-rust-target-adapters.md) Core Boundaries and
+   Compile-Time Rust Target Adapters (Accepted)

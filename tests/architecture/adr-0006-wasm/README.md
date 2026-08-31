@@ -1,5 +1,10 @@
 # ADR 0006 — WebAssembly Component Target Adapter Feasibility Suite
 
+> **Historical supersession:** This is historical evidence for superseded ADR
+> 0006. It proves the former WebAssembly architecture was feasible and
+> validated, but does not describe the current selected production architecture
+> (ADR 0009).
+>
 > **Historical architecture validation — not production code.**
 >
 > This directory is the executable feasibility evidence for **ADR 0006**. It

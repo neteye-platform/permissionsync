@@ -2,7 +2,12 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR 0009](0009-compile-time-rust-target-adapters.md)
+
+> **Historical clarification:** This ADR defined the former independent WASM
+> artifact model. ADR 0009 eliminates independent runtime adapter artifacts, so
+> adapter OCI distribution, loader materialization, digest selection, and
+> exact-artifact startup semantics are not active.
 
 ## Context
 
@@ -195,8 +200,8 @@ deployment spike
 ([`tests/architecture/adr-0008-packaging/spike.py`](../../tests/architecture/adr-0008-packaging/spike.py))
 and recorded as historical evidence in
 [`docs/adr/evidence/0008-packaging-validation.md`](evidence/0008-packaging-validation.md).
-Final activation occurs through review and merge of the change marking this
-ADR Accepted. This was not a new feasibility-gate framework.
+The scenarios passed while evaluating this design; they remain historical
+evidence for superseded ADR 0008 and do not validate ADR 0009.
 
 - **Offline replica recovery.** After successful staging, with external Internet
   unavailable and deployment-local infrastructure available, a fresh replica,
@@ -238,6 +243,7 @@ This ADR defers:
 - [ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md)
 - [ADR 0006](0006-core-boundaries-and-webassembly-component-target-adapters.md)
 - [ADR 0007](0007-runtime-configuration-oci-and-observability.md)
+- [ADR 0009](0009-compile-time-rust-target-adapters.md) (superseding decision)
 - [ADR index](README.md)
 - [OCI Distribution Specification](https://github.com/opencontainers/distribution-spec/blob/main/spec.md)
 - [OCI Image Specification, descriptor and content digest](https://github.com/opencontainers/image-spec/blob/main/descriptor.md)

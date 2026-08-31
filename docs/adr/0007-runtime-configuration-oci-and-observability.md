@@ -17,6 +17,14 @@ PermissionSync is one generic, immutable, versioned binary and OCI image. The
 same artifact is reusable across deployments. It must not embed deployment
 URLs, credentials, permission data, target instances, or environment trust.
 
+After successful installation or upgrade, normal replica creation and recovery
+including restart, eviction, replacement, node reboot, relocation, and
+cold-node scheduling MUST NOT require public or external registry connectivity.
+Therefore, the selected PermissionSync OCI image MUST be available through
+deployment-local infrastructure or equivalent offline installation or upgrade
+media. Image availability is deployment infrastructure, not PermissionSync
+application state.
+
 All deployment-specific values are runtime configuration:
 
 - Inbound configuration specifies issuer, JWKS or discovery URL, optional
@@ -25,9 +33,11 @@ All deployment-specific values are runtime configuration:
 - Provider configuration specifies type, endpoint, credentials, TLS or trust
   settings including private CAs, and shorter per-operation timeouts.
 - Target configuration specifies client_id mapping, managed or unmanaged
-  status, and adapter. Endpoint, authentication or credentials, TLS or trust
-  settings including private CAs, and adapter-specific values are included only
-  when required by the selected adapter contract.
+  status, and a logical adapter identifier. The identifier is resolved
+  deterministically against adapters compiled into the current binary.
+  Endpoint, credentials, TLS or trust settings including private CAs, and
+  adapter-specific values are included only when required by the selected
+  adapter contract.
 - Runtime configuration specifies listen address and port, shorter per-operation
   timeouts, bounded synchronization concurrency or capacity, one bounded overall
   synchronization deadline, logging, and metrics.
@@ -55,13 +65,17 @@ choosing health or status mechanisms.
 
 Isolated target-local errors are detected eagerly where practical, but make only
 that managed target unusable. The selected adapter contract determines which
-target configuration is required. Errors include a selected adapter that is
-unavailable, disabled, or incompatible; a missing required target endpoint or
-required target credentials; a malformed configured endpoint; invalid
+target configuration is required. Errors include a configured adapter
+identifier absent from the current compiled-in registry; missing required
+target endpoint or credentials; a malformed configured endpoint; invalid
 target-specific TLS or trust configuration where applicable; and missing or
-invalid required adapter-specific configuration. The service may remain ready.
-A selected unusable managed target returns `500`; other valid managed targets
-process normally, and unmanaged or unconfigured targets remain `200` no-ops.
+invalid required adapter-specific configuration. A target-local adapter
+identifier absent from the compiled-in registry is eagerly detected where
+practical. When detectable, no Permission Provider or Target Adapter work
+begins for that target. The service may remain ready. A selected unusable
+managed target returns `500` only for that target; other valid managed
+targets process normally, and unrelated unmanaged or unconfigured targets
+remain serviceable as `200` no-ops.
 Runtime unavailability after valid configuration remains a synchronization
 failure.
 
@@ -89,10 +103,11 @@ Valid managed work acquires bounded synchronization capacity before provider
 work. Local saturation, including inability to acquire capacity before the
 overall deadline, is a synchronization failure and returns `500`, never a
 successful no-op. No Permission Provider or Target Adapter work begins. The
-overall deadline and cancellation are propagated through authentication
-verification, capacity waits, provider work, and adapter operations wherever
-practical. Cancellation is best effort. Downstream requests or effects already
-issued remain uncertain, with no rollback or undo guarantee.
+overall deadline and cancellation are passed through authentication
+verification, capacity waits, provider work, and adapter operations on a
+best-effort basis. This does not promise arbitrary in-process adapter work can
+be hard-interrupted. Downstream requests or effects already issued remain
+uncertain, with no rollback or undo guarantee.
 
 In-flight synchronization and capacity are bounded so slow downstreams cannot
 exhaust the runtime. The capacity mechanism and limits remain deferred.
@@ -140,10 +155,13 @@ and bounded downstream work protects runtime capacity. Future specifications
 must preserve these boundaries and make the deferred operational details
 explicit.
 
+Any adapter change is a new PermissionSync binary and OCI image release; there
+is no independent runtime adapter artifact.
+
 ## References
 
 - [ADR 0001](0001-inbound-synchronization-contract.md)
 - [ADR 0002](0002-receiver-side-jwt-verification.md)
 - [ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md)
 - [ADR 0005](0005-bounded-desired-permission-model.md)
-- [ADR 0006](0006-core-boundaries-and-webassembly-component-target-adapters.md)
+- [ADR 0009](0009-compile-time-rust-target-adapters.md)

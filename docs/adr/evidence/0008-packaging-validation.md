@@ -1,5 +1,10 @@
 # ADR 0008 — Packaging, Distribution, and Lifecycle Validation Evidence
 
+> **Historical supersession:** This is historical evidence for superseded ADR
+> 0008. It proves the former independent WASM packaging architecture was
+> feasible and validated, but does not describe the current selected production
+> architecture ([ADR 0009](../0009-compile-time-rust-target-adapters.md)).
+
 This file records the executable evidence for the **ADR 0008** acceptance
 scenarios, produced by `python3 spike.py` (a dependency-free loader model at
 [`tests/architecture/adr-0008-packaging/spike.py`](../../../tests/architecture/adr-0008-packaging/spike.py)).

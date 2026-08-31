@@ -1,9 +1,14 @@
 # ADR 0008 — Target Adapter Packaging, Distribution, and Lifecycle Validation Spike
 
+> **Historical supersession:** This is historical evidence for superseded ADR
+> 0008. It proves the former independent WASM packaging architecture was
+> feasible and validated, but does not describe the current selected production
+> architecture (ADR 0009).
+>
 > **Historical architecture validation — not production code.**
 >
 > This directory is the small executable validation evidence for **ADR 0008**
-> acceptance. It machine-checks the three "Validation Before Acceptance"
+> acceptance. It machine-checks the three "Acceptance Validation"
 > scenarios that ADR 0008 owns. It is **not** production PermissionSync, **not**
 > the production loader, and **not** a recommendation of any specific registry
 > product, loader implementation, signing technology, or deployment
@@ -17,7 +22,7 @@
 
 This spike models only the parts of the adapter-loader boundary that ADR 0008
 owns, and machine-checks the three scenarios from ADR 0008's
-"Validation Before Acceptance":
+"Acceptance Validation":
 
 1. **Offline replica recovery.** After staging, a fresh replica recovers the
    complete exact selected artifact set from deployment-local infrastructure

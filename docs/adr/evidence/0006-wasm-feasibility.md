@@ -1,5 +1,10 @@
 # ADR 0006 — Feasibility Evidence (Executable)
 
+> **Historical supersession:** This is historical evidence for superseded ADR
+> 0006. It proves the former WebAssembly architecture was feasible and
+> validated, but does not describe the current selected production architecture
+> ([ADR 0009](../0009-compile-time-rust-target-adapters.md)).
+
 This file records the executable evidence for the **ADR 0006** feasibility
 acceptance criteria, produced by `make test` (which runs `tests/gates.py`
 against the Wasmtime 48 host and the fake-provider / fake-target). Every

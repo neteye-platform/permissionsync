@@ -2,7 +2,12 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR 0009](0009-compile-time-rust-target-adapters.md)
+
+> **Historical clarification:** The accepted WebAssembly feasibility conclusion
+> was validated and later intentionally replaced by ADR 0009. The PoC remains
+> historical feasibility evidence; supersession does not mean WebAssembly was
+> infeasible.
 
 ## Context
 
@@ -278,6 +283,7 @@ This ADR defers:
 - [ADR 0004](0004-generic-rest-permission-provider.md)
 - [ADR 0005](0005-bounded-desired-permission-model.md)
 - [ADR 0007](0007-runtime-configuration-oci-and-observability.md)
+- [ADR 0009](0009-compile-time-rust-target-adapters.md) (superseding decision)
 - [ADR index](README.md)
 - [WebAssembly Component Model](https://component-model.bytecodealliance.org/)
 - [WebAssembly Interface Types][wit]
