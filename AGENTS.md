@@ -48,7 +48,7 @@
   cargo check --workspace --all-targets --all-features --locked
   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
   cargo test --workspace --all-targets --all-features --locked
-  cargo deny check
+  cargo deny --locked check
   RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
   git diff --check
   ```

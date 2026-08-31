@@ -35,4 +35,4 @@ jobs:
       - name: Install cargo-deny
         run: cargo install --locked --version "$CARGO_DENY_VERSION" cargo-deny
       - name: Check dependency policy
-        run: cargo deny check
+        run: cargo deny --locked check
