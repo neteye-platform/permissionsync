@@ -64,5 +64,4 @@ REST wire specification remains deferred elsewhere.
 - [ADR 0001](0001-inbound-synchronization-contract.md)
 - [ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md)
 - [ADR 0005](0005-bounded-desired-permission-model.md)
-- [ADR 0006](0006-core-boundaries-and-webassembly-component-target-adapters.md)
-- [ADR 0007](0007-runtime-configuration-oci-and-observability.md)
+- [ADR 0006](0006-runtime-configuration-oci-and-observability.md)

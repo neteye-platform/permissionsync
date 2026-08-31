@@ -4,8 +4,6 @@
 
 Accepted
 
-This ADR supersedes ADR 0006 and ADR 0008.
-
 ## Context
 
 PermissionSync must reconcile users with different target systems without
@@ -100,7 +98,7 @@ For every request, the complete order is:
 11. Return the resulting HTTP outcome.
 
 Globally ambiguous or structurally unusable routing remains a global startup or
-readiness error under ADR 0007. A target-local managed configuration error may
+readiness error under ADR 0006. A target-local managed configuration error may
 be detected eagerly where practical without making unrelated routes
 unavailable.
 
@@ -135,9 +133,9 @@ The failure model has three stages:
 
 ### Deployment, restart, and upgrades
 
-The image already contains every supported adapter. ADR 0007 owns
+The image already contains every supported adapter. ADR 0006 owns
 whole-product-image availability. Because all adapter code is linked into that
-image, satisfying ADR 0007 also makes adapter code available. No extra adapter
+image, satisfying ADR 0006 also makes adapter code available. No extra adapter
 artifact, registry, loader, or download path exists.
 
 Upgrades and rollbacks are whole-product-image operations. There is no
@@ -153,7 +151,7 @@ replay state is required for routing or correctness. Core remains stateless.
 
 Concrete adapter crates are trusted in-process code. They have the authority
 of the PermissionSync process, so this design does **not** provide the
-security properties previously sought from a WebAssembly sandbox. In
+security properties of a WebAssembly sandbox. In
 particular, it loses WebAssembly isolation, WIT admission, capability
 linking, default runtime denial of filesystem/environment/process access,
 host-enforced egress, and independent memory isolation. No sandbox or
@@ -189,14 +187,6 @@ image, and an adapter change requires a full image rollout. In return, the
 system avoids the operational and compatibility complexity of a component
 runtime, dynamic ABI, loader, or separate service.
 
-The technically feasible Wasm approach from ADR 0006 could have supplied
-isolation and independent artifacts, but its runtime, WIT, admission,
-capability, distribution, and lifecycle machinery is no longer justified by
-the product's simplicity and trust model. Native dynamic libraries would add
-ABI and loading complexity with weak isolation. Microservices would add
-network, deployment, availability, and latency overhead. Putting target logic
-in Core would destroy genericity and make every target change a Core change.
-
 The lost sandbox properties are a material security cost, not an accidental
 omission. Adapter code must therefore be reviewed and trusted as product
 code, and process/deployment privileges must be constrained outside this
@@ -207,10 +197,9 @@ in-process boundary.
 - **Compile-time Rust crates (chosen):** statically linked, deterministic,
   simple, and strongly typed, at the cost of full-image coupling and trusted
   in-process code.
-- **WebAssembly components (prior ADR 0006):** technically feasible and
-  capable of language independence and stronger isolation, but no longer
-  justified by the added runtime, WIT, capability, admission, and artifact
-  lifecycle complexity.
+- **WebAssembly components:** evaluated during design and technically feasible,
+  with language independence and stronger isolation, but not justified by the
+  added runtime, WIT, capability, admission, and artifact lifecycle complexity.
 - **Native dynamic libraries:** independently replaceable, but require an ABI,
   loader, compatibility policy, and trust machinery while providing weak
   isolation.
@@ -222,7 +211,7 @@ in-process boundary.
 
 ## Testing Expectations
 
-Testing must verify, without requiring a proof of concept, that:
+Testing must verify directly that:
 
 - Core builds without depending on any concrete adapter, adapter crates use
   only the public Core contract/types for their Core dependency, and the
@@ -241,7 +230,7 @@ Testing must verify, without requiring a proof of concept, that:
   or expiry failures. Tests cover the prohibition on detached/background
   reconciliation and the possibility that non-cooperative defects affect the
   whole replica.
-- A built image contains all supported adapters, so satisfying ADR 0007's
+- A built image contains all supported adapters, so satisfying ADR 0006's
   image-availability requirement needs no additional adapter artifact,
   registry, loader, or download dependency. Rolling image revisions can operate
   with old and new replicas. No test should imply dynamic loading, Wasm
@@ -267,7 +256,5 @@ here.
 - [ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md)
 - [ADR 0004](0004-generic-rest-permission-provider.md)
 - [ADR 0005](0005-bounded-desired-permission-model.md)
-- [ADR 0007](0007-runtime-configuration-oci-and-observability.md)
-- [ADR 0006 (historical)](0006-core-boundaries-and-webassembly-component-target-adapters.md)
-- [ADR 0008 (historical)](0008-target-adapter-packaging-distribution-and-lifecycle.md)
+- [ADR 0006](0006-runtime-configuration-oci-and-observability.md)
 - [ADR index](README.md)

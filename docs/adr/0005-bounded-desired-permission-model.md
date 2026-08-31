@@ -131,7 +131,7 @@ and must not be made to appear supported by silently dropping, rewriting,
 weakening, or defaulting semantics. This pre-mutation model-validation rule
 does not change the uncertain downstream-effect behavior for valid target
 operations under
-[ADR 0007](0007-runtime-configuration-oci-and-observability.md).
+[ADR 0006](0006-runtime-configuration-oci-and-observability.md).
 
 A constraint expresses a desired access restriction that applies at the
 synchronized-user or document level rather than to one assignment, such as a
@@ -199,5 +199,4 @@ must reconcile removal only within their configured managed authority.
 
 - [ADR 0001](0001-inbound-synchronization-contract.md)
 - [ADR 0004](0004-generic-rest-permission-provider.md)
-- [ADR 0006](0006-core-boundaries-and-webassembly-component-target-adapters.md)
-- [ADR 0007](0007-runtime-configuration-oci-and-observability.md)
+- [ADR 0006](0006-runtime-configuration-oci-and-observability.md)

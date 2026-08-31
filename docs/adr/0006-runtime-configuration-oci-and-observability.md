@@ -164,4 +164,4 @@ is no independent runtime adapter artifact.
 - [ADR 0002](0002-receiver-side-jwt-verification.md)
 - [ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md)
 - [ADR 0005](0005-bounded-desired-permission-model.md)
-- [ADR 0009](0009-compile-time-rust-target-adapters.md)
+- [ADR 0007](0007-compile-time-rust-target-adapters.md)

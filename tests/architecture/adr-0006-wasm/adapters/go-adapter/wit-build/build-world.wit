@@ -1,8 +1,0 @@
-package permissionsync:adr0006@0.1.0;
-
-world adapter-build {
-  import http;
-  import runtime;
-  export adapter-api;
-  include wasi:cli/command@0.2.0;
-}

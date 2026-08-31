@@ -49,7 +49,7 @@ token during a temporary JWKS outage. A source failure never accepts a token.
 
 Remote JWKS and discovery verification operations have bounded timeouts and
 consume the remaining overall request budget under
-[ADR 0007](0007-runtime-configuration-oci-and-observability.md). Provider or
+[ADR 0006](0006-runtime-configuration-oci-and-observability.md). Provider or
 adapter work runs only after successful authentication, authorization, and
 request validation.
 
@@ -66,5 +66,5 @@ failures, authorization failures, and verifier infrastructure failures.
 ## References
 
 - [ADR 0001](0001-inbound-synchronization-contract.md)
-- [ADR 0007](0007-runtime-configuration-oci-and-observability.md)
+- [ADR 0006](0006-runtime-configuration-oci-and-observability.md)
 - [ADR index](README.md)

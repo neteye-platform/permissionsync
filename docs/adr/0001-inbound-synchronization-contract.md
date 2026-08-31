@@ -42,7 +42,7 @@ whole-second precision.
 imposed. Group strings are preserved as provided, with no new path grammar
 imposed. A non-null string `client_id` passes wire-schema validation; configured
 target recognition is target resolution under
-[ADR 0007](0007-runtime-configuration-oci-and-observability.md),
+[ADR 0006](0006-runtime-configuration-oci-and-observability.md),
 not JSON validation.
 
 ```json
@@ -59,14 +59,14 @@ not JSON validation.
 The body must not gain request, event, or correlation IDs, idempotency keys,
 retry metadata, or arbitrary metadata without an explicit contract revision.
 Future correlation should be transport metadata, owned by
-[ADR 0007](0007-runtime-configuration-oci-and-observability.md).
+[ADR 0006](0006-runtime-configuration-oci-and-observability.md).
 
 The technical caller is authenticated and authorized under
 [ADR 0002](0002-receiver-side-jwt-verification.md). Authentication and
 authorization occur first, followed by strict request validation. All occur
 before target resolution, Permission Provider, or Target Adapter work. Target
 resolution remains compatible with
-[ADR 0007](0007-runtime-configuration-oci-and-observability.md).
+[ADR 0006](0006-runtime-configuration-oci-and-observability.md).
 Delivery and reconciliation behavior is defined by
 [ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md).
 
@@ -103,5 +103,5 @@ and can evolve internal reconciliation models without changing the contract.
 
 - [ADR 0002](0002-receiver-side-jwt-verification.md)
 - [ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md)
-- [ADR 0007](0007-runtime-configuration-oci-and-observability.md)
+- [ADR 0006](0006-runtime-configuration-oci-and-observability.md)
 - [ADR index](README.md)

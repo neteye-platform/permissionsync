@@ -3,7 +3,8 @@
 ## Repository purpose
 
 - PermissionSync is an architecture-first repository.
-- No production implementation currently exists.
+- Inspect repository contents and configuration before assuming an implementation,
+  workspace, or build commands exist.
 - The repository records the service contract, boundaries, security properties,
   and deployment constraints that a future implementation must preserve.
 - Treat the architecture records as executable constraints for future code.
@@ -24,10 +25,11 @@
   defines the Provider's WHAT: resolving the desired access state.
 - The [accepted desired-permission model](docs/adr/0005-bounded-desired-permission-model.md)
   defines the bounded, target-neutral DesiredPermissions model.
-- The [accepted runtime decision](docs/adr/0007-runtime-configuration-oci-and-observability.md)
-  defines runtime configuration, stateless operation, OCI image behavior, and
-  safe observability.
-- The [active adapter decision](docs/adr/0009-compile-time-rust-target-adapters.md)
+- The [accepted runtime decision](docs/adr/0006-runtime-configuration-oci-and-observability.md)
+  defines runtime configuration, stateless OCI operation, external secrets and
+  configuration, TLS requirements, offline whole-image availability, and safe
+  observability.
+- The [active adapter decision](docs/adr/0007-compile-time-rust-target-adapters.md)
   defines the compile-time Rust Target Adapter architecture.
 - The repository tooling configuration, including
   [pre-commit configuration](.pre-commit-config.yaml),
@@ -38,11 +40,13 @@
 
 ## Active architecture
 
-- ADR 0009 is the active Target Adapter architecture.
+- ADR 0007 is the active Target Adapter architecture.
 - Each concrete adapter is a distinct Rust crate linked into one generic
   PermissionSync binary and one generic OCI product image.
 - Runtime configuration selects only among adapters compiled into that binary.
 - The complete linked adapter set is part of the product image identity.
+- The conceptual flow is Identity Context -> Permission Provider (WHAT) -> a
+  Core-owned TargetAdapter contract -> linked concrete adapter (HOW) -> target.
 - Core owns orchestration, authentication and authorization, strict request
   validation, routing, capacity, deadlines, structural model validation, one
   Provider invocation, one adapter invocation, and the HTTP outcome.
@@ -64,6 +68,7 @@
 - Concrete adapters may depend only on Core's public contract and public types
   for their Core dependency.
 - Adapters must not depend on Core internals or on other adapter crates.
+- Core remains target-generic and does not interpret target semantics.
 - Do not move target-specific behavior into Core just for packaging convenience.
 - The composition root maps logical adapter identifiers deterministically to
   compiled implementations.
@@ -96,11 +101,11 @@
 - Adapters perform complete target-semantic validation before mutation.
 - Unsupported or invalid target semantics must fail.
 - They must not be silently dropped, weakened, rewritten, or defaulted.
-- [ADR 0007](docs/adr/0007-runtime-configuration-oci-and-observability.md)
+- [ADR 0006](docs/adr/0006-runtime-configuration-oci-and-observability.md)
   requires stateless runtime operation.
-- ADR 0007 keeps deployment configuration and externally supplied secrets out
+- ADR 0006 keeps deployment configuration and externally supplied secrets out
   of the generic binary and image.
-- ADR 0007 requires TLS verification and deployment-specific trust settings.
+- ADR 0006 requires TLS verification and deployment-specific trust settings.
 - After successful installation or upgrade, normal replica creation and
   recovery must not require public or external registry connectivity.
 - The selected whole PermissionSync OCI image must be available through
@@ -110,34 +115,29 @@
 - Keep one generic image; do not introduce a product-specific deployment image.
 - Do not select a cache, mirror, or loader architecture as a workaround.
 
-## Historical architecture evidence
+## ADR lifecycle
 
-- [ADR 0006](docs/adr/0006-core-boundaries-and-webassembly-component-target-adapters.md)
-  is superseded and historical only.
-- [ADR 0008](docs/adr/0008-target-adapter-packaging-distribution-and-lifecycle.md)
-  is superseded and historical only.
-- The [ADR 0006 evidence](docs/adr/evidence/0006-wasm-feasibility.md) is a
-  historical feasibility record, not an active architecture requirement.
-- The [ADR 0008 evidence](docs/adr/evidence/0008-packaging-validation.md) records
-  historical packaging scenarios and their passed results.
-- The [ADR 0006 proof of concept](tests/architecture/adr-0006-wasm/README.md)
-  and [ADR 0008 proof of concept](tests/architecture/adr-0008-packaging/README.md)
-  are historical artifacts.
-- The [ADR 0008 spike](tests/architecture/adr-0008-packaging/spike.py) is not a
-  product implementation or product validation.
-- ADR 0006 and ADR 0008 evidence and POCs never validate ADR 0009.
-- Do not revive their WebAssembly, dynamic-artifact, loader, or independent
-  adapter-lifecycle requirements through incidental implementation choices.
+- The [ADR index](docs/adr/README.md) defines the current ADR set and each
+  record's status.
+- A design discarded before adoption may be omitted from the adopted
+  architecture baseline; retain useful rationale in the selected ADR's
+  Alternatives.
+- Future architecture that was actually adopted normally remains as Superseded
+  when replaced, preserving the decision history.
+- Follow the [ADR index](docs/adr/README.md) Record Structure: Status, Context,
+  Decision, Consequences, and References.
+- Add every ADR to the index.
+- Use the next ADR number and never renumber an adopted ADR.
 
 ## Working in the repository
 
 - Read the relevant Accepted ADRs before changing architecture-facing material.
-- Use the [ADR index](docs/adr/README.md) to confirm whether a record is active
-  or superseded.
 - Preserve each ADR's owned decision; reference another ADR instead of copying
   its full policy.
 - Do not create a new ADR for a small clarification or implementation detail.
 - Create a new ADR only for a genuine architecture decision.
+- Keep deferred decisions deferred; do not introduce architecture through an
+  implementation detail or an unrecorded change.
 - Keep documentation concise, direct, and deployment-neutral.
 - Do not add a Kubernetes-specific product or deployment contract.
 - Do not add production code, tests, or configuration when the requested change
@@ -155,8 +155,8 @@
 - Inspect `git diff` before finishing.
 - Optionally inspect `git diff --word-diff` when reviewing wording changes.
 - Do not invent Cargo, test-runner, Docker, Make, or build commands.
-- Historical POCs may document local commands, but those commands are not
-  product validation and do not establish ADR 0009 compliance.
+- Do not speculate about repository paths or commands; use only paths and
+  commands established by repository configuration or the assigned checks.
 - Future production tests must verify architecture guardrails, not merely build
   a convenient implementation.
 - Future tests must cover boundaries, failure isolation, bounded work,
@@ -190,8 +190,7 @@
 ## Before finishing
 
 - Confirm the implementation follows the active ADRs, especially ADR 0007 and
-  ADR 0009.
-- Confirm superseded ADR 0006 and ADR 0008 were not treated as requirements.
+  ADR 0006.
 - Confirm no unrelated file changed.
 - Run the assigned repository checks and inspect the resulting diff.
 - Report skipped checks accurately rather than substituting invented commands.
