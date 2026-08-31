@@ -1,8 +1,8 @@
-# Caller Authentication and Authorization
+# ADR-0002: Caller Authentication and Authorization
 
-## Status
-
-Accepted
+- **Status:** Accepted
+- **Date:** 2026-08-24
+- **Deciders:** R&D Team
 
 ## Context
 
@@ -55,6 +55,10 @@ request validation.
 
 Never log a bearer token, complete claims, or secrets. Diagnostics use only a
 minimal, privacy-conscious caller identity.
+
+## Alternatives considered
+
+No material alternatives were recorded for this decision.
 
 ## Consequences
 

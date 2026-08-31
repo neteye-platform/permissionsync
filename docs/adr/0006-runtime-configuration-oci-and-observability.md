@@ -1,162 +1,170 @@
-# Runtime Configuration, Stateless OCI Operation, and Safe Observability
+# ADR-0006: Runtime Configuration, Stateless OCI Operation, and Safe Observability
 
-## Status
-
-Accepted
+- **Status:** Accepted
+- **Date:** 2026-08-24
+- **Deciders:** R&D Team
 
 ## Context
 
 PermissionSync must serve distinct deployments without embedding their trust,
 network, provider, target, credential, or permission choices. It must remain
-portable across OCI runtimes and provide useful operational evidence without
-exposing secrets or unnecessary sensitive data.
+portable across OCI runtimes, provide useful operational evidence without
+exposing secrets, and recover without deployment-registry access after an
+installation or upgrade.
 
 ## Decision
 
-PermissionSync is one generic, immutable, versioned binary and OCI image. The
-same artifact is reusable across deployments. It must not embed deployment
-URLs, credentials, permission data, target instances, or environment trust.
+### Generic artifact and deployment boundary
 
-After successful installation or upgrade, normal replica creation and recovery
-including restart, eviction, replacement, node reboot, relocation, and
-cold-node scheduling MUST NOT require public or external registry connectivity.
-Therefore, the selected PermissionSync OCI image MUST be available through
-deployment-local infrastructure or equivalent offline installation or upgrade
-media. Image availability is deployment infrastructure, not PermissionSync
-application state.
+PermissionSync is one generic, immutable, versioned binary and OCI image,
+reusable across deployments. It embeds no deployment URLs, credentials,
+permission data, target instances, or environment trust. After successful
+installation or upgrade, normal replica creation and recovery—including
+restart, eviction, replacement, node reboot, relocation, and cold-node
+scheduling—MUST NOT require public or external registry connectivity. The
+selected image MUST therefore be available from deployment-local
+infrastructure or equivalent offline installation or upgrade media. Image
+availability is deployment infrastructure, not PermissionSync application
+state.
+
+Kubernetes is only a deployment target: the service depends on no Kubernetes
+API, discovery, object, or configuration semantics and also works with
+Podman, Docker, and other OCI runtimes. Helm charts and manifests are
+optional deployment artifacts.
+
+### Runtime configuration and validation
 
 All deployment-specific values are runtime configuration:
 
-- Inbound configuration specifies issuer, JWKS or discovery URL, optional
-  audience, algorithm allowlist, required role, scope, or equivalent, and the
-  claim location.
-- Provider configuration specifies type, endpoint, credentials, TLS or trust
-  settings including private CAs, and shorter per-operation timeouts.
-- Target configuration specifies client_id mapping, managed or unmanaged
-  status, and a logical adapter identifier. The identifier is resolved
-  deterministically against adapters compiled into the current binary.
-  Endpoint, credentials, TLS or trust settings including private CAs, and
-  adapter-specific values are included only when required by the selected
-  adapter contract.
-- Runtime configuration specifies listen address and port, shorter per-operation
-  timeouts, bounded synchronization concurrency or capacity, one bounded overall
+- **Inbound:** issuer, JWKS or discovery URL, optional audience, algorithm
+  allowlist, required role or scope (or equivalent), and claim location.
+- **Provider:** type, endpoint, credentials, TLS or trust settings including
+  private CAs, and shorter per-operation timeouts.
+- **Target:** `client_id` mapping, managed or unmanaged status, and a logical
+  adapter identifier resolved deterministically against adapters compiled into
+  the current binary. Endpoint, credentials, TLS or trust settings including
+  private CAs, and adapter-specific values are supplied only when required by
+  the selected adapter contract.
+- **Runtime:** listen address and port, shorter per-operation timeouts,
+  bounded synchronization concurrency or capacity, one bounded overall
   synchronization deadline, logging, and metrics.
 
-Secrets are supplied externally, without requiring Kubernetes Secrets. All
+Secrets are supplied externally; Kubernetes Secrets are not required. All
 downstream credentials use least privilege, and TLS verification must not be
-disabled. This ADR does not select a configuration or secret mechanism.
+disabled. This ADR does not choose a configuration or secret mechanism.
 
 Static configuration is validated at startup and readiness whenever reasonably
-possible. Global or core errors prevent startup or readiness: missing or invalid
-trusted issuer, JWKS or discovery configuration, signing algorithm allowlist,
-or global authorization configuration; fundamentally invalid runtime or
-listener configuration; and ambiguous, contradictory, or structurally unusable
-target routing.
+possible. Global or core errors prevent startup or readiness, including a
+missing or invalid trusted issuer, JWKS or discovery configuration, signing
+algorithm allowlist, global authorization configuration, fundamentally invalid
+runtime or listener configuration, or ambiguous, contradictory, or
+structurally unusable target routing.
 
-Permission Provider configuration, endpoint, authentication or credentials,
-TLS or trust settings, and provider-specific configuration are validated
-eagerly where practical, but are required only for managed synchronization.
-Missing or invalid provider dependency causes a selected managed request to
-return `500`. Unconfigured and unmanaged targets remain `200` no-ops with no
-provider work. The service may remain ready if it can authenticate, authorize,
-validate, route, and return those no-op outcomes. Provider configuration failure
-is safely visible through logs and metrics or status where appropriate, without
-choosing health or status mechanisms.
+Provider configuration, endpoint, authentication or credentials, TLS or trust
+settings, and provider-specific configuration are validated eagerly where
+practical but are required only for managed synchronization. Missing or
+invalid provider dependencies make a selected managed request return `500`.
+Unconfigured and unmanaged targets remain `200` no-ops with no provider work;
+the service may remain ready when it can authenticate, authorize, validate,
+route, and return those outcomes. Provider configuration failures are exposed
+safely through logs, metrics, or status where appropriate, without choosing
+health or status mechanisms.
 
-Isolated target-local errors are detected eagerly where practical, but make only
-that managed target unusable. The selected adapter contract determines which
-target configuration is required. Errors include a configured adapter
-identifier absent from the current compiled-in registry; missing required
-target endpoint or credentials; a malformed configured endpoint; invalid
-target-specific TLS or trust configuration where applicable; and missing or
-invalid required adapter-specific configuration. A target-local adapter
-identifier absent from the compiled-in registry is eagerly detected where
-practical. When detectable, no Permission Provider or Target Adapter work
-begins for that target. The service may remain ready. A selected unusable
-managed target returns `500` only for that target; other valid managed
-targets process normally, and unrelated unmanaged or unconfigured targets
-remain serviceable as `200` no-ops.
-Runtime unavailability after valid configuration remains a synchronization
-failure.
+Isolated target-local errors are detected eagerly where practical and make
+only that managed target unusable. They include a configured adapter
+identifier absent from the current compiled-in registry, missing required
+endpoint or credentials, malformed endpoint, invalid target TLS or trust
+configuration where applicable, and missing or invalid required
+adapter-specific configuration. The selected adapter contract determines which
+target configuration is required. When an absent adapter key is detectable, no
+Permission Provider or Target Adapter work begins for that target. The service
+may remain ready; that managed target returns `500`, while other valid managed
+targets process normally and unrelated unmanaged or unconfigured targets
+remain serviceable as `200` no-ops. Runtime unavailability after valid
+configuration is a synchronization failure.
 
-V1 is stateless. Any healthy replica can handle a request. It has no shared
-persistence, distributed locks, persistent delivery queue, or idempotency
+### Statelessness, deadlines, capacity, and delivery
+
+V1 is stateless: any healthy replica can handle a request. There is no shared
+persistence, distributed lock, persistent delivery queue, or idempotency
 database unless a future ADR accepts one.
 
-Each inbound request has one runtime-configurable overall deadline that starts
-when the request is accepted and covers all PermissionSync application
-processing until the response outcome is ready to be emitted. It covers
-authentication, JWKS or discovery work, authorization, strict validation,
-target resolution, capacity waiting, provider work, and all Target Adapter
-reconciliation work. It does not claim control over final HTTP or network
-transport completion. Every remote authentication verification operation is
-bounded and consumes the same remaining budget. Every provider and target
-outbound operation is also individually bounded. Individual child operations may
-have shorter configured timeouts, but their effective timeout must not
-intentionally exceed the remaining overall budget. The overall deadline is
-configured below the caller-side HTTP timeout, leaving transport and response
-margin, without a hardcoded external timeout value. Expiry at any stage is a
-synchronization failure and returns `500` under ADR 0001. No new work
-intentionally starts after expiry.
+Each request has one runtime-configurable overall deadline starting when the
+request is accepted and covering all PermissionSync application processing
+until the response outcome is ready to emit: authentication, JWKS or
+discovery, authorization, strict validation, target resolution, capacity
+waiting, provider work, and all Target Adapter reconciliation. It does not
+control final HTTP or network transport completion. Every remote
+authentication verification, provider operation, and target outbound
+operation is individually bounded and consumes the same remaining budget;
+child operations may have shorter configured timeouts but must not
+intentionally exceed that budget. The overall deadline is configured below
+the caller-side HTTP timeout, leaving transport and response margin, without
+hardcoding an external timeout. Expiry at any stage is a synchronization
+failure returning `500` under [ADR 0001](0001-inbound-synchronization-contract.md),
+and no new work intentionally starts after expiry.
 
-Valid managed work acquires bounded synchronization capacity before provider
-work. Local saturation, including inability to acquire capacity before the
-overall deadline, is a synchronization failure and returns `500`, never a
-successful no-op. No Permission Provider or Target Adapter work begins. The
-overall deadline and cancellation are passed through authentication
-verification, capacity waits, provider work, and adapter operations on a
-best-effort basis. This does not promise arbitrary in-process adapter work can
-be hard-interrupted. Downstream requests or effects already issued remain
-uncertain, with no rollback or undo guarantee.
-
-In-flight synchronization and capacity are bounded so slow downstreams cannot
-exhaust the runtime. The capacity mechanism and limits remain deferred.
+Valid managed work obtains bounded synchronization capacity before provider
+work. Local saturation, including failure to obtain capacity before the
+overall deadline, returns `500`, never a successful no-op, and starts no
+provider or adapter work. Capacity and in-flight synchronization remain
+bounded so slow downstreams cannot exhaust the runtime; the mechanism and
+limits are deferred. Deadline and cancellation pass through authentication,
+capacity waits, provider work, and adapter operations on a best-effort basis.
+This cannot hard-interrupt arbitrary in-process adapter work. Already-issued
+downstream requests or effects remain uncertain, with no rollback or undo
+guarantee.
 
 Each inbound request makes at most one Permission Provider resolution
 invocation and one selected Target Adapter reconciliation invocation. One
-adapter reconciliation may issue multiple required downstream API operations.
-Those operations, and failed downstream operations, are not automatically
-retried in v1. The single-attempt, no-retry delivery policy is defined by
-[ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md).
+adapter reconciliation may make multiple downstream API calls, but neither
+those calls nor failed downstream operations are automatically retried in v1;
+the single-attempt, no-retry policy is defined by [ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md).
+
+### Operations, observability, and correlation
 
 The runtime uses reusable outbound HTTP connection pools, graceful shutdown,
-health and readiness endpoints, a metrics endpoint where practical, structured
-stdout and stderr logging, non-root execution, and a minimal runtime image.
-This ADR does not name paths, metrics, or mechanisms.
+health and readiness endpoints, a metrics endpoint where practical,
+structured stdout and stderr logging, non-root execution, and a minimal
+runtime image. Paths, metric names, and mechanisms are not selected here.
 
-Kubernetes is a deployment target only. PermissionSync depends on no Kubernetes
-API, discovery, object, or configuration semantics. The OCI image also works
-with Podman, Docker, and other OCI runtimes. Helm charts and manifests are
-optional deployment artifacts.
-
-Observability records may include client_id, adapter, result category, stage,
-duration or latency, coarse assignment and constraint counts, and inbound
-group count but not group names, plus a privacy-conscious technical caller
-identity. They may include a username only
-when explicitly justified by logging and privacy policy. They never include a
-raw request body, email, full group paths, raw bearer token, client secret,
-provider credentials, target credentials, private keys, complete JWT claims,
-full sensitive desired-permission documents or data, or constraint values
-such as network ranges, resource selectors, or internal interface names.
-Only coarse, non-sensitive summaries may be recorded where useful.
-Caller-facing errors provide only safe detail.
+Observability may record `client_id`, adapter, result category, stage,
+duration or latency, coarse assignment and constraint counts, inbound group
+count without group names, and a privacy-conscious technical caller identity.
+A username is allowed only when explicitly justified by logging and privacy
+policy. It must never record raw request bodies, email, full group paths, raw
+bearer tokens, client or provider credentials, target credentials, private
+keys, complete JWT claims, full sensitive desired-permission documents or
+data, or constraint values such as network ranges, resource selectors, or
+internal interface names. Only coarse, non-sensitive summaries are recorded,
+and caller-facing errors contain only safe detail.
 
 Correlation is optional. The runtime supports propagating a future identifier
-when it is supplied in an HTTP transport header, but does not require a header,
-name it, or add correlation or request ID to the fixed six-field body. No body
-fields are used for correlation. Current events must not assume an identifier
-exists.
+when it is supplied in an HTTP transport header, but no header or name is
+required, and no correlation or request ID is added to the fixed six-field
+body. No body field is used for correlation, and current events must not assume
+an identifier.
+
+## Alternatives considered
+
+- **Deployment-specific images or embedded configuration:** rejected in favor
+  of one reusable generic artifact with external runtime configuration and
+  secrets.
+- **Kubernetes-specific configuration or secret mechanisms:** rejected to
+  preserve OCI and deployment neutrality and because Kubernetes Secrets are
+  not required.
+- **Stateful delivery, automatic retry, or rollback:** rejected for v1 in
+  favor of stateless, single-attempt reconciliation under ADR 0003.
 
 ## Consequences
 
 One release supports many deployments while keeping configuration and secrets
-outside the artifact. Stateless replicas can scale and recover independently,
-and bounded downstream work protects runtime capacity. Future specifications
-must preserve these boundaries and make the deferred operational details
-explicit.
-
-Any adapter change is a new PermissionSync binary and OCI image release; there
-is no independent runtime adapter artifact.
+outside the artifact. Stateless replicas can scale and recover independently;
+offline whole-image availability supports recovery, and bounded downstream
+work protects capacity. Adapter changes are full PermissionSync binary and
+OCI image releases; there is no independent runtime adapter artifact. Future
+specifications must preserve these boundaries and make deferred operational
+details explicit.
 
 ## References
 

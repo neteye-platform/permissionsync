@@ -1,8 +1,8 @@
-# Inbound Synchronization Contract and Caller-Owned Workflow Policy
+# ADR-0001: Inbound Synchronization Contract and Caller-Owned Workflow Policy
 
-## Status
-
-Accepted
+- **Status:** Accepted
+- **Date:** 2026-08-24
+- **Deciders:** R&D Team
 
 ## Context
 
@@ -62,9 +62,9 @@ Future correlation should be transport metadata, owned by
 [ADR 0006](0006-runtime-configuration-oci-and-observability.md).
 
 The technical caller is authenticated and authorized under
-[ADR 0002](0002-receiver-side-jwt-verification.md). Authentication and
-authorization occur first, followed by strict request validation. All occur
-before target resolution, Permission Provider, or Target Adapter work. Target
+[ADR 0002](0002-receiver-side-jwt-verification.md), then the request is strictly
+validated. Authentication, authorization, and strict validation occur before
+target resolution, Permission Provider, or Target Adapter work. Target
 resolution remains compatible with
 [ADR 0006](0006-runtime-configuration-oci-and-observability.md).
 Delivery and reconciliation behavior is defined by
@@ -92,6 +92,10 @@ workflow. PermissionSync does not decide authentication success.
 
 `/api/sync-user` may be provisional during 0.x. Any route, body, or status
 change requires explicit compatibility work and a caller contract revision.
+
+## Alternatives considered
+
+No material alternatives were recorded for this decision.
 
 ## Consequences
 

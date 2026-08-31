@@ -1,42 +1,44 @@
 # Architecture Decision Records
 
-Architecture Decision Records (ADRs) capture durable architecture decisions
-and their trade-offs. They record why a direction was chosen so later work
-can understand the decision in context.
+This directory is the entry point for PermissionSync Architecture Decision
+Records (ADRs). ADRs capture durable architecture decisions, ownership,
+constraints, trade-offs, and rationale. They do not replace detailed API or
+configuration specifications.
 
-ADRs do not replace future API or configuration specifications. Those
-specifications define detailed contracts when they are needed.
+New ADRs MUST use the [ADR template](template.md).
 
 ## Record Structure
 
-Each ADR uses these sections:
+Every ADR uses this standard structure:
 
 - **Status**: The current standing of the decision.
+- **Date**: The decision record date in `YYYY-MM-DD` form.
+- **Deciders**: The roles or people responsible for the decision.
 - **Context**: The problem, constraints, and relevant background.
 - **Decision**: The chosen approach and its scope.
-- **Consequences**: The expected benefits, costs, and follow-up
-  implications.
-- **References**: Links to related ADRs, specifications, or external
-  material.
+- **Alternatives considered**: Material options considered and why they were
+  not chosen.
+- **Consequences**: Expected benefits, costs, and follow-up implications.
+- **References**: Related ADRs, specifications, or external material.
 
-## Writing Principles
+## Statuses
 
-- Each ADR directly states the essential decision and invariants it owns.
-- Cross-ADR references provide additional context or detail; they are never
-  required to understand an ADR's own decision.
-- Avoid duplicating decisions owned by other ADRs.
-- An Accepted ADR may reference a Proposed ADR for context, but must not
-  normatively depend on a Proposed ADR for its own meaning.
+PermissionSync uses these statuses:
 
-## Status Meanings
+- **Proposed**: Under consideration; it does not guide the architecture.
+- **Accepted**: Active; it guides the architecture.
+- **Superseded**: Replaced by a newer ADR; retained for its decision history.
+- **Deprecated**: No longer to be used; no replacement ADR is named.
 
-- **Accepted**: The decision is active and guides the architecture.
-- **Proposed**: The decision is under consideration and does not yet guide
-  the architecture.
-- **Superseded**: A newer ADR replaces the decision. The record remains for
-  history.
-- **Deprecated**: The decision should no longer be used, but no replacement
-  ADR is named.
+## Lifecycle and numbering
+
+- Follow the standard structure and add every new ADR to this index.
+- Use the next available number; once assigned, never reuse or renumber it.
+- A replacement is a new ADR and normally marks the replaced Accepted decision
+  Superseded.
+- A design discarded before acceptance may be omitted from the architecture
+  baseline; retain useful rationale in the selected ADR's Alternatives.
+- Cross-references provide context; an ADR must state the decision it owns.
 
 ## Index
 

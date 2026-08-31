@@ -1,8 +1,8 @@
-# At-Most-Once Delivery and Idempotent Reconciliation
+# ADR-0003: At-Most-Once Delivery and Idempotent Reconciliation
 
-## Status
-
-Accepted
+- **Status:** Accepted
+- **Date:** 2026-08-24
+- **Deciders:** R&D Team
 
 ## Context
 
@@ -46,6 +46,10 @@ should reconcile idempotently by comparing current managed state with desired
 managed state, rather than making blind additive changes. They must tolerate
 repeated legitimate desired-state synchronizations and uncertain downstream
 effects.
+
+## Alternatives considered
+
+No material alternatives were recorded for this decision.
 
 ## Consequences
 
