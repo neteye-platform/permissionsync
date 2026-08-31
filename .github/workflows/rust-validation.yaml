@@ -1,0 +1,38 @@
+name: Rust Validation
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Rust workspace
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      # renovate: datasource=crate depName=cargo-deny versioning=semver
+      CARGO_DENY_VERSION: "0.20.2"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --all-features --locked
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --all-targets --all-features --locked
+      - name: Check documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+      - name: Install cargo-deny
+        run: cargo install --locked --version "$CARGO_DENY_VERSION" cargo-deny
+      - name: Check dependency policy
+        run: cargo deny check
