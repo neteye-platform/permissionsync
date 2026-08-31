@@ -38,19 +38,56 @@
 
 ## Testing and validation
 
-- Run only `prek run --all-files` as the repository-native validation command.
-- Run `git diff --check` for whitespace errors.
-- Inspect `git diff`; optionally inspect `git diff --word-diff` for wording.
-- Do not invent Cargo, test-runner, Docker, Make, build, or other commands.
-- Do not speculate about paths or validation that the repository does not
-  establish.
-- Report skipped checks accurately.
+- The exact Rust toolchain is defined by `rust-toolchain.toml`. Do not override
+  it in CI or documentation.
+- Before completing an implementation PR, run:
+
+  ```sh
+  prek run --all-files
+  cargo fmt --all -- --check
+  cargo check --workspace --all-targets --all-features --locked
+  cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+  cargo test --workspace --all-targets --all-features --locked
+  cargo deny check
+  RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+  git diff --check
+  ```
+
+- Install the exact Renovate-managed `cargo-deny` version from
+  `.github/workflows/rust-validation.yaml` before its policy check.
+- Add direct Cargo dependencies only when the current change requires them. Pin
+  direct dependency versions exactly, commit `Cargo.lock` with manifest changes,
+  and use `--locked` for dependency-resolving Cargo commands.
+- Tests must be deterministic and isolated. They must not depend on public
+  Internet access; real Keycloak, GLPI, IcingaWeb2, or other production
+  services; wall-clock races; arbitrary sleeps; unseeded randomness; execution
+  order; persistent state; fixed ports; or developer-specific environment
+  state. Use controlled time, local fake or mock servers, ephemeral ports,
+  temporary directories, deterministic seeds, explicit synchronization, and
+  bounded timeouts. Never retry a failed test; fix the test or production race.
+- Inspect `git diff` before finishing.
+- Optionally inspect `git diff --word-diff` when reviewing wording changes.
+- Future production tests must verify architecture guardrails, not merely build
+  a convenient implementation.
+- Future tests must cover boundaries, failure isolation, bounded work,
+  no-retry behavior, validation-before-mutation, and safe observability.
+- Failure isolation is limited to target-local configuration and recoverable
+  request failures; those failures isolate to the affected target or request.
+- Cancellation is best effort, and detached or background reconciliation is not
+  permitted.
+- Non-cooperative work, panic, abort, out-of-memory, or unsafe defects can
+  affect the whole replica.
+- Future tests must not imply dynamic adapter loading or WebAssembly sandbox
+  properties for the compile-time Rust architecture.
 
 ## Security
 
 - Never commit credentials, tokens, private keys, secrets, or trust material.
 - Do not disable or weaken TLS verification; comply with security requirements
   in Accepted ADRs.
+- Use mature, well-maintained libraries for TLS, JWT, OAuth/OIDC,
+  cryptography, and signature validation when that work is introduced. Never
+  implement cryptographic primitives from scratch.
 
 ## Before finishing
 
