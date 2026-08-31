@@ -25,7 +25,7 @@ repository. Build, check, and test the workspace with:
 ```sh
 cargo build --workspace --all-features --locked
 cargo check --workspace --all-targets --all-features --locked
-cargo test --workspace --all-targets --all-features --locked
+cargo test --workspace --all-features --locked
 ```
 
 The dependency-policy check requires the exact, Renovate-managed
@@ -39,12 +39,12 @@ cargo install --locked --version <CARGO_DENY_VERSION> cargo-deny
 Run the complete local validation suite before opening an implementation PR:
 
 ```sh
-prek run --all-files
+prek run --all-files --refresh
 cargo fmt --all -- --check
+cargo deny --locked check
 cargo check --workspace --all-targets --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-targets --all-features --locked
-cargo deny --locked check
+cargo test --workspace --all-features --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 git diff --check
 ```

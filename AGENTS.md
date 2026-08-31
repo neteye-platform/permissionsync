@@ -43,12 +43,12 @@
 - Before completing an implementation PR, run:
 
   ```sh
-  prek run --all-files
+  prek run --all-files --refresh
   cargo fmt --all -- --check
+  cargo deny --locked check
   cargo check --workspace --all-targets --all-features --locked
   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-  cargo test --workspace --all-targets --all-features --locked
-  cargo deny --locked check
+  cargo test --workspace --all-features --locked
   RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
   git diff --check
   ```
@@ -58,27 +58,17 @@
 - Add direct Cargo dependencies only when the current change requires them. Pin
   direct dependency versions exactly, commit `Cargo.lock` with manifest changes,
   and use `--locked` for dependency-resolving Cargo commands.
-- Tests must be deterministic and isolated. They must not depend on public
-  Internet access; real Keycloak, GLPI, IcingaWeb2, or other production
-  services; wall-clock races; arbitrary sleeps; unseeded randomness; execution
-  order; persistent state; fixed ports; or developer-specific environment
-  state. Use controlled time, local fake or mock servers, ephemeral ports,
-  temporary directories, deterministic seeds, explicit synchronization, and
-  bounded timeouts. Never retry a failed test; fix the test or production race.
+- New workspace crates must inherit the workspace lints.
+- Tests must be deterministic and isolated: no public Internet access, real
+  external or production services, arbitrary sleeps, wall-clock races, unseeded
+  randomness, execution order, persistent shared state, fixed ports, or
+  developer-specific state. Prefer controlled time, local fakes and fixtures,
+  ephemeral ports, temporary directories, deterministic seeds, explicit
+  synchronization, and bounded timeouts. A flaky test is a bug. Never hide it
+  with automatic test retries.
+- Architecture-specific tests must follow the relevant Accepted ADRs.
 - Inspect `git diff` before finishing.
 - Optionally inspect `git diff --word-diff` when reviewing wording changes.
-- Future production tests must verify architecture guardrails, not merely build
-  a convenient implementation.
-- Future tests must cover boundaries, failure isolation, bounded work,
-  no-retry behavior, validation-before-mutation, and safe observability.
-- Failure isolation is limited to target-local configuration and recoverable
-  request failures; those failures isolate to the affected target or request.
-- Cancellation is best effort, and detached or background reconciliation is not
-  permitted.
-- Non-cooperative work, panic, abort, out-of-memory, or unsafe defects can
-  affect the whole replica.
-- Future tests must not imply dynamic adapter loading or WebAssembly sandbox
-  properties for the compile-time Rust architecture.
 
 ## Security
 
