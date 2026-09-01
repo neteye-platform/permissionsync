@@ -1,7 +1,4 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": [
-    "github>neteye-platform/repo-commons",
-    "customManagers:githubActionsVersions"
-  ]
+  "extends": ["github>neteye-platform/repo-commons"]
 }
