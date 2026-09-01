@@ -20,24 +20,39 @@ Technical caller access tokens should be short-lived.
 
 Authentication requires:
 
-- A configured, trusted JWKS and configured, trusted issuer validation.
+- A configured trusted JWKS source pointing to the identity provider.
+- Explicit validation of the token `iss` claim against the configured trusted
+  issuer.
 - Signature validation with an algorithm allowlist.
 - A required `exp` claim and `nbf` validation when present.
 - Validation of other meaningful temporal claims with bounded clock skew.
 - Safe JWKS caching and rotation, with fail-closed behavior.
 
+PermissionSync MUST validate the token `aud` claim against a configured expected
+audience that represents PermissionSync. A token that is otherwise valid but was
+not issued for PermissionSync MUST be rejected. Runtime configuration owns the
+expected audience value.
+
 Token-controlled URLs, algorithms, or other token content must never expand
-trust. Validate an expected `aud` only when an audience is configured.
+trust.
+
+PermissionSync must not assume the `sub` claim equals the OAuth client
+identifier or service name for the requesting caller. The required audience
+provides resource binding to PermissionSync.
 
 Authorization is separate from, and required after, authentication. It requires
 a configured least-privilege role, scope, or equivalent trusted claim. Runtime
-configuration owns the required value, claim location, and optional audience.
+configuration owns the required value and claim location.
+
+JWT parsing, signature verification, standards handling, and cryptographic
+operations MUST use a mature, maintained, standards-compliant library. The
+concrete library is an implementation decision and is not chosen in this ADR.
 
 Return `401` when credentials cause rejection: a missing or malformed bearer
 token, invalid JWT structure, expiry or not-yet-valid time, invalid signature,
-wrong issuer or configured audience, disallowed algorithm, a missing signing
-key after a successful trusted JWKS refresh, or another cryptographically
-unverifiable token after the trusted source was successfully consulted.
+wrong issuer, wrong audience, disallowed algorithm, a missing signing key after
+a successful trusted JWKS refresh, or another cryptographically unverifiable
+token after the trusted source was successfully consulted.
 
 Return `403` only when a valid, authenticated technical caller lacks the
 configured role, scope, or equivalent claim. Return `500` when PermissionSync
@@ -53,8 +68,13 @@ consume the remaining overall request budget under
 adapter work runs only after successful authentication, authorization, and
 request validation.
 
-Never log a bearer token, complete claims, or secrets. Diagnostics use only a
-minimal, privacy-conscious caller identity.
+External authentication or authorization responses MUST NOT reveal the precise
+token validation failure; the caller receives only the appropriate HTTP
+outcome. Never log a bearer token, complete claims, or secrets. Diagnostics use
+only a minimal, privacy-conscious caller identity. Detailed diagnostics may
+exist internally only when they are safe and privacy-conscious, and must never
+expose bearer tokens, complete claims, secrets, or sensitive verification
+material.
 
 ## Alternatives considered
 
@@ -62,7 +82,7 @@ No material alternatives were recorded for this decision.
 
 ## Consequences
 
-Configured trust inputs, authorization policy, and optional audience must be
+Configured trust inputs, authorization policy, and the required audience must be
 managed deliberately. PermissionSync can support normal signing-key rotation
 without accepting an unverifiable token, while distinguishing caller credential
 failures, authorization failures, and verifier infrastructure failures.
