@@ -18,7 +18,10 @@ Use a generic REST Permission Provider as the v1 desired-state boundary.
 PermissionSync calls the configured provider with synchronized-user identity
 context, relevant inbound group membership and login metadata, and an explicit
 target or client identifier. The provider resolves the desired permissions for
-that user.
+that user. The synchronized-user identity context is information about the end
+user whose desired permissions are being resolved; it is not an authentication
+identity or context and must not be confused with the technical caller
+authenticated by PermissionSync.
 
 Runtime configuration supplies the provider type, endpoint, authentication or
 credentials, TLS and trust settings (including private or internal CA trust),

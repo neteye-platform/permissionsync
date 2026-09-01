@@ -63,10 +63,10 @@ the image identity includes the complete linked adapter set.
 
 Runtime configuration selects only a compiled-in adapter. It cannot download,
 install, load, or select an implementation absent from the binary. There is no
-dynamic loading, WebAssembly, WIT, `.so`, sidecar, microservice, adapter OCI
-artifact, loader, independent adapter-artifact digest or version selection,
-hot loading, or independent adapter release mechanism. Product OCI image
-digests remain valid for identifying the complete product image.
+dynamic loading, `.so`, sidecar, microservice, adapter OCI artifact, loader,
+independent adapter-artifact digest or version selection, hot loading, or
+independent adapter release mechanism. Product OCI image digests remain valid
+for identifying the complete product image.
 
 Target-native integration is preferred first, then a reusable standard
 integration where appropriate, then a PermissionSync adapter only when those
@@ -136,11 +136,8 @@ adapter lifecycle, version, or replay state required for routing or
 correctness; Core remains stateless.
 
 Concrete adapter crates are trusted in-process code with the authority of the
-PermissionSync process. This design does **not** provide WebAssembly sandbox
-properties: it loses WebAssembly isolation, WIT admission, capability
-linking, default runtime denial of filesystem/environment/process access,
-host-enforced egress, and independent memory isolation. The Rust trait
-boundary and static linking imply no sandbox or capability-isolation claim.
+PermissionSync process. The Rust crate/trait boundary and static linking are
+not a sandbox or isolation boundary; linked code has process authority.
 
 Core's selected target context and credentials are passed through the public
 contract as code-level discipline, not as a confidentiality or security
@@ -177,10 +174,9 @@ serviceability of unrelated routes, at most one provider and adapter call,
 no retry or rollback, deadline/cancellation propagation, `500` for returned or
 recoverable provider, adapter, or deadline-expiry failures, no detached
 reconciliation, and whole-replica impact from non-cooperative defects. Image
-tests must confirm all supported adapters are present and no extra artifact,
-registry, dynamic loader, Wasm isolation, WIT admission, capability linking,
-host-enforced egress, or independent memory isolation is implied; rolling image
-revisions may coexist.
+tests must confirm all supported adapters are present and no dynamic loader,
+separate adapter artifact, or download path is implied; rolling image revisions
+may coexist.
 
 ## Alternatives considered
 

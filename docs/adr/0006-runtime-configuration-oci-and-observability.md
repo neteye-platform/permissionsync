@@ -36,8 +36,9 @@ optional deployment artifacts.
 
 All deployment-specific values are runtime configuration:
 
-- **Inbound:** issuer, JWKS or discovery URL, optional audience, algorithm
-  allowlist, required role or scope (or equivalent), and claim location.
+- **Inbound:** trusted issuer, trusted JWKS source or discovery URL, required
+  expected audience, algorithm allowlist, required role or scope (or
+  equivalent), and claim location.
 - **Provider:** type, endpoint, credentials, TLS or trust settings including
   private CAs, and shorter per-operation timeouts.
 - **Target:** `client_id` mapping, managed or unmanaged status, and a logical
