@@ -125,9 +125,25 @@ the single-attempt, no-retry policy is defined by [ADR 0003](0003-at-most-once-d
 ### Operations, observability, and correlation
 
 The runtime uses reusable outbound HTTP connection pools, graceful shutdown,
-health and readiness endpoints, a metrics endpoint where practical,
-structured stdout and stderr logging, non-root execution, and a minimal
-runtime image. Paths, metric names, and mechanisms are not selected here.
+health and readiness endpoints, non-root execution, and a minimal runtime
+image. Structured stdout and stderr logging and metrics are required
+operational capabilities for v1, not optional. Exact metric names, endpoint
+paths, the Rust observability library, and the metrics backend or protocol are
+deferred and not selected here.
+
+PermissionSync telemetry MUST make it possible to determine at least:
+request/synchronization count by coarse outcome; end-to-end request duration;
+final or failure stage using bounded categories such as authentication,
+authorization, validation, routing, capacity, provider, and adapter; current
+in-flight managed synchronization work; local capacity or saturation
+rejection; Permission Provider outcome, failure, and latency; and Target
+Adapter reconciliation outcome, failure, and latency.
+
+Metric dimensions or labels MUST use bounded, low-cardinality values.
+User-derived or otherwise unbounded or sensitive values MUST NOT be metric
+labels, including usernames, emails, group values, bearer or JWT data, and
+technical caller identities. `client_id` may remain available in safe
+structured logs where appropriate, but is not required as a metric label.
 
 Observability may record `client_id`, adapter, result category, stage,
 duration or latency, coarse assignment and constraint counts, inbound group
@@ -139,6 +155,9 @@ keys, complete JWT claims, full sensitive desired-permission documents or
 data, or constraint values such as network ranges, resource selectors, or
 internal interface names. Only coarse, non-sensitive summaries are recorded,
 and caller-facing errors contain only safe detail.
+
+Distributed tracing and a concrete telemetry protocol or exporter are deferred
+and are not required for v1.
 
 Correlation is optional. The runtime supports propagating a future identifier
 when it is supplied in an HTTP transport header, but no header or name is
