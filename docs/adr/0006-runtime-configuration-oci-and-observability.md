@@ -46,10 +46,11 @@ All deployment-specific values are runtime configuration:
   under [ADR 0001](0001-inbound-synchronization-contract.md).
 - **Provider:** type, endpoint, credentials, TLS or trust settings including
   private CAs, and shorter per-operation timeouts.
-- **Target:** a logical adapter identifier resolved deterministically against
-  adapters compiled into the current binary. Endpoint, credentials, TLS or
-  trust settings including private CAs, and adapter-specific values are
-  supplied only when required by the selected adapter contract.
+- **Target:** a logical target identifier whose runtime configuration selects an
+  adapter identifier. The adapter identifier is resolved against the compiled-in
+  adapter registry to select the concrete adapter implementation. Endpoint,
+  credentials, TLS or trust settings including private CAs, and adapter-specific
+  values are supplied only when required by the selected adapter contract.
 - **Runtime:** listen address and port, shorter per-operation timeouts,
   bounded synchronization concurrency or capacity, one bounded overall
   synchronization deadline, logging, and metrics.

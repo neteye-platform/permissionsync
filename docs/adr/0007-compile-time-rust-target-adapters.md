@@ -59,17 +59,19 @@ generic PermissionSync binary and OCI image. Core depends on no concrete
 adapter crate. An adapter may depend on Core only through Core's public
 contract and public types; it may use its own third-party dependencies, but
 not Core internals or other adapter crates. The composition root depends on
-Core and supported adapter crates and deterministically maps each logical
-adapter ID to its compiled implementation. One generic product image
+Core and supported adapter crates and deterministically maps each adapter
+identifier to its compiled adapter implementation. One generic product image
 contains all supported adapters; deployment has no cargo-feature matrix, and
 the image identity includes the complete linked adapter set.
 
-Runtime configuration selects only a compiled-in adapter. It cannot download,
-install, load, or select an implementation absent from the binary. There is no
-dynamic loading, `.so`, sidecar, microservice, adapter OCI artifact, loader,
-independent adapter-artifact digest or version selection, hot loading, or
-independent adapter release mechanism. Product OCI image digests remain valid
-for identifying the complete product image.
+Runtime configuration for a recognized logical target selects an adapter
+identifier. That identifier is resolved only against the compiled-in adapter
+registry; PermissionSync cannot download, install, load, or select an
+implementation absent from the binary. There is no dynamic loading, `.so`,
+sidecar, microservice, adapter OCI artifact, loader, independent adapter-artifact
+digest or version selection, hot loading, or independent adapter release
+mechanism. Product OCI image digests remain valid for identifying the complete
+product image.
 
 Target-native integration is preferred first, then a reusable standard
 integration where appropriate, then a PermissionSync adapter only when those
@@ -221,8 +223,8 @@ does not prove review or safety.
 
 Deferred details are the workspace paths, crate names and repository layout,
 exact `TargetAdapter` signature and associated types/errors/versioning,
-composition-root registration API, runtime configuration schema and logical
-adapter-ID grammar, target context and credential projection, concrete target
+composition-root registration API, runtime configuration schema and adapter
+identifier grammar, target context and credential projection, concrete target
 API contracts, and implementation-level capacity, timeout, observability,
 trust-material, and secret-delivery mechanisms. These deferrals permit no
 dynamic adapter mechanism or change to the static-linking and security
