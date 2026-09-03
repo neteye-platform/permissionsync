@@ -104,23 +104,25 @@ Provider configuration, endpoint, authentication or credentials, TLS or trust
 settings, and provider-specific configuration are validated eagerly where
 practical but are required only when a selected target is reconciled. Missing
 or invalid provider dependencies make a selected target's synchronization
-return `500`. An unknown or unsupported target returns `400` under
-[ADR 0001](0001-inbound-synchronization-contract.md); the service may remain
-ready when it can authenticate, authorize, validate, route, and return those
-outcomes. Provider configuration failures are exposed safely through logs,
-metrics, or status where appropriate, without choosing health or status
-mechanisms.
+return `500`. An authorized caller whose logical target is unknown or
+unrecognized by the runtime routing/configuration contract receives `400` under
+[ADR 0001](0001-inbound-synchronization-contract.md). Provider configuration
+failures are exposed safely through logs, metrics, or status where appropriate,
+without choosing health or status mechanisms. The service may remain ready when
+it can authenticate, authorize, validate, route, and return those outcomes.
 
-Isolated target-local errors are detected eagerly where practical and make
-only that target unusable. They include a configured adapter identifier absent
-from the current compiled-in registry, missing required endpoint or
-credentials, malformed endpoint, invalid target TLS or trust configuration
-where applicable, and missing or invalid required adapter-specific
-configuration. The selected adapter contract determines which target
-configuration is required. When an absent adapter key is detectable, no
-Permission Provider or Target Adapter work begins for that target. The service
-may remain ready; that known target returns `500`, while other valid targets
-process normally. Unknown or unsupported targets return `400`. Runtime
+Isolated target-local errors are detected eagerly where practical and make only
+that target unusable. A recognized logical target with unavailable or broken
+server-side adapter or target configuration is a target-local `500`. Examples
+include a configured adapter identifier absent from the current compiled-in
+registry, missing required endpoint or credentials, malformed endpoint, invalid
+target TLS or trust configuration where applicable, missing or invalid required
+adapter-specific configuration, or an equivalent deployment/composition
+defect. The selected adapter contract determines which target configuration is
+required. When such an error is detectable after logical resolution and before
+capacity, no Permission Provider or Target Adapter work begins. The service may
+remain ready; that target returns `500`, while other correct targets remain
+serviceable. Unknown or unrecognized logical targets return `400`. Runtime
 unavailability after valid configuration is a synchronization failure.
 
 ### Statelessness, deadlines, capacity, and delivery

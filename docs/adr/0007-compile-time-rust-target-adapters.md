@@ -90,14 +90,17 @@ For every request, the complete order is:
 4. Authorize the authenticated caller for that derived scope. A valid caller
    lacking the required scope returns `403`. This authorization check happens
    before full strict request validation, before target resolution, and before
-   any check of whether the target is supported or configured.
+   any check of whether the logical target is recognized or configured.
 5. Perform full strict validation of the fixed five-field request body. An
    invalid request returns `400`.
 6. Resolve the target. If the caller was authorized for the derived target
-   scope but the target is unknown or unsupported, return `400` under ADR 0001.
-7. If the resolved target names an adapter key absent from the compiled-in
-   registry and that error is detectable, return target-local `500` with no
-   capacity, provider, or adapter work; unrelated routes remain serviceable.
+   scope but the logical target is unknown or unrecognized by the runtime
+   routing/configuration contract, return `400` under ADR 0001.
+7. If the recognized logical target names an adapter key absent from the
+   compiled-in registry, or has another unavailable or broken server-side
+   adapter/configuration defect that is detectable, return target-local `500`
+   with no capacity, provider, or adapter work; unrelated correct targets
+   remain serviceable.
 8. Obtain bounded capacity.
 9. Invoke the Permission Provider once.
 10. Structurally validate the resulting payload envelope (`{version, payload}`).
@@ -107,18 +110,23 @@ For every request, the complete order is:
 
 Authorization for the derived scope precedes target resolution, so an
 authenticated caller who lacks `permissionsync:<target>` for a target name
-receives `403` before PermissionSync determines whether that target exists or is
-supported. Target existence is not revealed to unauthorized callers. An
-authenticated and authorized caller who requests a target that is unknown or
-unsupported receives `400`. No Permission Provider or Target Adapter work begins
-before authentication, authorization, full strict request validation, and
-target resolution succeed.
+receives `403` before PermissionSync determines whether that target is
+recognized or configured. Target existence and server-side configuration are
+not revealed to unauthorized callers. An authenticated and authorized caller
+who requests a logical target that is unknown or unrecognized by the runtime
+routing/configuration contract receives `400`; a recognized logical target with
+an unavailable or broken server-side adapter/configuration receives target-local
+`500`. An unauthorized caller receives neither the unknown-target `400` nor the
+target-local `500`. No Permission Provider or Target Adapter work begins before
+authentication, authorization, full strict request validation, and target
+resolution succeed.
 
 Globally ambiguous or structurally unusable routing is a global startup or
 readiness error under [ADR 0006](0006-runtime-configuration-oci-and-observability.md).
-A target-local adapter-selection or target-configuration error may be detected
-eagerly where practical while leaving the service ready and returning `500`
-only for that target; unrelated routes remain available.
+A target-local adapter-selection or target-configuration error for a recognized
+logical target may be detected eagerly where practical while leaving the
+service ready and returning `500` only for that target; unrelated correct
+targets remain available.
 
 Adapter reconciliation owns target lookup, adapter-specific payload and
 target-semantic validation of the complete envelope before mutation, target
@@ -130,6 +138,10 @@ It reports whether reconciliation changed target state (`changed`) or left it
 unchanged (`unchanged`) without exposing exactly what resource was created or
 modified. One reconciliation may make multiple target calls; there is no
 automatic retry or rollback.
+
+Adapter-specific payload or target-semantic validation failures for a
+recognized logical target are server-side failures and return target-local
+`500`; they are not unknown-target `400` responses.
 
 The overall deadline and cancellation propagate through provider and adapter
 work; a COMPLIANT Target Adapter has bounded execution. Each compliant adapter:
@@ -217,7 +229,10 @@ dynamic adapter mechanism or change to the static-linking and security
 boundary decision.
 
 Tests must verify Core's independence from concrete adapters; adapters' use of
-only public Core contract/types; `400` for an unknown or unsupported target;
+only public Core contract/types; `400` for an unknown or unrecognized logical
+target and target-local `500` for a recognized target with unavailable or broken
+server-side adapter/configuration; adapter-specific payload or target-semantic
+failures remain target-local `500`, not unknown-target `400`;
 exactly-once composition-root linking and deterministic ID mapping; complete
 envelope-structure and target-semantic payload validation before mutation; and
 absence of secret or sensitive logging. They must cover the `200`/`204`
@@ -230,6 +245,23 @@ reconciliation, and whole-replica impact from non-cooperative defects. Every
 supported adapter is compiled and tested on every PR; image tests must confirm
 all supported adapters are present and no dynamic loader, separate adapter
 artifact, or download path is implied; rolling image revisions may coexist.
+
+If a shared target HTTP client or common transport owns target TLS policy, that
+layer MUST have hermetic, deterministic tests that verify:
+
+- a sensitive `http://` endpoint is rejected before any sensitive traffic;
+- configuration that disables certificate validation is rejected;
+- configuration that disables hostname validation is rejected;
+- a local TLS server using an explicitly configured test/private CA succeeds
+  when certificate and hostname validation succeed; and
+- an untrusted certificate is rejected.
+
+These tests use only local fake or test TLS endpoints, deterministic
+certificates and fixtures, and never weaken production validation. They do not
+use the public internet or real GLPI/Grafana. An adapter that owns its own
+target transport requires equivalent coverage; an adapter using the tested
+shared transport need not duplicate it. Adapter-specific tests remain focused
+on adapter behavior.
 
 Target-identifier grammar tests under
 [ADR 0001](0001-inbound-synchronization-contract.md) MUST cover at least:

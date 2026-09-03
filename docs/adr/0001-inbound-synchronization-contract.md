@@ -22,7 +22,7 @@ PermissionSync exposes this synchronous request:
 The JSON body has exactly these five fields and no others:
 
 - `event_type`: string, exactly `LOGIN`.
-- `target`: non-null string identifying the requested target/adapter, matching
+- `target`: non-null string identifying the requested logical target, matching
   the v1 target identifier grammar.
 - `username`: non-null string, the canonical NetEye user key.
 - `groups`: array of strings supplied as full group-path values.
@@ -33,8 +33,9 @@ JSON fields rather than ignoring them. At minimum, `400` applies to malformed
 JSON, a missing required field, an unknown extra field, or a wrong JSON type. It
 also applies to `event_type` other than `LOGIN`, an illegal null for a
 non-nullable field, `groups` that is not an array, a non-string group member, or
-a timestamp that is not ISO-8601 UTC with whole-second precision. An unknown or
-unsupported `target` is rejected with `400`.
+a timestamp that is not ISO-8601 UTC with whole-second precision. A logical
+target that is unknown or unrecognized by the runtime routing/configuration
+contract is rejected with `400` during target resolution.
 
 The v1 `target` identifier grammar is:
 
@@ -85,13 +86,16 @@ The processing order for every request is fixed:
    caller lacks the required scope, return `403`. This authorization check
    intentionally happens BEFORE full strict validation of the remaining
    request fields, before target resolution, and before any check of whether
-   the target is actually supported or configured: an authenticated caller who
-   is not authorized for a target name must not be able to determine whether
-   that target exists or is supported.
+   the target is recognized or configured: an authenticated caller who is not
+   authorized for a target name must not be able to determine whether that
+   target exists or is recognized.
 5. Perform full strict validation of the fixed five-field request body. An
    invalid request returns `400`.
 6. Resolve the target. If the caller was authorized for the derived target
-   scope but the target is unknown or unsupported, return `400`.
+   scope but the logical target is unknown or unrecognized by the runtime
+   routing/configuration contract, return `400`. A recognized logical target
+   whose server-side adapter or required target configuration is unavailable or
+   broken returns target-local `500` as described by ADR 0006 and ADR 0007.
 7. Obtain bounded synchronization capacity.
 8. Invoke the Permission Provider once.
 9. Structurally validate the `{version, payload}` envelope.
@@ -108,20 +112,26 @@ Delivery and reconciliation behavior is defined by
 
 Because authorization for the derived scope precedes target resolution, an
 authenticated caller who lacks `permissionsync:<target>` for a given target name
-receives `403` before PermissionSync determines whether that target exists or is
-supported. PermissionSync does not reveal target existence to unauthorized
-callers. An authenticated and authorized caller who requests a target that is
-unknown or unsupported receives `400`.
+receives `403` before PermissionSync determines whether that target is recognized
+or configured. PermissionSync does not reveal target existence or server-side
+configuration to unauthorized callers. An authenticated and authorized caller
+who requests a logical target that is unknown or unrecognized by the runtime
+routing/configuration contract receives `400`; a recognized logical target with
+an unavailable or broken server-side adapter or target configuration receives
+target-local `500`. An unauthorized caller receives neither the unknown-target
+`400` nor the target-local `500`.
 
 Response semantics are:
 
 - `200`: successful reconciliation and target state changed.
 - `204`: successful reconciliation but target state was already in the desired
   state.
-- `400`: invalid request, or an unknown or unsupported target.
+- `400`: invalid request, or an unknown or unrecognized logical target.
 - `401`: caller credential validation failure.
 - `403`: authenticated but not authorized for the requested target.
-- `500`: synchronization, internal, provider, adapter, or server-side failure.
+- `500`: synchronization, internal, provider, adapter, or other server-side
+  failure, including unavailable or broken configuration for a recognized
+  logical target.
 
 PermissionSync is a reconciliation service. Target-side resource creation is an
 implementation detail of reconciliation and does not control the public HTTP

@@ -205,17 +205,23 @@ PermissionSync audience, disallowed algorithm, a missing signing key after a
 successful trusted JWKS refresh, or another cryptographically unverifiable token
 after the trusted source was successfully consulted.
 
+If a metadata refresh times out or its source fails, that failure alone does not
+return `500`. If still-usable cached trusted verification state safely verifies
+the signature and normal authentication claims, processing continues through
+normal authorization. If existing cached state definitively proves the token
+invalid, return `401` even when the refresh also failed.
+
 Return `403` only after successful authentication when `scope` is absent, empty,
 or is syntactically valid but lacks the exact `permissionsync:<target>` token
 required for the requested target. Wrong-shaped or nonempty malformed `scope`
 returns `401` as specified above. Return `500` when PermissionSync cannot
-establish validity because verifier infrastructure is unavailable. This
-includes unavailable JWKS with no usable cached trusted verification state,
-required discovery with no usable cached metadata, refresh timeout, or
-unexpectedly unavailable trusted verification configuration. A usable cached
-trusted verification state may verify a token during a temporary JWKS or
-discovery outage only when all the conditions above succeed. A source failure
-never accepts a token by itself.
+establish validity because verifier infrastructure is unavailable and no
+still-usable cached trusted verification state can establish validity. This
+includes unavailable JWKS or required discovery, including a refresh timeout,
+when no such cached state exists, or unexpectedly unavailable trusted
+verification configuration. A usable cached trusted verification state may
+verify a token during a temporary JWKS or discovery outage only when all the
+conditions above succeed. A source failure never accepts a token by itself.
 
 Remote JWKS and discovery verification operations have bounded timeouts and
 consume the remaining overall request budget under
