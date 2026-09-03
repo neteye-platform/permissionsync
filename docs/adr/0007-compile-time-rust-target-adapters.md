@@ -93,7 +93,7 @@ For every request, the complete order is:
    lacking the required scope returns `403`. This authorization check happens
    before full strict request validation, before target resolution, and before
    any check of whether the logical target is recognized or configured.
-5. Perform full strict validation of the fixed five-field request body. An
+5. Perform full strict validation of the fixed four-field request body. An
    invalid request returns `400`.
 6. Resolve the target. If the caller was authorized for the derived target
    scope but the logical target is unknown or unrecognized by the runtime

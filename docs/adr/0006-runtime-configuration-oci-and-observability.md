@@ -213,7 +213,7 @@ and are not required for v1.
 
 Correlation is optional. The runtime supports propagating a future identifier
 when it is supplied in an HTTP transport header, but no header or name is
-required, and no correlation or request ID is added to the fixed five-field
+required, and no correlation or request ID is added to the fixed four-field
 body. No body field is used for correlation, and current events must not assume
 an identifier.
 

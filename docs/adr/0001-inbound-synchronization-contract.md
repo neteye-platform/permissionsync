@@ -19,23 +19,21 @@ PermissionSync exposes this synchronous request:
     Authorization: Bearer <technical-service-jwt>
     Content-Type: application/json
 
-The JSON body has exactly these five fields and no others:
+The JSON body has exactly these four fields and no others:
 
 - `event_type`: string, exactly `LOGIN`.
 - `target`: non-null string identifying the requested logical target, matching
   the v1 target identifier grammar.
 - `username`: non-null string, the canonical NetEye user key.
 - `groups`: array of strings supplied as full group-path values.
-- `timestamp`: ISO-8601 UTC string truncated to whole seconds.
 
 PermissionSync validates the body strictly; it rejects invalid JSON and unknown
 JSON fields rather than ignoring them. At minimum, `400` applies to malformed
 JSON, a missing required field, an unknown extra field, or a wrong JSON type. It
 also applies to `event_type` other than `LOGIN`, an illegal null for a
-non-nullable field, `groups` that is not an array, a non-string group member, or
-a timestamp that is not ISO-8601 UTC with whole-second precision. A logical
-target that is unknown or unrecognized by the runtime routing/configuration
-contract is rejected with `400` during target resolution.
+non-nullable field, `groups` that is not an array, or a non-string group member.
+A logical target that is unknown or unrecognized by the runtime
+routing/configuration contract is rejected with `400` during target resolution.
 
 The v1 `target` identifier grammar is:
 
@@ -62,8 +60,7 @@ validation.
       "event_type": "LOGIN",
       "target": "glpi",
       "username": "jdoe",
-      "groups": ["/staff", "/staff/engineering"],
-      "timestamp": "2026-08-24T09:15:32Z"
+      "groups": ["/staff", "/staff/engineering"]
     }
 
 The body must not gain request, event, or correlation IDs, idempotency keys,
@@ -89,7 +86,7 @@ The processing order for every request is fixed:
    the target is recognized or configured: an authenticated caller who is not
    authorized for a target name must not be able to determine whether that
    target exists or is recognized.
-5. Perform full strict validation of the fixed five-field request body. An
+5. Perform full strict validation of the fixed four-field request body. An
    invalid request returns `400`.
 6. Resolve the target. If the caller was authorized for the derived target
    scope but the logical target is unknown or unrecognized by the runtime

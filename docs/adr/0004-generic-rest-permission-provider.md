@@ -16,8 +16,8 @@ specification.
 
 Use a generic REST Permission Provider as the v1 desired-state boundary.
 PermissionSync calls the configured provider with synchronized-user identity
-context, relevant inbound group membership and login metadata, and the requested
-target. The provider resolves and returns the versioned adapter-specific
+context, relevant inbound group membership, and the requested target. The
+provider resolves and returns the versioned adapter-specific
 envelope for that user and target. The synchronized-user identity context is
 information about the end user whose desired permissions are being resolved; it
 is not an authentication identity or context and must not be confused with the
@@ -38,9 +38,9 @@ certificate verification must not be disabled as a workaround. One reusable
 OCI image can therefore serve different permission backends.
 
 Every outbound Permission Provider API request always carries synchronized-user
-information, such as username, group membership, login metadata, and the
-requested target. Therefore ALL HTTP Permission Provider requests in v1 MUST use
-HTTPS, not only requests that happen to carry authentication credentials. An
+identity context, relevant inbound group membership, and the requested target.
+Therefore ALL HTTP Permission Provider requests in v1 MUST use HTTPS, not only
+requests that happen to carry authentication credentials. An
 HTTPS URI is required for all Provider requests, with TLS certificate validation
 and hostname validation; TLS verification MUST NOT be disabled, and plaintext
 `http://` MUST NOT be used for a Provider request. Private or internal CAs

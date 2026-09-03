@@ -28,9 +28,8 @@ request.
 For each inbound request, PermissionSync invokes Permission Provider resolution
 at most once and selected Target Adapter reconciliation at most once. It does
 not replay work or deduplicate requests. It must never merge requests by
-byte-identical bodies, username and target and timestamp tuples, caller
-identity, or inferred fingerprints. Identical bodies can represent separate,
-valid login events.
+byte-identical bodies, a username-and-target tuple, caller identity, or inferred
+fingerprints. Identical bodies can represent separate, valid login events.
 
 One adapter reconciliation can make multiple required downstream API
 operations, such as lookup, create, read, or update. These are not multiple
