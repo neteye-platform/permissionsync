@@ -28,7 +28,7 @@ request.
 For each inbound request, PermissionSync invokes Permission Provider resolution
 at most once and selected Target Adapter reconciliation at most once. It does
 not replay work or deduplicate requests. It must never merge requests by
-byte-identical bodies, username and client and timestamp tuples, caller
+byte-identical bodies, username and target and timestamp tuples, caller
 identity, or inferred fingerprints. Identical bodies can represent separate,
 valid login events.
 
@@ -41,11 +41,17 @@ A future retry policy requires an explicit ADR and supporting evidence.
 PermissionSync v1 is stateless. It has no persistent replay queue and adds no
 persistence solely to provide delivery guarantees.
 
-This decision makes no exactly-once promise. Where practical, Target Adapters
-should reconcile idempotently by comparing current managed state with desired
-managed state, rather than making blind additive changes. They must tolerate
-repeated legitimate desired-state synchronizations and uncertain downstream
-effects.
+This decision makes no exactly-once promise and introduces no automatic retry.
+The single-attempt, no-retry policy applies to both Permission Provider and
+Target Adapter invocations. The adapter idempotent-convergence contract is:
+each Target Adapter reconciles toward the desired state idempotently, comparing
+current target state with desired state rather than making blind additive
+changes, so that repeated legitimate desired-state synchronizations converge the
+target to the desired state. Adapters must tolerate uncertain downstream effects
+from a previous attempt. This convergence contract does not create any delivery
+or exactly-once guarantee, and it does not add automatic retry; see
+[ADR 0007](0007-compile-time-rust-target-adapters.md) for how the contract
+applies to adapter reconciliation.
 
 ## Alternatives considered
 

@@ -50,8 +50,8 @@ PermissionSync uses these statuses:
    At-Most-Once Delivery and Idempotent Reconciliation (Accepted)
 4. [0004](0004-generic-rest-permission-provider.md) Generic REST Permission
    Provider for v1 (Accepted)
-5. [0005](0005-bounded-desired-permission-model.md) Bounded Desired-Permission
-   Model (Accepted)
+5. [0005](0005-versioned-adapter-specific-desired-state-envelope.md) Versioned Adapter-Specific
+   Desired-State Envelope (Accepted)
 6. [0006](0006-runtime-configuration-oci-and-observability.md) Runtime
    Configuration, Stateless OCI Operation, and Safe Observability (Accepted)
 7. [0007](0007-compile-time-rust-target-adapters.md) Core Boundaries and

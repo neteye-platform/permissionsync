@@ -16,18 +16,38 @@ specification.
 
 Use a generic REST Permission Provider as the v1 desired-state boundary.
 PermissionSync calls the configured provider with synchronized-user identity
-context, relevant inbound group membership and login metadata, and an explicit
-target or client identifier. The provider resolves the desired permissions for
-that user. The synchronized-user identity context is information about the end
-user whose desired permissions are being resolved; it is not an authentication
-identity or context and must not be confused with the technical caller
-authenticated by PermissionSync.
+context, relevant inbound group membership and login metadata, and the requested
+target. The provider resolves and returns the versioned adapter-specific
+envelope for that user and target. The synchronized-user identity context is
+information about the end user whose desired permissions are being resolved; it
+is not an authentication identity or context and must not be confused with the
+technical caller authenticated by PermissionSync.
+
+The provider returns a common envelope containing a versioned, target-specific
+payload (`{version, payload}`). The envelope is defined by
+[ADR
+0005](0005-versioned-adapter-specific-desired-state-envelope.md). The provider
+must know which target is being requested and return the payload contract
+expected by that target's adapter; it keeps no universal permission
+vocabulary.
 
 Runtime configuration supplies the provider type, endpoint, authentication or
 credentials, TLS and trust settings (including private or internal CA trust),
 and a bounded timeout. Provider credentials use least privilege, and TLS
 certificate verification must not be disabled as a workaround. One reusable
 OCI image can therefore serve different permission backends.
+
+Every outbound Permission Provider API request always carries synchronized-user
+information, such as username, group membership, login metadata, and the
+requested target. Therefore ALL HTTP Permission Provider requests in v1 MUST use
+HTTPS, not only requests that happen to carry authentication credentials. An
+HTTPS URI is required for all Provider requests, with TLS certificate validation
+and hostname validation; TLS verification MUST NOT be disabled, and plaintext
+`http://` MUST NOT be used for a Provider request. Private or internal CAs
+remain supported through configured trust material. Provider credentials use
+least privilege. The concrete TLS implementation and library, and the concrete
+provider authentication scheme, are implementation decisions and are not chosen
+in this ADR.
 
 The authentication mechanism, configuration library, configuration values and
 timeout value remain deferred. The request and response wire contract,
@@ -61,14 +81,16 @@ can support different backends. A future wire specification can evolve without
 changing this boundary.
 
 This decision does not define a universal IAM ontology, target-specific
-property bags, runtime libraries or a target API schema. The bounded
-desired-permission model is defined by [ADR
-0005](0005-bounded-desired-permission-model.md); the detailed provider REST
-wire specification remains deferred.
+property bags, runtime libraries or a target API schema. The versioned
+adapter-specific payload envelope is defined by
+[ADR
+0005](0005-versioned-adapter-specific-desired-state-envelope.md); the detailed
+provider REST wire specification remains deferred.
 
 ## References
 
 - [ADR 0001](0001-inbound-synchronization-contract.md)
 - [ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md)
-- [ADR 0005](0005-bounded-desired-permission-model.md)
+- [ADR 0005](0005-versioned-adapter-specific-desired-state-envelope.md)
 - [ADR 0006](0006-runtime-configuration-oci-and-observability.md)
+- [ADR 0007](0007-compile-time-rust-target-adapters.md)

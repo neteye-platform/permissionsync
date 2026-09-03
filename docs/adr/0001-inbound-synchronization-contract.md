@@ -15,78 +15,124 @@ decisions.
 
 PermissionSync exposes this synchronous request:
 
-```http
-POST /api/sync-user
-Authorization: Bearer <technical-service-jwt>
-Content-Type: application/json
-```
+    POST /api/sync-user
+    Authorization: Bearer <technical-service-jwt>
+    Content-Type: application/json
 
-The JSON body has exactly these six fields and no others:
+The JSON body has exactly these five fields and no others:
 
 - `event_type`: string, exactly `LOGIN`.
-- `client_id`: non-null string OIDC client and target selector.
-- `username`: non-null string.
-- `email`: nullable string.
+- `target`: non-null string identifying the requested target/adapter, matching
+  the v1 target identifier grammar.
+- `username`: non-null string, the canonical NetEye user key.
 - `groups`: array of strings supplied as full group-path values.
 - `timestamp`: ISO-8601 UTC string truncated to whole seconds.
 
 PermissionSync validates the body strictly; it rejects invalid JSON and unknown
 JSON fields rather than ignoring them. At minimum, `400` applies to malformed
-JSON, a missing required field, an unknown extra field, or a wrong JSON type,
-including for `email`. It also applies to `event_type` other than `LOGIN`, an
-illegal null for a non-nullable field, `groups` that is not an array, a
-non-string group member, or a timestamp that is not ISO-8601 UTC with
-whole-second precision.
+JSON, a missing required field, an unknown extra field, or a wrong JSON type. It
+also applies to `event_type` other than `LOGIN`, an illegal null for a
+non-nullable field, `groups` that is not an array, a non-string group member, or
+a timestamp that is not ISO-8601 UTC with whole-second precision. An unknown or
+unsupported `target` is rejected with `400`.
 
-`client_id` and `username` require non-null strings, with no additional grammar
-imposed. Group strings are preserved as provided, with no new path grammar
-imposed. A non-null string `client_id` passes wire-schema validation; configured
-target recognition is target resolution under
-[ADR 0006](0006-runtime-configuration-oci-and-observability.md),
-not JSON validation.
+The v1 `target` identifier grammar is:
 
-```json
-{
-  "event_type": "LOGIN",
-  "client_id": "example-client",
-  "username": "alex",
-  "email": "alex@example.test",
-  "groups": ["/engineering/platform", "/engineering/security"],
-  "timestamp": "2026-08-25T12:34:56Z"
-}
-```
+    ^[a-z0-9]([a-z0-9._-]{0,62}[a-z0-9])?$
+
+The match is ASCII-only, lowercase, 1..64 characters long, and starts and ends
+with an alphanumeric character; a one-character alphanumeric target is valid.
+Internal characters are limited to `a-z`, `0-9`, `.`, `_`, and `-`. No leading
+or trailing separator, spaces, colons, quotes, backslashes, control characters,
+or arbitrary Unicode are allowed. Because `target` is used directly to derive
+`permissionsync:<target>`, it is NOT an arbitrary non-null string; a `target`
+that violates this grammar is rejected with `400` during the minimal target
+validation that precedes scope derivation, so a caller cannot force arbitrary
+input into an OAuth scope name.
+
+`username` requires a non-null string, with no additional grammar imposed.
+Group strings are preserved as provided, with no new path grammar imposed. A
+`target` matching the identifier grammar passes minimal validation; recognized
+target routing is target resolution under
+[ADR 0006](0006-runtime-configuration-oci-and-observability.md), not JSON
+validation.
+
+    {
+      "event_type": "LOGIN",
+      "target": "glpi",
+      "username": "jdoe",
+      "groups": ["/staff", "/staff/engineering"],
+      "timestamp": "2026-08-24T09:15:32Z"
+    }
 
 The body must not gain request, event, or correlation IDs, idempotency keys,
 retry metadata, or arbitrary metadata without an explicit contract revision.
 Future correlation should be transport metadata, owned by
 [ADR 0006](0006-runtime-configuration-oci-and-observability.md).
 
-The technical caller is authenticated and authorized under
-[ADR 0002](0002-receiver-side-jwt-verification.md), then the request is strictly
-validated. Authentication, authorization, and strict validation occur before
-target resolution, Permission Provider, or Target Adapter work. Target
+The processing order for every request is fixed:
+
+1. Authenticate the technical caller's JWT under
+   [ADR 0002](0002-receiver-side-jwt-verification.md).
+2. Parse and validate the request only enough to obtain a usable `target`
+   value: the body must be parseable enough to read `target`, `target` must be
+   present, `target` must be a non-null string, and `target` must match the v1
+   target identifier grammar. If this minimal target extraction or grammar
+   validation cannot be performed, return `400`.
+3. Derive the required authorization scope deterministically:
+   `permissionsync:<target>`.
+4. Authorize the authenticated technical caller for that derived scope. If the
+   caller lacks the required scope, return `403`. This authorization check
+   intentionally happens BEFORE full strict validation of the remaining
+   request fields, before target resolution, and before any check of whether
+   the target is actually supported or configured: an authenticated caller who
+   is not authorized for a target name must not be able to determine whether
+   that target exists or is supported.
+5. Perform full strict validation of the fixed five-field request body. An
+   invalid request returns `400`.
+6. Resolve the target. If the caller was authorized for the derived target
+   scope but the target is unknown or unsupported, return `400`.
+7. Obtain bounded synchronization capacity.
+8. Invoke the Permission Provider once.
+9. Structurally validate the `{version, payload}` envelope.
+10. Invoke the selected Target Adapter once.
+11. Return `200` when reconciliation changed target state, `204` when the
+    target was already in the desired state, or the appropriate error status.
+
+Authentication, authorization, full strict request validation, and target
+resolution all occur before Permission Provider or Target Adapter work. Target
 resolution remains compatible with
 [ADR 0006](0006-runtime-configuration-oci-and-observability.md).
 Delivery and reconciliation behavior is defined by
 [ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md).
 
+Because authorization for the derived scope precedes target resolution, an
+authenticated caller who lacks `permissionsync:<target>` for a given target name
+receives `403` before PermissionSync determines whether that target exists or is
+supported. PermissionSync does not reveal target existence to unauthorized
+callers. An authenticated and authorized caller who requests a target that is
+unknown or unsupported receives `400`.
+
 Response semantics are:
 
-- `200`: successful synchronization.
-- `201`: successful synchronization when PermissionSync can meaningfully
-  report creation of target-side resources.
-- `400`: invalid request.
+- `200`: successful reconciliation and target state changed.
+- `204`: successful reconciliation but target state was already in the desired
+  state.
+- `400`: invalid request, or an unknown or unsupported target.
 - `401`: caller credential validation failure.
-- `403`: authenticated but unauthorized.
-- `500`: synchronization, internal, provider, or adapter failure.
+- `403`: authenticated but not authorized for the requested target.
+- `500`: synchronization, internal, provider, adapter, or server-side failure.
 
-PermissionSync does not define a response body or mandatory public outcome
-enum. Both `200` and `201` are valid success responses; adapter or API
-specifications may refine their selection. Internal models may be richer, but
-cannot replace these wire semantics. An internal adapter result may optionally
-expose creation information when its target contract can determine it
-meaningfully, without defining a public type or enum. No Target Adapter is
-required to expose or determine creation state.
+PermissionSync is a reconciliation service. Target-side resource creation is an
+implementation detail of reconciliation and does not control the public HTTP
+status; `201` is not part of this contract.
+
+The Target Adapter must provide enough internal result information to
+distinguish `changed` from `unchanged` reconciliation. It need not expose
+exactly what resource was created or modified, and no response body is required
+for this distinction. Internal models may be richer, but cannot replace these
+wire semantics.
+
 The caller alone decides whether a result affects authentication or its
 workflow. PermissionSync does not decide authentication success.
 
