@@ -92,7 +92,7 @@ For every request, the complete order is:
    validate it against the v1 target identifier grammar under ADR 0001. A
    grammar-invalid suffix returns `403`.
 5. Perform full strict validation of the fixed three-field request body. An
-   invalid request, including a legacy `target` field, returns `400`.
+   invalid request body returns `400`.
 6. Resolve the extracted target. If the caller held a valid PermissionSync
    scope but the logical target is unknown or unrecognized by the runtime
    routing/configuration contract, return `400` under ADR 0001.
@@ -111,8 +111,8 @@ For every request, the complete order is:
 Scope validation and target extraction precede target resolution, so a caller
 without exactly one valid-grammar `permissionsync:<target>` scope token
 receives `401` or `403` before PermissionSync determines whether any candidate
-target is recognized or configured; there is no caller-supplied target for an
-unauthorized request to reveal. Only once a caller holds exactly one such
+target is recognized or configured, so an unauthorized caller cannot learn
+whether any target name exists. Only once a caller holds exactly one such
 valid token does PermissionSync resolve the extracted target: an unknown or
 unrecognized logical target receives `400`, and a recognized logical target
 with an unavailable or broken server-side adapter/configuration receives
@@ -247,8 +247,8 @@ artifact, or download path is implied; rolling image revisions may coexist.
 Tests must also cover the complete scope-to-target precedence matrix from ADR
 0001 and ADR 0002 — zero, one, and more than one `permissionsync:<target>`
 scope token, and a single token with a grammar-invalid extracted suffix — and
-must verify that a legacy request-body `target` field is rejected as an
-unknown field.
+must verify that a request body field outside the fixed three-field contract
+is rejected as unknown.
 
 If a shared target HTTP client or common transport owns target TLS policy, that
 layer MUST have hermetic, deterministic tests that verify:
@@ -269,8 +269,8 @@ on adapter behavior.
 
 Target-identifier grammar tests under
 [ADR 0001](0001-inbound-synchronization-contract.md) validate the target
-suffix extracted from the caller's `permissionsync:<target>` scope token, not
-any request-body value. They MUST cover at least:
+suffix extracted from the caller's `permissionsync:<target>` scope token. They
+MUST cover at least:
 
 - a one-character alphanumeric extracted target is accepted;
 - a valid 64-character extracted target is accepted;

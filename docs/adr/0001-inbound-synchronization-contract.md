@@ -30,17 +30,15 @@ JSON fields rather than ignoring them. At minimum, `400` applies to malformed
 JSON, a missing required field, an unknown extra field, or a wrong JSON type. It
 also applies to `event_type` other than `LOGIN`, an illegal null for a
 non-nullable field, `groups` that is not an array, or a non-string group member.
-The body carries no `target` field; a legacy request that includes `target` is
-rejected as an unknown extra field and returns `400`.
 
 `username` requires a non-null string, with no additional grammar imposed.
 Group strings are preserved as provided, with no new path grammar imposed.
 
-The logical target is not part of the request body. It is extracted from the
-caller's authorized `permissionsync:<target>` JWT scope token under
+The logical target is extracted from exactly one authorized
+`permissionsync:<target>` JWT scope token under
 [ADR 0002](0002-receiver-side-jwt-verification.md), which is the sole source of
-the logical target. The v1 `target` identifier grammar governs that extracted
-suffix:
+the logical target and the sole target-routing selector. The v1 `target`
+identifier grammar governs that extracted suffix:
 
     ^[a-z0-9]([a-z0-9._-]{0,62}[a-z0-9])?$
 
@@ -85,7 +83,7 @@ The processing order for every request is fixed:
    validate it against the v1 target identifier grammar. A suffix that
    violates the grammar is an unusable authorization grant and returns `403`.
 5. Perform full strict validation of the fixed three-field request body. An
-   invalid request, including a legacy `target` field, returns `400`.
+   invalid request body returns `400`.
 6. Resolve the extracted logical target. If it is unknown or unrecognized by
    the runtime routing/configuration contract, return `400`. A recognized
    logical target whose server-side adapter or required target configuration
@@ -109,13 +107,12 @@ Scope validation and target extraction precede full strict body validation and
 target resolution: a caller without exactly one valid-grammar
 `permissionsync:<target>` scope token is rejected with `401` or `403` before
 PermissionSync evaluates the request body or checks whether any candidate
-target is recognized or configured. There is no caller-supplied request-body
-target, so there is no unauthorized target name whose existence could be
-revealed. Only once a caller holds exactly one such valid token does
-PermissionSync resolve the extracted target: an unknown or unrecognized
-logical target receives `400`, and a recognized logical target with an
-unavailable or broken server-side adapter or target configuration receives
-target-local `500`.
+target is recognized or configured, so an unauthorized caller cannot learn
+whether any target name exists. Only once a caller holds exactly one such
+valid token does PermissionSync resolve the extracted target: an unknown or
+unrecognized logical target receives `400`, and a recognized logical target
+with an unavailable or broken server-side adapter or target configuration
+receives target-local `500`.
 
 Response semantics are:
 
@@ -145,8 +142,7 @@ wire semantics.
 The caller alone decides whether a result affects authentication or its
 workflow. PermissionSync does not decide authentication success.
 
-`/api/sync-user` may be provisional during 0.x. Any route, body, or status
-change requires explicit compatibility work and a caller contract revision.
+Changes to the public wire contract require an explicit contract revision.
 
 ## Alternatives considered
 

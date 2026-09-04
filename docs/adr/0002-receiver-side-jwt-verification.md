@@ -18,13 +18,18 @@ PermissionSync expects the technical caller's bearer JWT in the HTTP
 issued by Keycloak and represents the caller, not the synchronized end user.
 Technical caller access tokens should be short-lived.
 
-The required JWT claims for PermissionSync's contract are:
+PermissionSync uses these JWT claims:
+
+Authentication:
 
     iss
     aud
     exp
     iat
     client_id
+
+Authorization and target selection:
+
     scope
 
 Authentication and authorization use these claims with distinct
@@ -216,20 +221,17 @@ returns `500`; readiness is false while no usable verifier state exists under
 [ADR 0006](0006-runtime-configuration-oci-and-observability.md).
 
 Permission for a target is granted by scope, and that same scope identifies
-the target: PermissionSync derives no target from the request body or any
-other claim. There is no configured role, claim-location indirection, or
-request-supplied target: the logical target and the authorization decision
-both come from the single exact `permissionsync:<target>` scope token, whose
-suffix is validated against the v1 target identifier grammar under
+the target: the logical target and the authorization decision both come from
+the single exact `permissionsync:<target>` scope token, whose suffix is
+validated against the v1 target identifier grammar under
 [ADR 0001](0001-inbound-synchronization-contract.md) so a caller cannot force
-arbitrary routing through an unvalidated value.
-
-The JWT `scope` is therefore both the technical caller's authorization grant
-and the sole logical-target selector. Other, non-PermissionSync OAuth scopes
-MAY be present and have no effect on authorization or routing. Exactly one
-`permissionsync:<target>` token is required; zero such tokens, more than one,
-or one with a grammar-invalid suffix all return `403`, as specified above.
-There is no second target source.
+arbitrary routing through an unvalidated value. There is no configured role or
+claim-location indirection: this single scope token is both the technical
+caller's authorization grant and the sole logical-target selector. Other,
+non-PermissionSync OAuth scopes MAY be present and have no effect on
+authorization or routing. Exactly one `permissionsync:<target>` token is
+required; zero such tokens, more than one, or one with a grammar-invalid
+suffix all return `403`, as specified above.
 
 JWT parsing, signature verification, standards handling, and cryptographic
 operations MUST use a mature, maintained, standards-compliant library. The

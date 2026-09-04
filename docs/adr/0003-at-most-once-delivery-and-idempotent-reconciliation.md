@@ -16,10 +16,10 @@ identifier.
 
 ## Decision
 
-At-most-once end-to-end delivery applies to the current compatibility caller:
-it submits one logical delivery and does not retry a timeout, I/O failure, 4xx
-response, or 5xx response. A failed delivery may never be replayed, and
-PermissionSync must not assume eventual delivery.
+The v1 caller contract is single-attempt: one logical delivery is submitted,
+and a timeout, I/O failure, 4xx response, or 5xx response is not automatically
+retried. A failed delivery may never be replayed, and PermissionSync must not
+assume eventual delivery.
 
 PermissionSync cannot control all callers. If any caller submits the same
 logical synchronization again, PermissionSync processes it as a new legitimate

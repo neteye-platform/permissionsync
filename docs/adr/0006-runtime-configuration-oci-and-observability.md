@@ -45,10 +45,10 @@ All deployment-specific values are runtime configuration:
   authorization scope convention `permissionsync:<target>` is not a
   configurable value under
   [ADR 0001](0001-inbound-synchronization-contract.md) and
-  [ADR 0002](0002-receiver-side-jwt-verification.md). Routing uses the logical
-  target extracted from the caller's single authorized
+  [ADR 0002](0002-receiver-side-jwt-verification.md). Routing uses only the
+  logical target extracted from the caller's single authorized
   `permissionsync:<target>` JWT scope, together with runtime target
-  configuration. There is no request-body target and no other routing input.
+  configuration.
 - **Provider:** type, endpoint, credentials, TLS or trust settings including
   private CAs, and shorter per-operation timeouts.
 - **Target:** a logical target identifier whose runtime configuration selects an

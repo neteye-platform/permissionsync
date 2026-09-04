@@ -67,9 +67,9 @@ PermissionSync makes at most one bounded provider attempt per inbound
 request and does not retry. Provider failure is explicit and fails
 synchronization; it never means an empty desired-permission set. The provider
 does not reconcile the target, and neither adapters nor the core make
-permission decisions. The caller owns
-what to do with the returned synchronization result. The current compatibility
-caller uses single-attempt, at-most-once delivery under [ADR
+permission decisions. The caller owns what to do with the returned
+synchronization result. Inbound delivery follows the single-attempt,
+at-most-once contract defined by [ADR
 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md).
 
 ## Alternatives considered
