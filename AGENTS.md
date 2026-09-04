@@ -38,19 +38,46 @@
 
 ## Testing and validation
 
-- Run only `prek run --all-files` as the repository-native validation command.
-- Run `git diff --check` for whitespace errors.
-- Inspect `git diff`; optionally inspect `git diff --word-diff` for wording.
-- Do not invent Cargo, test-runner, Docker, Make, build, or other commands.
-- Do not speculate about paths or validation that the repository does not
-  establish.
-- Report skipped checks accurately.
+- The exact Rust toolchain is defined by `rust-toolchain.toml`. Do not override
+  it in CI or documentation.
+- Before completing an implementation PR, run:
+
+  ```sh
+  prek run --all-files --refresh
+  cargo fmt --all -- --check
+  cargo deny --locked check
+  cargo check --workspace --all-targets --all-features --locked
+  cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+  cargo test --workspace --all-features --locked
+  RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+  git diff --check
+  ```
+
+- Install the exact Renovate-managed `cargo-deny` version from
+  `.github/workflows/rust-validation.yaml` before its policy check.
+- Add direct Cargo dependencies only when the current change requires them. Pin
+  direct dependency versions exactly, commit `Cargo.lock` with manifest changes,
+  and use `--locked` for dependency-resolving Cargo commands.
+- New workspace crates must inherit the workspace lints.
+- Tests must be deterministic and isolated: no public Internet access, real
+  external or production services, arbitrary sleeps, wall-clock races, unseeded
+  randomness, execution order, persistent shared state, fixed ports, or
+  developer-specific state. Prefer controlled time, local fakes and fixtures,
+  ephemeral ports, temporary directories, deterministic seeds, explicit
+  synchronization, and bounded timeouts. A flaky test is a bug. Never hide it
+  with automatic test retries.
+- Architecture-specific tests must follow the relevant Accepted ADRs.
+- Inspect `git diff` before finishing.
+- Optionally inspect `git diff --word-diff` when reviewing wording changes.
 
 ## Security
 
 - Never commit credentials, tokens, private keys, secrets, or trust material.
 - Do not disable or weaken TLS verification; comply with security requirements
   in Accepted ADRs.
+- Use mature, well-maintained libraries for TLS, JWT, OAuth/OIDC,
+  cryptography, and signature validation when that work is introduced. Never
+  implement cryptographic primitives from scratch.
 
 ## Before finishing
 
