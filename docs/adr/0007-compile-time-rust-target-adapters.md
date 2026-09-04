@@ -82,20 +82,18 @@ options are insufficient. This ADR does not select SCIM.
 For every request, the complete order is:
 
 1. Authenticate the technical caller JWT under ADR 0002.
-2. Parse and validate the request only enough to obtain a usable `target`
-   value: the body must be parseable enough to read `target`, `target` must be
-   present, `target` must be a non-null string, and `target` must match the v1
-   target identifier grammar under ADR 0001. If this minimal target extraction
-   or grammar validation cannot be performed, return `400`.
-3. Derive the required authorization scope deterministically:
-   `permissionsync:<target>`.
-4. Authorize the authenticated caller for that derived scope. A valid caller
-   lacking the required scope returns `403`. This authorization check happens
-   before full strict request validation, before target resolution, and before
-   any check of whether the logical target is recognized or configured.
-5. Perform full strict validation of the fixed four-field request body. An
-   invalid request returns `400`.
-6. Resolve the target. If the caller was authorized for the derived target
+2. Validate the `scope` claim's shape and, if nonempty, its RFC 6749 syntax
+   under ADR 0002. A wrong-shaped `scope`, or a nonempty `scope` string that
+   violates RFC 6749 syntax, returns `401`.
+3. Require exactly one scope token with the exact, case-sensitive prefix
+   `permissionsync:`. An absent or empty `scope`, a syntactically valid
+   `scope` with no such token, or more than one such token, returns `403`.
+4. Extract the suffix of that one token as the logical target identifier and
+   validate it against the v1 target identifier grammar under ADR 0001. A
+   grammar-invalid suffix returns `403`.
+5. Perform full strict validation of the fixed three-field request body. An
+   invalid request, including a legacy `target` field, returns `400`.
+6. Resolve the extracted target. If the caller held a valid PermissionSync
    scope but the logical target is unknown or unrecognized by the runtime
    routing/configuration contract, return `400` under ADR 0001.
 7. If the recognized logical target names an adapter key absent from the
@@ -110,18 +108,17 @@ For every request, the complete order is:
 12. Return `200` when reconciliation changed target state, `204` when it was
     already in the desired state, or the appropriate error status.
 
-Authorization for the derived scope precedes target resolution, so an
-authenticated caller who lacks `permissionsync:<target>` for a target name
-receives `403` before PermissionSync determines whether that target is
-recognized or configured. Target existence and server-side configuration are
-not revealed to unauthorized callers. An authenticated and authorized caller
-who requests a logical target that is unknown or unrecognized by the runtime
-routing/configuration contract receives `400`; a recognized logical target with
-an unavailable or broken server-side adapter/configuration receives target-local
-`500`. An unauthorized caller receives neither the unknown-target `400` nor the
-target-local `500`. No Permission Provider or Target Adapter work begins before
-authentication, authorization, full strict request validation, and target
-resolution succeed.
+Scope validation and target extraction precede target resolution, so a caller
+without exactly one valid-grammar `permissionsync:<target>` scope token
+receives `401` or `403` before PermissionSync determines whether any candidate
+target is recognized or configured; there is no caller-supplied target for an
+unauthorized request to reveal. Only once a caller holds exactly one such
+valid token does PermissionSync resolve the extracted target: an unknown or
+unrecognized logical target receives `400`, and a recognized logical target
+with an unavailable or broken server-side adapter/configuration receives
+target-local `500`. No Permission Provider or Target Adapter work begins
+before authentication, scope validation and target extraction, full strict
+request validation, and target resolution succeed.
 
 Globally ambiguous or structurally unusable routing is a deterministic global
 startup failure under [ADR 0006](0006-runtime-configuration-oci-and-observability.md).
@@ -247,6 +244,11 @@ reconciliation, and whole-replica impact from non-cooperative defects. Every
 supported adapter is compiled and tested on every PR; image tests must confirm
 all supported adapters are present and no dynamic loader, separate adapter
 artifact, or download path is implied; rolling image revisions may coexist.
+Tests must also cover the complete scope-to-target precedence matrix from ADR
+0001 and ADR 0002 — zero, one, and more than one `permissionsync:<target>`
+scope token, and a single token with a grammar-invalid extracted suffix — and
+must verify that a legacy request-body `target` field is rejected as an
+unknown field.
 
 If a shared target HTTP client or common transport owns target TLS policy, that
 layer MUST have hermetic, deterministic tests that verify:
@@ -266,14 +268,17 @@ shared transport need not duplicate it. Adapter-specific tests remain focused
 on adapter behavior.
 
 Target-identifier grammar tests under
-[ADR 0001](0001-inbound-synchronization-contract.md) MUST cover at least:
+[ADR 0001](0001-inbound-synchronization-contract.md) validate the target
+suffix extracted from the caller's `permissionsync:<target>` scope token, not
+any request-body value. They MUST cover at least:
 
-- a one-character alphanumeric target is accepted;
-- a valid 64-character target is accepted;
-- a 65-character target is rejected;
-- a leading separator is rejected;
-- a trailing separator is rejected; and
-- internal `.`, `_`, and `-` characters are accepted.
+- a one-character alphanumeric extracted target is accepted;
+- a valid 64-character extracted target is accepted;
+- a 65-character extracted target is rejected, returning `403`;
+- a leading separator in the extracted target is rejected, returning `403`;
+- a trailing separator in the extracted target is rejected, returning `403`;
+  and
+- internal `.`, `_`, and `-` characters in the extracted target are accepted.
 
 For every adapter, where the target behavior can be represented by a
 deterministic fake/test double, idempotent-convergence must be tested for at

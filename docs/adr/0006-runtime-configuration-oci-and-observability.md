@@ -41,13 +41,14 @@ All deployment-specific values are runtime configuration:
 
 - **Inbound:** trusted issuer, trusted JWKS or discovery source, expected
   PermissionSync audience, and algorithm allowlist (see
-  [ADR 0002](0002-receiver-side-jwt-verification.md)). Authorization scope is
-  not a configurable value: it is derived deterministically from the minimally
-  validated target identifier by the convention `permissionsync:<target>`
-  under [ADR 0001](0001-inbound-synchronization-contract.md). Routing uses the
-  request body's `target` together with runtime target configuration. JWT
-  `scope` only authorizes the technical caller; it never selects, supplies,
-  defaults, or overrides routing.
+  [ADR 0002](0002-receiver-side-jwt-verification.md)). The PermissionSync
+  authorization scope convention `permissionsync:<target>` is not a
+  configurable value under
+  [ADR 0001](0001-inbound-synchronization-contract.md) and
+  [ADR 0002](0002-receiver-side-jwt-verification.md). Routing uses the logical
+  target extracted from the caller's single authorized
+  `permissionsync:<target>` JWT scope, together with runtime target
+  configuration. There is no request-body target and no other routing input.
 - **Provider:** type, endpoint, credentials, TLS or trust settings including
   private CAs, and shorter per-operation timeouts.
 - **Target:** a logical target identifier whose runtime configuration selects an
@@ -78,9 +79,10 @@ fundamentally invalid listener or runtime configuration; and ambiguous,
 contradictory, or structurally unusable target routing. These errors cannot
 recover merely by waiting.
 Authorization scope is not runtime configuration, so there is no configurable
-authorization mapping or policy to validate; it is derived from the minimally
-validated target identifier by convention under
-[ADR 0001](0001-inbound-synchronization-contract.md).
+authorization mapping or policy to validate; the logical target is extracted
+from the caller's authorized `permissionsync:<target>` scope by convention
+under [ADR 0001](0001-inbound-synchronization-contract.md) and
+[ADR 0002](0002-receiver-side-jwt-verification.md).
 
 Startup and readiness distinguish invalid static local configuration from a
 temporarily unreachable Keycloak:
@@ -221,7 +223,7 @@ and are not required for v1.
 
 Correlation is optional. The runtime supports propagating a future identifier
 when it is supplied in an HTTP transport header, but no header or name is
-required, and no correlation or request ID is added to the fixed four-field
+required, and no correlation or request ID is added to the fixed three-field
 body. No body field is used for correlation, and current events must not assume
 an identifier.
 

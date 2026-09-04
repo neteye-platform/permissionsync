@@ -16,12 +16,14 @@ specification.
 
 Use a generic REST Permission Provider as the v1 desired-state boundary.
 PermissionSync calls the configured provider with synchronized-user identity
-context, relevant inbound group membership, and the requested target. The
-provider resolves and returns the versioned adapter-specific
-envelope for that user and target. The synchronized-user identity context is
-information about the end user whose desired permissions are being resolved; it
-is not an authentication identity or context and must not be confused with the
-technical caller authenticated by PermissionSync.
+context, relevant inbound group membership, and the logical target selected by
+the caller's authorized `permissionsync:<target>` JWT scope (see
+[ADR 0002](0002-receiver-side-jwt-verification.md)). The provider resolves and
+returns the versioned adapter-specific envelope for that user and target. The
+synchronized-user identity context is information about the end user whose
+desired permissions are being resolved; it is not an authentication identity or
+context and must not be confused with the technical caller authenticated by
+PermissionSync.
 
 The provider returns a common envelope containing a versioned, target-specific
 payload (`{version, payload}`). The envelope is defined by
@@ -38,8 +40,9 @@ certificate verification must not be disabled as a workaround. One reusable
 OCI image can therefore serve different permission backends.
 
 Every outbound Permission Provider API request always carries synchronized-user
-identity context, relevant inbound group membership, and the requested target.
-Therefore ALL HTTP Permission Provider requests in v1 MUST use HTTPS, not only
+identity context, relevant inbound group membership, and the logical target
+selected from the caller's authorized JWT scope. Therefore ALL HTTP Permission
+Provider requests in v1 MUST use HTTPS, not only
 requests that happen to carry authentication credentials. An
 HTTPS URI is required for all Provider requests, with TLS certificate validation
 and hostname validation; TLS verification MUST NOT be disabled, and plaintext
