@@ -79,6 +79,11 @@ The processing order for every request is fixed:
    validation cannot be performed, return `400`.
 3. Derive the required authorization scope deterministically:
    `permissionsync:<target>`.
+   The request body's `target` is the sole routing selector. The JWT `scope` is
+   the technical caller's authorization set; it never selects, supplies,
+   defaults, or overrides routing. PermissionSync derives this one required
+   exact token from the request target and tests membership. Extra scopes and
+   their ordering do not affect routing or the required-scope decision.
 4. Authorize the authenticated technical caller for that derived scope. If the
    caller lacks the required scope, return `403`. This authorization check
    intentionally happens BEFORE full strict validation of the remaining

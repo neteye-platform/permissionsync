@@ -1,4 +1,4 @@
-# ADR-0006: Runtime Configuration, Stateless OCI Operation, and Safe Observability
+# ADR-0006: Runtime Configuration, OCI Packaging, and Safe Observability
 
 - **Status:** Accepted
 - **Date:** 2026-08-24
@@ -28,11 +28,12 @@ deployment-local infrastructure or equivalent offline installation or upgrade
 media. Image availability is deployment infrastructure, not PermissionSync
 application state.
 
-Kubernetes and OpenShift are supported deployment targets: the service depends
-on no Kubernetes API, discovery, object, or configuration semantics. Helm
-charts and manifests are optional deployment artifacts and are owned by
-deployment, not by PermissionSync. Where Kubernetes or OpenShift is used, the
-container is configured with the `RuntimeDefault` seccomp profile.
+Kubernetes is the only explicitly supported deployment platform. OCI is the
+artifact format and does not imply support for other container platforms. The
+service depends on no Kubernetes application APIs, discovery, object, or
+configuration semantics. Helm charts and manifests are optional deployment
+artifacts and are owned by deployment, not by PermissionSync. The container is
+configured with the `RuntimeDefault` seccomp profile for Kubernetes deployments.
 
 ### Runtime configuration and validation
 
@@ -43,7 +44,10 @@ All deployment-specific values are runtime configuration:
   [ADR 0002](0002-receiver-side-jwt-verification.md)). Authorization scope is
   not a configurable value: it is derived deterministically from the minimally
   validated target identifier by the convention `permissionsync:<target>`
-  under [ADR 0001](0001-inbound-synchronization-contract.md).
+  under [ADR 0001](0001-inbound-synchronization-contract.md). Routing uses the
+  request body's `target` together with runtime target configuration. JWT
+  `scope` only authorizes the technical caller; it never selects, supplies,
+  defaults, or overrides routing.
 - **Provider:** type, endpoint, credentials, TLS or trust settings including
   private CAs, and shorter per-operation timeouts.
 - **Target:** a logical target identifier whose runtime configuration selects an
@@ -66,27 +70,30 @@ API requests, as specified in
 [ADR 0007](0007-compile-time-rust-target-adapters.md). This ADR does not choose
 a configuration or secret mechanism.
 
-Static configuration is validated at startup and readiness whenever reasonably
-possible. Global or core errors prevent startup or readiness, including a
-missing or invalid trusted issuer, JWKS or discovery configuration, signing
-algorithm allowlist, fundamentally invalid runtime or listener configuration,
-or ambiguous, contradictory, or structurally unusable target routing.
+Invalid static local configuration that affects global/core behavior MUST fail
+startup, and PermissionSync MUST NOT complete startup with it. Examples include
+a missing or invalid trusted issuer; malformed JWKS or discovery configuration;
+an invalid expected audience; an invalid signing-algorithm allowlist;
+fundamentally invalid listener or runtime configuration; and ambiguous,
+contradictory, or structurally unusable target routing. These errors cannot
+recover merely by waiting.
 Authorization scope is not runtime configuration, so there is no configurable
 authorization mapping or policy to validate; it is derived from the minimally
 validated target identifier by convention under
 [ADR 0001](0001-inbound-synchronization-contract.md).
 
-Startup and readiness distinguish invalid local authentication configuration
-from a temporarily unreachable Keycloak:
+Startup and readiness distinguish invalid static local configuration from a
+temporarily unreachable Keycloak:
 
-- **A. Invalid local configuration** (for example a missing trusted issuer, a
-  malformed JWKS or discovery URL, an invalid expected audience configuration,
-  or an invalid algorithm allowlist): a global error that may prevent startup
-  or readiness.
+- **A. Invalid static local configuration** (for example a missing trusted
+  issuer, malformed JWKS or discovery configuration, an invalid expected
+  audience configuration, or an invalid algorithm allowlist): MUST fail
+  startup; PermissionSync MUST NOT complete startup with it, and it cannot
+  recover merely by waiting.
 - **B. Valid local configuration but Keycloak/JWKS/discovery temporarily
-  unreachable:** PermissionSync MUST remain alive and MUST NOT enter a
-  crash/restart loop. Readiness MUST be false if PermissionSync has no usable
-  trusted verification state as defined by
+  unreachable:** PermissionSync MUST remain alive, MUST NOT fail startup, and
+  MUST NOT enter a crash/restart loop. Readiness MUST be false if PermissionSync
+  has no usable trusted verification state as defined by
   [ADR 0002](0002-receiver-side-jwt-verification.md). All remote verification,
   discovery, and JWKS
   attempts MUST be bounded by timeouts, and there MUST be no infinite startup
@@ -113,7 +120,8 @@ without choosing health or status mechanisms. The service may remain ready when
 it can authenticate, authorize, validate, route, and return those outcomes.
 
 Isolated target-local errors are detected eagerly where practical and make only
-that target unusable. A recognized logical target with unavailable or broken
+that target unusable. They do not cause global startup failure or readiness
+failure. A recognized logical target with unavailable or broken
 server-side adapter or target configuration is a target-local `500`. Examples
 include a configured adapter identifier absent from the current compiled-in
 registry, missing required endpoint or credentials, malformed endpoint, invalid
@@ -222,9 +230,9 @@ an identifier.
 - **Deployment-specific images or embedded configuration:** rejected in favor
   of one reusable generic artifact with external runtime configuration and
   secrets.
-- **Kubernetes-specific configuration or secret mechanisms:** rejected to
-  preserve OCI and deployment neutrality and because Kubernetes Secrets are
-  not required.
+- **Mandatory Kubernetes-specific application/configuration coupling:** rejected
+  because PermissionSync has no Kubernetes application API or semantic
+  dependency, and Kubernetes Secrets are not required.
 - **Stateful delivery, automatic retry, or rollback:** rejected for v1 in
   favor of stateless, single-attempt reconciliation under ADR 0003.
 

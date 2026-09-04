@@ -53,6 +53,6 @@ PermissionSync uses these statuses:
 5. [0005](0005-versioned-adapter-specific-desired-state-envelope.md) Versioned Adapter-Specific
    Desired-State Envelope (Accepted)
 6. [0006](0006-runtime-configuration-oci-and-observability.md) Runtime
-   Configuration, Stateless OCI Operation, and Safe Observability (Accepted)
+   Configuration, OCI Packaging, and Safe Observability (Accepted)
 7. [0007](0007-compile-time-rust-target-adapters.md) Core Boundaries and
    Compile-Time Rust Target Adapters (Accepted)

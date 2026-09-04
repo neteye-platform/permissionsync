@@ -123,8 +123,8 @@ target-local `500`. No Permission Provider or Target Adapter work begins before
 authentication, authorization, full strict request validation, and target
 resolution succeed.
 
-Globally ambiguous or structurally unusable routing is a global startup or
-readiness error under [ADR 0006](0006-runtime-configuration-oci-and-observability.md).
+Globally ambiguous or structurally unusable routing is a deterministic global
+startup failure under [ADR 0006](0006-runtime-configuration-oci-and-observability.md).
 A target-local adapter-selection or target-configuration error for a recognized
 logical target may be detected eagerly where practical while leaving the
 service ready and returning `500` only for that target; unrelated correct
@@ -239,7 +239,7 @@ exactly-once composition-root linking and deterministic ID mapping; complete
 envelope-structure and target-semantic payload validation before mutation; and
 absence of secret or sensitive logging. They must cover the `200`/`204`
 `changed`/`unchanged` distinction, target-local `500` for an absent compiled
-adapter key, global startup/readiness failure for ambiguous routing,
+adapter key, deterministic global startup failure for ambiguous routing,
 serviceability of unrelated routes, at most one provider and adapter call,
 no retry or rollback, deadline/cancellation propagation, `500` for returned or
 recoverable provider, adapter, or deadline-expiry failures, no detached

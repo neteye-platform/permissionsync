@@ -187,6 +187,13 @@ identifier under [ADR 0001](0001-inbound-synchronization-contract.md), which is
 validated against the v1 target identifier grammar before any scope is derived,
 so a caller cannot force arbitrary input into the OAuth scope name.
 
+The request body's `target` is the sole routing selector. The JWT `scope` is the
+technical caller's authorization set; it never selects, supplies, defaults, or
+overrides routing. PermissionSync derives the one required exact
+`permissionsync:<target>` token from the request target and tests membership;
+extra scopes and their ordering do not affect routing or the required-scope
+decision.
+
 JWT parsing, signature verification, standards handling, and cryptographic
 operations MUST use a mature, maintained, standards-compliant library. The
 concrete library is an implementation decision and is not chosen in this ADR.
