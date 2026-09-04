@@ -1,9 +1,11 @@
 [workspace]
+members = ["crates/permissionsync-core"]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
+publish = false
 repository = "https://github.com/neteye-platform/permissionsync"
 version = "0.1.0"
 
@@ -17,7 +19,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 version.workspace = true
-publish = false
+publish.workspace = true
 
 [lints]
 workspace = true
