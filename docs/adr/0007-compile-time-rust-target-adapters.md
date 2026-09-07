@@ -79,46 +79,15 @@ options are insufficient. This ADR does not select SCIM.
 
 ### Request order and failure model
 
-For every request, the complete order is:
+[ADR 0001](0001-inbound-synchronization-contract.md) owns the complete request
+processing order, its precedence rules, and the public HTTP outcomes. This ADR
+specifies the adapter-related requirements within that order.
 
-1. Authenticate the technical caller JWT under ADR 0002.
-2. Validate the `scope` claim's shape and, if nonempty, its RFC 6749 syntax
-   under ADR 0002. A wrong-shaped `scope`, or a nonempty `scope` string that
-   violates RFC 6749 syntax, returns `401`.
-3. Require exactly one scope token with the exact, case-sensitive prefix
-   `permissionsync:`. An absent or empty `scope`, a syntactically valid
-   `scope` with no such token, or more than one such token, returns `403`.
-4. Extract the suffix of that one token as the logical target identifier and
-   validate it against the v1 target identifier grammar under ADR 0001. A
-   grammar-invalid suffix returns `403`.
-5. Perform full strict validation of the fixed three-field request body. An
-   invalid request body returns `400`.
-6. Resolve the extracted target. If the caller held a valid PermissionSync
-   scope but the logical target is unknown or unrecognized by the runtime
-   routing/configuration contract, return `400` under ADR 0001.
-7. If the recognized logical target names an adapter key absent from the
-   compiled-in registry, or has another unavailable or broken server-side
-   adapter/configuration defect that is detectable, return target-local `500`
-   with no capacity, provider, or adapter work; unrelated correct targets
-   remain serviceable.
-8. Obtain bounded capacity.
-9. Invoke the Permission Provider once.
-10. Structurally validate the resulting payload envelope (`{version, payload}`).
-11. Invoke the selected Target Adapter reconciliation once.
-12. Return `200` when reconciliation changed target state, `204` when it was
-    already in the desired state, or the appropriate error status.
-
-Scope validation and target extraction precede target resolution, so a caller
-without exactly one valid-grammar `permissionsync:<target>` scope token
-receives `401` or `403` before PermissionSync determines whether any candidate
-target is recognized or configured, so an unauthorized caller cannot learn
-whether any target name exists. Only once a caller holds exactly one such
-valid token does PermissionSync resolve the extracted target: an unknown or
-unrecognized logical target receives `400`, and a recognized logical target
-with an unavailable or broken server-side adapter/configuration receives
-target-local `500`. No Permission Provider or Target Adapter work begins
-before authentication, scope validation and target extraction, full strict
-request validation, and target resolution succeed.
+For a recognized logical target, its configured adapter identifier resolves only
+against the compiled-in registry. An absent adapter key or another detectable
+adapter/configuration defect is target-local `500`; Core starts no capacity,
+Provider, or Adapter work for that target, while unrelated correct targets
+remain serviceable.
 
 Globally ambiguous or structurally unusable routing is a deterministic global
 startup failure under [ADR 0006](0006-runtime-configuration-oci-and-observability.md).

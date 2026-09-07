@@ -3,6 +3,10 @@
 /// This context is distinct from the technical caller authenticated by the
 /// inbound boundary. Username and group values are preserved without
 /// normalization or additional grammar validation.
+///
+/// Preserving values does not make them trusted for downstream contexts.
+/// Consumers must use context-appropriate encoding, serialization, and
+/// structured logging.
 pub struct IdentityContext {
     username: String,
     groups: Vec<String>,

@@ -20,11 +20,15 @@ impl EnvelopeVersion {
     }
 }
 
-/// One syntactically valid JSON value whose semantics belong to a Target Adapter.
+/// One validated raw JSON value whose target-specific semantics belong to a Target Adapter.
+///
+/// Core does not interpret this value. [`Self::as_json`] returns the stored raw
+/// JSON value, but callers must not rely on preservation of insignificant
+/// leading or trailing whitespace from an eventual Provider wire response.
 pub struct OpaquePayload(Box<RawValue>);
 
 impl OpaquePayload {
-    /// Returns the validated raw JSON value without interpreting it.
+    /// Returns the stored raw JSON value without interpreting it.
     pub fn as_json(&self) -> &str {
         self.0.get()
     }

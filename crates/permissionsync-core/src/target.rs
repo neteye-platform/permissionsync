@@ -66,7 +66,7 @@ mod tests {
     #[test]
     fn accepts_adr_target_grammar_boundaries() {
         let sixty_four_characters = "a".repeat(64);
-        let valid = ["a", "7", sixty_four_characters.as_str(), "a.b_c-d9"];
+        let valid = ["a", "7", "ab", sixty_four_characters.as_str(), "a.b_c-d9"];
 
         for value in valid {
             let target = LogicalTarget::try_from(value.to_owned()).unwrap();

@@ -84,6 +84,11 @@ pub trait PermissionProvider: Send + Sync {
 }
 
 /// A non-HTTP error returned by a Permission Provider.
+///
+/// Its outer display and debug representations are redacted. The source exposed
+/// through [`Error::source`] is for safe internal diagnosis only; it may contain
+/// sensitive data and must not be exposed to callers or logged without
+/// appropriate redaction.
 pub struct PermissionProviderError {
     source: Box<dyn Error + Send + Sync + 'static>,
 }
@@ -158,6 +163,11 @@ pub trait TargetAdapter: Send + Sync {
 }
 
 /// A non-HTTP error returned by a Target Adapter.
+///
+/// Its outer display and debug representations are redacted. The source exposed
+/// through [`Error::source`] is for safe internal diagnosis only; it may contain
+/// sensitive data and must not be exposed to callers or logged without
+/// appropriate redaction.
 pub struct TargetAdapterError {
     source: Box<dyn Error + Send + Sync + 'static>,
 }
@@ -204,7 +214,14 @@ pub enum ReconciliationOutcome {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, fmt, future, sync::Mutex, time::Instant};
+    use std::{
+        error::Error,
+        fmt,
+        future::Future,
+        sync::Mutex,
+        task::{Context, Poll, Waker},
+        time::Instant,
+    };
 
     use crate::{
         DesiredStateEnvelope, EnvelopeVersion, IdentityContext, LogicalTarget, OpaquePayload,
@@ -224,7 +241,9 @@ mod tests {
         }
     }
 
-    struct TestProvider;
+    struct TestProvider {
+        deadline: Mutex<Option<Instant>>,
+    }
 
     impl PermissionProvider for TestProvider {
         fn resolve<'a>(
@@ -232,16 +251,18 @@ mod tests {
             request: PermissionProviderRequest<'a>,
         ) -> BoxFuture<'a, Result<DesiredStateEnvelope, PermissionProviderError>> {
             Box::pin(async move {
+                *self.deadline.lock().unwrap() = Some(request.context().deadline());
                 let _ = request.identity().username();
                 let _ = request.target().as_str();
-                let _ = request.context().deadline();
 
                 Err(PermissionProviderError::new(SensitiveSource))
             })
         }
     }
 
-    struct TestAdapter;
+    struct TestAdapter {
+        deadline: Mutex<Option<Instant>>,
+    }
 
     impl TargetAdapter for TestAdapter {
         fn reconcile<'a>(
@@ -249,6 +270,7 @@ mod tests {
             request: TargetAdapterRequest<'a>,
         ) -> BoxFuture<'a, Result<ReconciliationOutcome, TargetAdapterError>> {
             Box::pin(async move {
+                *self.deadline.lock().unwrap() = Some(request.context().deadline());
                 let _ = request.desired_state().payload().as_json();
                 let _ = request.context().cancellation().is_cancelled();
 
@@ -266,10 +288,12 @@ mod tests {
             &'a self,
             request: TargetAdapterRequest<'a>,
         ) -> BoxFuture<'a, Result<ReconciliationOutcome, TargetAdapterError>> {
-            *self.payload.lock().unwrap() =
-                Some(request.desired_state().payload().as_json().to_owned());
+            Box::pin(async move {
+                *self.payload.lock().unwrap() =
+                    Some(request.desired_state().payload().as_json().to_owned());
 
-            Box::pin(future::ready(Ok(ReconciliationOutcome::Unchanged)))
+                Ok(ReconciliationOutcome::Unchanged)
+            })
         }
     }
 
@@ -283,6 +307,17 @@ mod tests {
     }
 
     impl Error for SensitiveSource {}
+
+    fn poll_ready<F: Future>(future: F) -> F::Output {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = Box::pin(future);
+
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("test future unexpectedly returned Poll::Pending"),
+        }
+    }
 
     #[test]
     fn context_preserves_deadline_and_cancellation_signal() {
@@ -302,11 +337,18 @@ mod tests {
         assert_send_sync::<dyn TargetAdapter>();
         assert_send_sync::<dyn CancellationSignal>();
 
-        let provider: &dyn PermissionProvider = &TestProvider;
-        let adapter: &dyn TargetAdapter = &TestAdapter;
-        let cancellation: &dyn CancellationSignal = &Cancelled;
+        let provider = TestProvider {
+            deadline: Mutex::new(None),
+        };
+        let adapter = TestAdapter {
+            deadline: Mutex::new(None),
+        };
+        let cancellation = Cancelled;
+        let provider_port: &dyn PermissionProvider = &provider;
+        let adapter_port: &dyn TargetAdapter = &adapter;
+        let cancellation_signal: &dyn CancellationSignal = &cancellation;
 
-        let _ = (provider, adapter, cancellation);
+        let _ = (provider_port, adapter_port, cancellation_signal);
     }
 
     #[test]
@@ -323,7 +365,10 @@ mod tests {
         let context = SynchronizationContext::new(Instant::now(), &cancellation);
         let request = TargetAdapterRequest::new(&desired_state, context);
 
-        drop(adapter.reconcile(request));
+        assert_eq!(
+            poll_ready(adapter.reconcile(request)).unwrap(),
+            ReconciliationOutcome::Unchanged
+        );
 
         assert_eq!(
             adapter.payload.lock().unwrap().as_deref(),
@@ -355,9 +400,13 @@ mod tests {
     }
 
     #[test]
-    fn port_futures_can_borrow_request_inputs() {
-        let provider = TestProvider;
-        let adapter = TestAdapter;
+    fn port_futures_share_one_overall_deadline_and_execute() {
+        let provider = TestProvider {
+            deadline: Mutex::new(None),
+        };
+        let adapter = TestAdapter {
+            deadline: Mutex::new(None),
+        };
         let cancellation = Cancelled;
         let identity = IdentityContext::new("jdoe".to_owned(), Vec::new());
         let target = LogicalTarget::try_from("target".to_owned()).unwrap();
@@ -366,12 +415,18 @@ mod tests {
             OpaquePayload::try_from("null".to_owned()).unwrap(),
         );
 
-        let provider_context = SynchronizationContext::new(Instant::now(), &cancellation);
-        let adapter_context = SynchronizationContext::new(Instant::now(), &cancellation);
+        let overall_deadline = Instant::now();
+        let provider_context = SynchronizationContext::new(overall_deadline, &cancellation);
+        let adapter_context = SynchronizationContext::new(overall_deadline, &cancellation);
         let provider_request = PermissionProviderRequest::new(&identity, &target, provider_context);
         let adapter_request = TargetAdapterRequest::new(&desired_state, adapter_context);
 
-        drop(provider.resolve(provider_request));
-        drop(adapter.reconcile(adapter_request));
+        assert!(poll_ready(provider.resolve(provider_request)).is_err());
+        assert_eq!(
+            poll_ready(adapter.reconcile(adapter_request)).unwrap(),
+            ReconciliationOutcome::Changed
+        );
+        assert_eq!(*provider.deadline.lock().unwrap(), Some(overall_deadline));
+        assert_eq!(*adapter.deadline.lock().unwrap(), Some(overall_deadline));
     }
 }
