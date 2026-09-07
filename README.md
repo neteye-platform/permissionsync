@@ -4,9 +4,10 @@ PermissionSync is an architecture-first service for synchronizing a user's
 desired permissions with a selected target. The active constraints are recorded
 in the [ADR index](docs/adr/README.md).
 
-The Rust workspace currently contains target-neutral Core domain contracts. It
-intentionally contains no synchronization, HTTP, authentication, Permission
-Provider implementation, or concrete target-adapter behavior yet.
+The Rust workspace currently contains target-neutral Core domain contracts and
+deterministic runtime target routing. It intentionally contains no
+synchronization, HTTP, authentication, Permission Provider implementation, or
+concrete target-adapter behavior yet.
 
 ## Development
 
