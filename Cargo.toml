@@ -1,5 +1,8 @@
 [workspace]
-members = ["crates/permissionsync-core"]
+members = [
+  "crates/permissionsync-core",
+  "crates/permissionsync-routing",
+]
 resolver = "3"
 
 [workspace.package]
