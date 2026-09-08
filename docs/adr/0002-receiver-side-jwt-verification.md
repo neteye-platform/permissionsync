@@ -50,54 +50,78 @@ Authentication validation semantics:
 - Signature verification MUST use the trusted Keycloak JWKS source and an
   explicit algorithm allowlist.
 
-Authorization semantics:
+Authorization and target-selection semantics:
 
 - When present, `scope` MUST be a JSON string. A `null`, array, object, number,
   or boolean `scope` is wrong-shaped and returns `401`.
-- After successful authentication, an absent `scope` or an empty string
-  `scope` returns `403`.
+- An absent `scope` or an empty string `scope` is structurally valid and has
+  zero PermissionSync scope tokens. It selects no logical target and grants no
+  authorization to any target. After strict body validation under
+  [ADR 0001](0001-inbound-synchronization-contract.md), it returns `204` as a
+  targetless successful no-op.
 - A nonempty `scope` string MUST use the RFC 6749 section 3.3 syntax:
   `scope = scope-token *( SP scope-token)` and
   `scope-token = 1*( %x21 / %x23-5B / %x5D-7E )`. A nonempty string that
   violates this syntax returns `401`.
-- A valid scope string consists of space-delimited scope tokens. Other,
-  non-PermissionSync OAuth scope tokens MAY also be present and have no effect
-  on PermissionSync authorization or routing.
-- PermissionSync identifies scope tokens with the exact, case-sensitive prefix
-  `permissionsync:`. Matching is exact-token only: prefix, suffix, and
-  substring lookalikes do not count.
-- PermissionSync requires exactly one scope token with that exact prefix. A
-  syntactically valid scope string with no such token, or with more than one
-  such token (including exact duplicates), returns `403`: zero is insufficient
-  authorization and more than one is an ambiguous target selection, and
-  neither is a usable authorization grant. Token order and the presence of
+- A valid nonempty scope string consists of space-delimited scope tokens. Other,
+  non-PermissionSync OAuth scope tokens MAY also be present in any number and
+  have no effect on PermissionSync target selection.
+- PermissionSync counts every RFC scope token whose bytes begin with the exact,
+  case-sensitive prefix `permissionsync:`. It does not search within a token or
+  change case. A token beginning with that prefix counts even when its suffix
+  later fails target-grammar validation. Tokens such as
+  `xpermissionsync:glpi`, `permissionsyncx:glpi`, and
+  `other:permissionsync:glpi` do not count.
+- Zero exact PermissionSync tokens select no target. They are not an
+  authorization failure and do not grant target authorization; after strict
+  body validation they return a targetless successful `204` with no routing,
+  capacity, Provider, or Adapter work.
+- More than one exact PermissionSync token, including exact duplicates, returns
+  `403` because target selection is ambiguous. Token order and the presence of
   other, non-PermissionSync scope tokens do not affect this count.
-- The single required token has the form `permissionsync:<target>`. Its suffix
-  after the `permissionsync:` prefix is the logical target identifier and MUST
-  match the v1 target identifier grammar defined in
-  [ADR 0001](0001-inbound-synchronization-contract.md). An exact single token
-  whose suffix violates that grammar is an unusable authorization grant and
-  returns `403`.
-- That single valid `permissionsync:<target>` token both authorizes the caller
-  and identifies the request's logical target; it is the only source of the
-  logical target, and PermissionSync uses no other claim or request value to
-  select one. Scope insufficiency, ambiguity, or an invalid extracted target
-  does not invalidate an already established technical caller identity.
+- Exactly one exact PermissionSync token has the form
+  `permissionsync:<target>`. Its suffix after the `permissionsync:` prefix is
+  the logical target identifier and MUST match the v1 target identifier grammar
+  defined in [ADR 0001](0001-inbound-synchronization-contract.md). A one-token
+  suffix that violates that grammar is an unusable authorization grant and
+  returns `403`; it is not a zero-token request.
+- Exactly one valid `permissionsync:<target>` token both authorizes the caller
+  for that target and identifies the request's logical target; it is the only
+  source of the logical target, and PermissionSync uses no other claim or
+  request value to select one. Zero target selection, ambiguity, or an invalid
+  extracted target does not invalidate an already established technical caller
+  identity.
 
 Examples:
 
+- An absent `scope`, or `scope = ""`, has zero PermissionSync tokens and, after
+  an otherwise valid request body, returns targetless successful `204`.
+- `scope = "service_account"` has zero PermissionSync tokens and, after an
+  otherwise valid request body, returns targetless successful `204`.
+- `scope = "Permissionsync:glpi"` has zero PermissionSync tokens because the
+  prefix is case-different; after an otherwise valid request body, it returns
+  targetless successful `204`.
+- `scope = "xpermissionsync:glpi permissionsyncx:glpi"` has zero
+  PermissionSync tokens because neither token begins with the exact prefix;
+  after an otherwise valid request body, it returns targetless successful `204`.
 - `scope = "permissionsync:glpi"` is valid: exactly one PermissionSync token,
   extracting target `glpi`.
 - `scope = "service_account permissionsync:glpi"` is valid: exactly one
   PermissionSync token among other, non-PermissionSync OAuth scopes.
 - `scope = "permissionsync:glpi permissionsync:grafana"` returns `403`: more
   than one PermissionSync target scope is an ambiguous target selection.
-- `scope = "service_account"` returns `403`: no PermissionSync target scope is
-  present.
+- `scope = "permissionsync:"` returns `403`: it is exactly one PermissionSync
+  token with an invalid target suffix, not a zero-token request.
 
 Ordering matters: authentication verifies the signature and `iss`, `aud`,
-`exp`, `iat`, and `client_id`; authorization is separate and, after successful
-authentication, evaluates `scope`.
+`exp`, `iat`, and `client_id` first. Structural scope validation, including RFC
+6749 validation for a nonempty `scope`, follows. PermissionSync then determines
+scope cardinality and validates the suffix when exactly one token is present.
+More than one exact PermissionSync token, or exactly one token with an invalid
+suffix, returns `403` before body validation. A zero-token result does not
+short-circuit body validation: only after the fixed request body validates
+successfully does it return targetless `204`. Exactly one grammar-valid target
+likewise proceeds through body validation before selected-target processing.
 
 Failure semantics:
 
@@ -107,11 +131,12 @@ Failure semantics:
 - A structurally malformed or wrong-shaped `scope` claim, or a nonempty `scope`
   string that violates RFC 6749 syntax, makes the token structurally invalid
   and returns `401`.
-- After successful authentication with a syntactically valid token, an absent
-  `scope`, an empty `scope`, a `scope` with no exact `permissionsync:` token, a
-  `scope` with more than one exact `permissionsync:` token, or a single exact
-  `permissionsync:` token whose extracted target suffix violates the v1 target
-  identifier grammar, all return `403`.
+- After successful authentication with a structurally valid `scope`, more than
+  one exact `permissionsync:` token, or exactly one such token whose extracted
+  target suffix violates the v1 target identifier grammar, returns `403`.
+- An absent `scope`, an empty `scope`, or a syntactically valid scope with no
+  exact `permissionsync:` token returns neither `401` nor `403`. It selects no
+  target and, after strict body validation, returns targetless successful `204`.
 
 The `client_id` claim requires supported deployment provisioning. Keycloak
 provisioning MUST guarantee that service-account / Client Credentials access
@@ -144,10 +169,12 @@ verify that representative Client Credentials tokens:
 - contain the configured expected PermissionSync audience in `aud`; and
 - cover the complete PermissionSync-required token contract defined by this
   ADR;
-- have an absent `scope` and return `403` after otherwise successful
-  authentication;
-- have an empty string `scope` and return `403`;
-- have a valid scope string with no `permissionsync:` token and return `403`;
+- have an absent `scope` and, with an otherwise valid inbound body, complete as
+  a targetless successful `204`;
+- have an empty string `scope` and, with an otherwise valid inbound body,
+  complete as a targetless successful `204`;
+- have a valid scope string with no exact `permissionsync:` token and, with an
+  otherwise valid inbound body, complete as a targetless successful `204`;
 - have exactly one exact `permissionsync:<target>` scope token and authorize,
   extracting `<target>` as the logical target;
 - have that one token among other, non-PermissionSync scopes and authorize;
@@ -160,9 +187,11 @@ verify that representative Client Credentials tokens:
 - have a wrong-shaped `scope` and return `401`;
 - have a nonempty malformed scope string and return `401`;
 - have a case-different `permissionsync:` prefix (for example
-  `Permissionsync:glpi`) and not match, returning `403`; and
-- have prefix, suffix, or substring lookalikes of `permissionsync:` and not
-  match, returning `403`.
+  `Permissionsync:glpi`) and, with an otherwise valid inbound body, complete as
+  a targetless successful `204`; and
+- have nonmatching lookalikes such as `xpermissionsync:glpi` and
+  `permissionsyncx:glpi` and, with an otherwise valid inbound body, complete as
+  a targetless successful `204`.
 
 These cases belong at the supported-Keycloak integration/contract layer. A
 real Keycloak instance is not required in every unit test.
@@ -220,18 +249,18 @@ verification state exists, token validity cannot be established and the request
 returns `500`; readiness is false while no usable verifier state exists under
 [ADR 0006](0006-runtime-configuration-oci-and-observability.md).
 
-Permission for a target is granted by scope, and that same scope identifies
-the target: the logical target and the authorization decision both come from
-the single exact `permissionsync:<target>` scope token, whose suffix is
-validated against the v1 target identifier grammar under
+Permission for a target is granted by scope, and that same scope identifies the
+target only when exactly one exact `permissionsync:<target>` token is present.
+Its suffix is validated against the v1 target identifier grammar under
 [ADR 0001](0001-inbound-synchronization-contract.md) so a caller cannot force
 arbitrary routing through an unvalidated value. There is no configured role or
-claim-location indirection: this single scope token is both the technical
-caller's authorization grant and the sole logical-target selector. Other,
-non-PermissionSync OAuth scopes MAY be present and have no effect on
-authorization or routing. Exactly one `permissionsync:<target>` token is
-required; zero such tokens, more than one, or one with a grammar-invalid
-suffix all return `403`, as specified above.
+claim-location indirection: this one valid scope token is both the technical
+caller's authorization grant for the selected target and the sole logical-target
+selector. Zero exact PermissionSync tokens grant no target authorization and
+select no target; after body validation they complete as targetless successful
+no-ops. Other, non-PermissionSync OAuth scopes MAY be present in any number and
+have no effect on target selection. More than one exact PermissionSync token,
+or one with a grammar-invalid suffix, returns `403`, as specified above.
 
 JWT parsing, signature verification, standards handling, and cryptographic
 operations MUST use a mature, maintained, standards-compliant library. The
@@ -257,13 +286,14 @@ the signature and normal authentication claims, processing continues through
 normal authorization. If existing cached state definitively proves the token
 invalid, return `401` even when the refresh also failed.
 
-Return `403` only after successful authentication when a syntactically valid
-`scope` is absent, empty, contains no exact `permissionsync:` token, contains
-more than one exact `permissionsync:` token, or contains exactly one such
-token whose extracted target suffix violates the v1 target identifier
-grammar. Wrong-shaped scope, or a nonempty scope string that violates RFC 6749
-syntax, returns `401` as specified above. Return `500` when PermissionSync
-cannot
+Return `403` only after successful authentication when a structurally valid
+`scope` contains more than one exact `permissionsync:` token, or exactly one
+such token whose extracted target suffix violates the v1 target identifier
+grammar. An absent, empty, or otherwise syntactically valid scope with no exact
+PermissionSync token selects no target and, after strict body validation,
+returns targetless successful `204`. Wrong-shaped scope, or a nonempty scope
+string that violates RFC 6749 syntax, returns `401` as specified above. Return
+`500` when PermissionSync cannot
 establish validity because verifier infrastructure is unavailable and no
 still-usable cached trusted verification state can establish validity. This
 includes unavailable JWKS or required discovery, including a refresh timeout,
@@ -275,8 +305,10 @@ conditions above succeed. A source failure never accepts a token by itself.
 Remote JWKS and discovery verification operations have bounded timeouts and
 consume the remaining overall request budget under
 [ADR 0006](0006-runtime-configuration-oci-and-observability.md). Provider or
-adapter work runs only after successful authentication, authorization, and
-request validation.
+Adapter work runs only after successful authentication, structural scope
+validation, exactly one valid target selection, and request validation. A
+zero-token request completes after request validation without Provider or
+Adapter work.
 
 External authentication or authorization responses MUST NOT reveal the precise
 token validation failure; the caller receives only the appropriate HTTP
@@ -293,15 +325,24 @@ No material alternatives were recorded for this decision.
 ## Consequences
 
 Configured trust inputs, authorization scope, and the required audience must be
-managed deliberately: the trusted issuer, expected audience, JWKS source, the
-Keycloak realm/client provisioning that grants each technical caller exactly
-one `permissionsync:<target>` scope, and the reusable auth crate. Provisioning
-a technical caller with more than one `permissionsync:<target>` scope makes
-every synchronization request for that caller return `403`, because
-PermissionSync requires exactly one such token per request. PermissionSync can
+managed deliberately: the trusted issuer, expected audience, JWKS source,
+Keycloak realm/client provisioning that supplies the required authentication
+claims and the intended zero-or-one target-selection scope behavior, and the
+reusable auth crate. Provisioning may legitimately issue a technical caller a
+token with zero `permissionsync:<target>` scopes; with a valid body, that
+delivery completes as a targetless successful no-op. Provisioning a token with
+more than one such scope makes that request return `403`. PermissionSync can
 support normal signing-key rotation without accepting an unverifiable token,
 while distinguishing caller credential failures, authorization failures, and
 verifier infrastructure failures.
+
+At the HTTP boundary, an unintentionally missing PermissionSync target scope is
+indistinguishable from an intentional targetless `204`; operators rely on the
+targetless no-op telemetry required by
+[ADR 0006](0006-runtime-configuration-oci-and-observability.md), plus safe
+diagnostic context where appropriate, to detect and investigate Keycloak
+scope-provisioning mistakes. A targetless no-op is not itself treated as a
+provisioning failure.
 
 ## References
 

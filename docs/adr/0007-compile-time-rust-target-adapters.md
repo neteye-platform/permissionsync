@@ -24,10 +24,12 @@ envelope from
 Adapter owns **HOW** that state is validated and reconciled against the target,
 including adapter-specific payload and target-semantic validation, target
 mappings, and target API calls. Core owns orchestration: caller authentication
-and authorization, strict request validation, target routing, capacity and
-deadline handling, structural envelope validation, one provider invocation, one
-adapter invocation, and the HTTP outcome. Core does not interpret target
-semantics and owns neither WHAT nor HOW.
+and authorization, strict request validation, deadline handling, and the HTTP
+outcome. For a selected target, it also owns routing, capacity, structural
+envelope validation, one Provider invocation, and one Adapter invocation. A
+targetless successful no-op is an inbound-orchestration outcome that terminates
+before target-specific Core boundaries. Core does not interpret target semantics
+and owns neither WHAT nor HOW.
 
 The desired state is the versioned adapter-specific payload envelope from
 [ADR
@@ -83,6 +85,13 @@ options are insufficient. This ADR does not select SCIM.
 processing order, its precedence rules, and the public HTTP outcomes. This ADR
 specifies the adapter-related requirements within that order.
 
+When ADR 0001 finds zero exact PermissionSync scope tokens, it still performs
+strict body validation. Only after that validation succeeds does it return a
+targetless successful no-op before routing, capacity, Provider, Adapter,
+target-local configuration, or desired-state work. This ADR's routing, capacity,
+Provider, envelope, and Adapter requirements apply only once exactly one
+grammar-valid logical target has been selected.
+
 For a recognized logical target, its configured adapter identifier resolves only
 against the compiled-in registry. An absent adapter key or another detectable
 adapter/configuration defect is target-local `500`; Core starts no capacity,
@@ -106,6 +115,14 @@ It reports whether reconciliation changed target state (`changed`) or left it
 unchanged (`unchanged`) without exposing exactly what resource was created or
 modified. One reconciliation may make multiple target calls; there is no
 automatic retry or rollback.
+
+Once a request enters the selected-target synchronization path, a successful
+`200` or selected-target `204` requires successful completion of both the
+Provider invocation and selected Target Adapter invocation. Earlier failures may
+prevent Adapter invocation. No earlier layer may manufacture a successful
+selected-target `200` or `204`; the selected Adapter alone determines
+`changed` versus `unchanged`. A targetless successful no-op is not Adapter
+reconciliation and is conceptually distinct from Adapter-reported `unchanged`.
 
 Adapter-specific payload or target-semantic validation failures for a
 recognized logical target are server-side failures and return target-local
@@ -138,10 +155,11 @@ condition, not supported normal behavior.
 
 Build compilation and compile-time and unit/integration tests enforce trait
 compatibility and catch exercised defects, but not every adapter defect.
-Returned or recoverable provider and adapter failures return `500`; they
-never become an empty desired state or successful no-op. A panic, abort,
-out-of-memory condition, unsafe defect, or non-cooperative block may affect,
-stall, or terminate the whole replica and is not target-local isolation.
+Returned or recoverable Provider and Adapter failures return `500`; they never
+become an empty desired state, a targetless successful no-op, or a successful
+selected-target result. A panic, abort, out-of-memory condition, unsafe defect,
+or non-cooperative block may affect, stall, or terminate the whole replica and
+is not target-local isolation.
 
 ### Deployment, lifecycle, and security
 
@@ -214,10 +232,29 @@ supported adapter is compiled and tested on every PR; image tests must confirm
 all supported adapters are present and no dynamic loader, separate adapter
 artifact, or download path is implied; rolling image revisions may coexist.
 Tests must also cover the complete scope-to-target precedence matrix from ADR
-0001 and ADR 0002 — zero, one, and more than one `permissionsync:<target>`
-scope token, and a single token with a grammar-invalid extracted suffix — and
-must verify that a request body field outside the fixed three-field contract
-is rejected as unknown.
+0001 and ADR 0002. They must verify at least:
+
+- zero exact PermissionSync scope tokens with an otherwise valid request return
+  targetless successful `204`, with zero target routing or resolution, capacity
+  acquisition, Provider invocations, and Adapter invocations;
+- zero exact PermissionSync scope tokens with a malformed body return `400`,
+  proving that targetless success does not bypass strict body validation;
+- exactly one grammar-valid target scope follows normal selected-target work,
+  and successful `200` or selected-target `204` follows successful Provider and
+  Adapter invocation, with `changed` or `unchanged` coming from the Adapter. A
+  malformed body in this state returns `400` before selected-target work;
+- more than one exact PermissionSync scope token, including duplicates, returns
+  `403` and starts no target-specific work; with a malformed body, it returns
+  `403` before body validation;
+- exactly one exact PermissionSync scope token with a grammar-invalid suffix
+  returns `403`, including with a malformed body, and starts no target-specific
+  work;
+- wrong-shaped scope or a nonempty malformed scope string returns `401`; and
+- unrelated OAuth scopes, case-different prefixes, and nonmatching lookalikes
+  count as zero PermissionSync tokens rather than selecting a target.
+
+Tests must also verify that a request body field outside the fixed three-field
+contract is rejected as unknown.
 
 If a shared target HTTP client or common transport owns target TLS policy, that
 layer MUST have hermetic, deterministic tests that verify:
