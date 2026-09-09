@@ -49,8 +49,12 @@ All deployment-specific values are runtime configuration:
   exactly one valid `permissionsync:<target>` scope token selects a logical
   target, together with runtime target configuration. Zero such tokens produce
   a targetless successful no-op and perform no routing.
-- **Provider:** type, endpoint, credentials, TLS or trust settings including
-  private CAs, and shorter per-operation timeouts.
+- **Provider:** type, endpoint, TLS or trust settings including private CAs,
+  shorter per-operation timeouts, and applicable Provider-specific configuration.
+  The raw inbound bearer JWT forwarded to the Provider under
+  [ADR 0008](0008-generic-rest-permission-provider-wire-and-transport-contract.md)
+  is request-scoped sensitive material, not runtime configuration, and is never
+  persisted.
 - **Target:** a logical target identifier whose runtime configuration selects an
   adapter identifier. The adapter identifier is resolved against the compiled-in
   adapter registry to select the concrete adapter implementation. Endpoint,
@@ -61,11 +65,11 @@ All deployment-specific values are runtime configuration:
   synchronization deadline, logging, and metrics.
 
 Secrets are supplied externally; Kubernetes Secrets are not required. All
-downstream credentials use least privilege, and TLS verification must not be
-disabled. The general TLS/trust requirement applies to all credential-bearing
-and trust-critical outbound traffic, including Keycloak authentication metadata
-retrieval (JWKS and OIDC discovery), Permission Provider requests, and Target
-API requests, as specified in
+downstream credentials, where applicable, use least privilege, and TLS
+verification must not be disabled. The general TLS/trust requirement applies to
+all sensitive and trust-critical outbound traffic, including Keycloak
+authentication metadata retrieval (JWKS and OIDC discovery), Permission
+Provider requests, and Target API requests, as specified in
 [ADR 0002](0002-receiver-side-jwt-verification.md),
 [ADR 0004](0004-generic-rest-permission-provider.md), and
 [ADR 0007](0007-compile-time-rust-target-adapters.md). This ADR does not choose
@@ -111,18 +115,20 @@ safely?", not "can PermissionSync currently open a connection to Keycloak?".
 Fail-closed behavior is preserved, and this adds no persistent application
 state or unbounded background work.
 
-Provider configuration, endpoint, authentication or credentials, TLS or trust
-settings, and provider-specific configuration are validated eagerly where
-practical but are required only when a selected target is reconciled. A
-targetless successful no-op requires neither Provider nor target-local
-configuration. Missing or invalid Provider dependencies make a selected
-target's synchronization return `500`. A request whose selected logical target
-is unknown or unrecognized by the runtime routing/configuration contract
-receives `400` under [ADR 0001](0001-inbound-synchronization-contract.md).
-Provider configuration failures are exposed safely through logs, metrics, or
-status where appropriate, without choosing health or status mechanisms. The
-service may remain ready when it can authenticate, validate, route selected
-targets, and return those outcomes.
+Provider configuration, endpoint, TLS or trust settings, shorter operation
+timeout, and applicable Provider-specific configuration are validated eagerly
+where practical but are required only when a selected target is reconciled. The
+forwarded inbound bearer JWT is retained request-scoped for the selected-target
+Provider call under ADR 0008. A targetless successful no-op requires neither
+Provider nor target-local configuration. Missing or invalid Provider dependencies
+make a selected target's synchronization return `500`. A request whose selected
+logical target is unknown or unrecognized by the runtime routing/configuration
+contract receives `400` under
+[ADR 0001](0001-inbound-synchronization-contract.md). Provider configuration
+failures are exposed safely through logs, metrics, or status where appropriate,
+without choosing health or status mechanisms. The service may remain ready when
+it can authenticate, validate, route selected targets, and return those
+outcomes.
 
 Isolated target-local errors are detected eagerly where practical and make only
 that target unusable. They do not cause global startup failure or readiness
@@ -225,11 +231,11 @@ result category, stage, duration or latency, coarse targetless no-op and
 selected-target `changed`/`unchanged` result counts, inbound group count without
 group names, and a privacy-conscious technical caller identity. A username is
 allowed only when explicitly justified by logging and privacy policy. It must
-never record raw request bodies, full group paths, raw bearer tokens, client or
-Provider credentials, target credentials, private keys, complete JWT claims,
-full sensitive Provider payload documents or data, or target mapping or semantic
-details. Only coarse, non-sensitive summaries are recorded, and caller-facing
-errors contain only safe detail.
+never record raw request bodies, full group paths, raw bearer tokens or JWTs
+(including the forwarded inbound JWT), client credentials, target credentials,
+private keys, complete JWT claims, full sensitive Provider payload documents or
+data, or target mapping or semantic details. Only coarse, non-sensitive
+summaries are recorded, and caller-facing errors contain only safe detail.
 
 Distributed tracing and a concrete telemetry protocol or exporter are deferred
 and are not required for v1.
@@ -268,3 +274,4 @@ details explicit.
 - [ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md)
 - [ADR 0005](0005-versioned-adapter-specific-desired-state-envelope.md)
 - [ADR 0007](0007-compile-time-rust-target-adapters.md)
+- [ADR 0008](0008-generic-rest-permission-provider-wire-and-transport-contract.md)

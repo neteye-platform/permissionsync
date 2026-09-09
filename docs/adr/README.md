@@ -56,3 +56,5 @@ PermissionSync uses these statuses:
    Configuration, OCI Packaging, and Safe Observability (Accepted)
 7. [0007](0007-compile-time-rust-target-adapters.md) Core Boundaries and
    Compile-Time Rust Target Adapters (Accepted)
+8. [0008](0008-generic-rest-permission-provider-wire-and-transport-contract.md)
+   Generic REST Permission Provider Wire and Transport Contract (Accepted)
