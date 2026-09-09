@@ -10,13 +10,14 @@
 Permission Provider for v1, but deliberately defers its exact wire and
 transport contract. A concrete Provider implementation must not invent that
 contract, especially because it transports synchronized-user identity, group
-membership, logical-target selection, desired-state payloads, and optionally a
-Provider credential.
+membership, the original raw technical-caller JWT, and desired-state payloads.
+The Provider derives its target semantics from the forwarded JWT scope.
 
 This record refines only that deferred Provider boundary. It applies only after
-inbound processing has selected exactly one valid logical target; a targetless
-successful no-op never invokes the Provider. It does not change inbound HTTP,
-caller JWT processing, target routing, Core orchestration, adapter semantics,
+PermissionSync has independently selected exactly one valid logical target from
+the authenticated inbound JWT; a targetless successful no-op never invokes the
+Provider. It does not change inbound HTTP, PermissionSync's caller JWT
+validation, target routing, Core orchestration, adapter semantics,
 runtime-configuration loading, or deployment behavior.
 
 ## Decision
@@ -30,9 +31,9 @@ PermissionSync owns no appended Provider path.
 
 The URI MUST NOT be relative, contain userinfo, a query component, or a
 fragment, and MUST NOT use URI-template processing. PermissionSync MUST NOT
-interpolate a username, group, logical target, credential, or other dynamic
-value into the URI. There is no Provider endpoint discovery or service
-discovery protocol.
+interpolate a username, group, logical target, raw JWT, or other dynamic value
+into the URI. There is no Provider endpoint discovery or service discovery
+protocol.
 
 For selected-target synchronization, PermissionSync makes at most one `POST`
 request to the configured URI. It may make no request when invalid Provider
@@ -40,36 +41,71 @@ configuration, deadline expiry, or cancellation prevents outbound I/O. It sends
 these request headers:
 
 ```text
+Authorization: Bearer <original inbound JWT>
 Content-Type: application/json
 Accept: application/json
 Accept-Encoding:
 ```
 
-The empty `Accept-Encoding` value communicates that v1 does not accept response
-content coding.
+`<original inbound JWT>` is the exact raw JWT that PermissionSync authenticated
+from the inbound Bearer credential for this synchronization. PermissionSync
+forwards it as the mandatory Provider Bearer credential. The empty
+`Accept-Encoding` value communicates that v1 does not accept response content
+coding.
 
-The UTF-8 JSON request body is one object with exactly these required members:
+The UTF-8 JSON request body is one object with exactly these two required
+members:
 
 ```json
 {
   "username": "jdoe",
-  "groups": ["/staff", "/staff/engineering"],
-  "target": "glpi"
+  "groups": ["/staff", "/staff/engineering"]
 }
 ```
 
-`username` is a JSON string, `groups` is an array of JSON strings, and
-`target` is the already validated logical-target string. Member order has no
-meaning. PermissionSync serializes the Core username, groups, and target
-values without trimming, Unicode normalization, sorting, deduplication, group
-path interpretation, or target transformation. Group order and duplicates are
-preserved. JSON serialization uses a standards-compliant serializer; it is not
-constructed through string concatenation or manual escaping.
+`username` is a JSON string and `groups` is an array of JSON strings. Member
+order has no meaning. PermissionSync serializes the Core username and groups
+without trimming, Unicode normalization, sorting, deduplication, or group path
+interpretation. Group order and duplicates are preserved. JSON serialization
+uses a standards-compliant serializer; it is not constructed through string
+concatenation or manual escaping. The Provider derives the logical target from
+the forwarded JWT scope.
 
-No other top-level request member is part of v1. In particular, the request
-does not include `event_type`, the inbound technical caller JWT, `client_id`,
-request identifiers, retry metadata, adapter identifiers, inbound HTTP details,
-or credentials. A Provider MUST NOT require such a member.
+### Forwarded JWT validation and target derivation
+
+The Provider MUST independently validate the forwarded JWT as a resource
+server. PermissionSync's prior validation does not substitute for validation at
+the Provider's resource boundary. At a minimum, the Provider MUST validate the
+JWT signature, a trusted issuer, its own Provider audience, expiry and other
+applicable time validity, and an explicit allowed signing-algorithm allowlist.
+It MUST perform any other normal trusted JWT validation required by its resource
+boundary.
+
+The same raw JWT is intentionally provisioned with appropriate `aud` values for
+both PermissionSync and the Provider. PermissionSync continues independently to
+require its configured PermissionSync audience and MUST NOT treat the Provider
+audience as a substitute. Its audience check continues to allow additional
+audience values, including the Provider audience.
+
+After JWT validation, the Provider parses the OAuth `scope` string and requires
+exactly one exact, case-sensitive scope token beginning with
+`permissionsync:`. It extracts that token's suffix and requires it to satisfy
+the v1 logical-target grammar in
+[ADR 0001](0001-inbound-synchronization-contract.md). It uses that target to
+resolve the desired permissions. Other OAuth scope tokens do not affect this
+requirement.
+
+An absent or empty scope establishes zero PermissionSync target tokens. A
+wrong-shaped scope, a nonempty scope string that is not valid OAuth scope
+syntax, zero or multiple exact `permissionsync:` tokens, or an extracted suffix
+that fails the v1 grammar cannot establish the required single valid target.
+The Provider MUST reject each as an authentication, authorization, or request
+failure. The Provider does not implement targetless no-op semantics.
+
+PermissionSync has already independently validated the same raw JWT scope,
+selected exactly one valid `LogicalTarget`, and routed the synchronization
+before invoking the Provider. The Provider repeats target extraction for its
+own resource boundary.
 
 ### Successful response and failures
 
@@ -146,10 +182,10 @@ it closes or drops the response stream.
 
 [ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md)
 owns the single-attempt policy. The Provider implementation MUST also prevent
-an HTTP client, middleware, redirect handler, credential refresh, or connection
-replay from sending another Provider request. There are no automatic retries
-for DNS, connection, TLS, timeout, status, media-type, body-limit, JSON, or
-other Provider failures.
+an HTTP client, middleware, redirect handler, token exchange, derivation,
+refresh, replacement, reissuance, or connection replay from sending another
+Provider request. There are no automatic retries for DNS, connection, TLS,
+timeout, status, media-type, body-limit, JSON, or other Provider failures.
 
 The Provider operation uses the existing `SynchronizationContext`. Its effective
 budget is no greater than the minimum of the remaining overall synchronization
@@ -161,7 +197,7 @@ cancellation signal and returns after its currently executing bounded operation;
 it MUST NOT detach or background Provider work. This decision adds no
 runtime-specific cancellation type to Core.
 
-### TLS, authentication, and ambient environment
+### TLS, forwarded Bearer authentication, and ambient environment
 
 All Provider requests use HTTPS with certificate validation and hostname
 validation. TLS verification MUST NOT be disabled, and there is no plaintext
@@ -169,27 +205,24 @@ fallback. Configured trust material MUST support private or internal CAs. The
 TLS library, trust-material delivery, and configuration format remain deferred
 under [ADR 0006](0006-runtime-configuration-oci-and-observability.md).
 
-Optional bearer authentication is the sole v1 Provider authentication mechanism.
-When no Provider credential is configured, PermissionSync sends no
-`Authorization` header. When a configured credential is present, PermissionSync
-sends `Authorization: Bearer <opaque credential>`. The credential is distinct
-from the inbound technical caller JWT and is never forwarded, derived, or
-exchanged from it. Credentials MUST NOT appear in the URI, query, JSON body,
-logs, errors, or ordinary `Debug` or `Display` output.
+Provider authentication uses only the exact raw JWT authenticated for the
+inbound request, forwarded as `Authorization: Bearer <original inbound JWT>`.
+The JWT MUST NOT be exchanged, derived, refreshed, replaced, or reissued. It is
+request-scoped sensitive material and MUST NOT be persisted or appear in a URI,
+query, JSON body, logs, metrics, errors, or any `Debug` or `Display` output.
 
-V1 has no generic authentication framework, HTTP Basic authentication,
-arbitrary API-key or custom-header map, mTLS authentication, or token
-acquisition or refresh subsystem. Provider traffic MUST NOT implicitly inherit
-ambient proxy configuration. This record does not define proxy support; a
-Provider implementation must explicitly disable proxy-from-environment behavior.
+Provider traffic MUST NOT implicitly inherit ambient proxy configuration. This
+record does not define proxy support; a Provider implementation must explicitly
+disable proxy-from-environment behavior.
 
 ### Observability and error boundary
 
 [ADR 0006](0006-runtime-configuration-oci-and-observability.md) owns the
 observability system. Provider diagnostics may use bounded coarse categories
 and record Provider outcome and latency, but MUST NOT log raw request,
-response, or error bodies; usernames; group names; payloads; bearer credentials;
-or full endpoint URIs. These values MUST NOT be metric labels.
+response, or error bodies; usernames; group names; payloads; raw bearer or JWT
+values; or full endpoint URIs. These values MUST NOT be metric labels. The
+forwarded JWT MUST NOT appear in errors or any `Debug` or `Display` output.
 
 `PermissionProviderError` remains the non-HTTP Core boundary error. A Provider
 failure is explicit and cannot mean an empty desired state or a successful
@@ -202,11 +235,11 @@ Core orchestration and the inbound contract.
   universal Provider deployment layout. One complete configured URI is smaller
   and deployment-neutral.
 - **Query, userinfo, fragments, or dynamic URI interpolation:** rejected to
-  avoid a second data or credential channel, ambiguous endpoint behavior, and
-  sensitive URI disclosure.
-- **GET, inbound-event forwarding, or technical-caller propagation:** rejected
-  because Provider resolution needs only synchronized-user identity, groups,
-  and the selected logical target, and those values belong in the JSON body.
+  avoid a second data or sensitive-token channel, ambiguous endpoint behavior,
+  and sensitive URI disclosure.
+- **GET or inbound-event forwarding:** rejected because Provider resolution uses
+  synchronized-user identity and groups in the JSON body, while target semantics
+  derive from the forwarded JWT scope.
 - **Permissive envelopes, `version == 1`, object-only payloads, other `2xx`
   successes, or a generic remote-error schema:** rejected because they either
   weaken structural validation or steal envelope and target semantics from
@@ -219,10 +252,6 @@ Core orchestration and the inbound contract.
   decompression bypass. A Provider implementation cannot be complete until it
   selects and documents a concrete absolute product safety ceiling; an optional
   stricter deployment limit cannot raise it.
-- **No Provider authentication only, HTTP Basic, arbitrary custom headers,
-  mTLS authentication, or a pluggable authentication strategy:** rejected in
-  favor of one optional standard Bearer header without an authentication
-  framework or credential lifecycle subsystem.
 - **Implicit ambient proxy behavior:** rejected because sensitive Provider
   traffic must not acquire an undocumented machine-dependent route.
 
@@ -230,21 +259,29 @@ Core orchestration and the inbound contract.
 
 The subsequent Provider implementation has one deterministic HTTP contract and
 can be tested with local, hermetic endpoints for exact request serialization,
-strict response validation, redirect refusal, streaming size limits, content
-coding refusal, no retry, deadline/cancellation propagation, configured private
-CA trust, and credential redaction.
+the exact two-field request body, mandatory unchanged Bearer JWT header,
+independent Provider JWT validation and target extraction, strict response
+validation, redirect refusal, streaming size limits, content coding refusal, no
+retry, deadline/cancellation propagation, configured private CA trust, and
+forwarded JWT redaction.
 
 Deployment configuration must supply an endpoint, shorter Provider timeout,
-trust material where needed, and optionally a least-privilege Bearer credential.
-The Provider implementation PR must select and document the concrete absolute
-product safety ceiling with rationale before it can merge. A deployment-specific
-limit remains optional; if supported, it can only lower the effective
-response-body limit. This record does not select how those values are loaded or
-stored, the numeric ceiling, its implementation mechanism, or any optional
-stricter deployment configuration.
+trust material where needed, and applicable Provider-specific values.
+The Provider independently owns resource-server validation and deployment
+provisioning must give the original inbound JWT both the PermissionSync and
+Provider audiences. The raw inbound JWT is request-scoped sensitive material,
+not runtime configuration. The Provider implementation PR must select and
+document the concrete absolute product safety ceiling with rationale before it
+can merge. A deployment-specific limit remains optional; if supported, it can
+only lower the effective response-body limit. This record does not select how
+those values are loaded or stored, the numeric ceiling, its implementation
+mechanism, or any optional stricter deployment configuration.
 
-This decision changes no Rust public API, Core contract, routing behavior,
-adapter contract, Cargo dependency, or deployment mechanism.
+This documentation PR itself changes no Rust API. A future implementation must
+safely retain and propagate the authenticated raw inbound bearer JWT
+request-scoped to the Provider. The exact Core/public API representation remains
+deferred. `LogicalTarget`, routing semantics, Adapter contracts, Cargo
+dependencies, and deployment semantics remain unchanged.
 
 ## References
 
