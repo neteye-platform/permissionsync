@@ -45,10 +45,10 @@ All deployment-specific values are runtime configuration:
   authorization scope convention `permissionsync:<target>` is not a
   configurable value under
   [ADR 0001](0001-inbound-synchronization-contract.md) and
-  [ADR 0002](0002-receiver-side-jwt-verification.md). Routing uses only the
-  logical target extracted from the caller's single authorized
-  `permissionsync:<target>` JWT scope, together with runtime target
-  configuration.
+  [ADR 0002](0002-receiver-side-jwt-verification.md). Routing occurs only when
+  exactly one valid `permissionsync:<target>` scope token selects a logical
+  target, together with runtime target configuration. Zero such tokens produce
+  a targetless successful no-op and perform no routing.
 - **Provider:** type, endpoint, credentials, TLS or trust settings including
   private CAs, and shorter per-operation timeouts.
 - **Target:** a logical target identifier whose runtime configuration selects an
@@ -79,10 +79,11 @@ fundamentally invalid listener or runtime configuration; and ambiguous,
 contradictory, or structurally unusable target routing. These errors cannot
 recover merely by waiting.
 Authorization scope is not runtime configuration, so there is no configurable
-authorization mapping or policy to validate; the logical target is extracted
-from the caller's authorized `permissionsync:<target>` scope by convention
-under [ADR 0001](0001-inbound-synchronization-contract.md) and
-[ADR 0002](0002-receiver-side-jwt-verification.md).
+authorization mapping or policy to validate. When exactly one valid
+`permissionsync:<target>` token is present, its suffix is the logical target by
+convention under [ADR 0001](0001-inbound-synchronization-contract.md) and
+[ADR 0002](0002-receiver-side-jwt-verification.md). Zero such tokens select no
+target and require no routing configuration.
 
 Startup and readiness distinguish invalid static local configuration from a
 temporarily unreachable Keycloak:
@@ -112,14 +113,16 @@ state or unbounded background work.
 
 Provider configuration, endpoint, authentication or credentials, TLS or trust
 settings, and provider-specific configuration are validated eagerly where
-practical but are required only when a selected target is reconciled. Missing
-or invalid provider dependencies make a selected target's synchronization
-return `500`. An authorized caller whose logical target is unknown or
-unrecognized by the runtime routing/configuration contract receives `400` under
-[ADR 0001](0001-inbound-synchronization-contract.md). Provider configuration
-failures are exposed safely through logs, metrics, or status where appropriate,
-without choosing health or status mechanisms. The service may remain ready when
-it can authenticate, authorize, validate, route, and return those outcomes.
+practical but are required only when a selected target is reconciled. A
+targetless successful no-op requires neither Provider nor target-local
+configuration. Missing or invalid Provider dependencies make a selected
+target's synchronization return `500`. A request whose selected logical target
+is unknown or unrecognized by the runtime routing/configuration contract
+receives `400` under [ADR 0001](0001-inbound-synchronization-contract.md).
+Provider configuration failures are exposed safely through logs, metrics, or
+status where appropriate, without choosing health or status mechanisms. The
+service may remain ready when it can authenticate, validate, route selected
+targets, and return those outcomes.
 
 Isolated target-local errors are detected eagerly where practical and make only
 that target unusable. They do not cause global startup failure or readiness
@@ -144,44 +147,50 @@ database unless a future ADR accepts one.
 
 Each request has one runtime-configurable overall deadline starting when the
 request is accepted and covering all PermissionSync application processing
-until the response outcome is ready to emit: authentication, JWKS or
-discovery, authorization, strict validation, target resolution, capacity
-waiting, provider work, and all Target Adapter reconciliation. It does not
-control final HTTP or network transport completion. Every remote
-authentication verification, provider operation, and target outbound
-operation is individually bounded and consumes the same remaining budget;
-child operations may have shorter configured timeouts but must not
-intentionally exceed that budget. The overall deadline is configured below
-the caller-side HTTP timeout, leaving transport and response margin, without
-hardcoding an external timeout. Expiry at any stage is a synchronization
-failure returning `500` under [ADR 0001](0001-inbound-synchronization-contract.md),
-and no new work intentionally starts after expiry.
+until the response outcome is ready to emit: authentication, JWKS or discovery,
+structural scope validation, PermissionSync-token processing, strict body
+validation, and, when a target is selected, target resolution, capacity waiting,
+Provider work, and all Target Adapter reconciliation. A targetless successful
+no-op remains within this deadline through production of its response, but does
+not enter target resolution, capacity waiting, Provider work, or Adapter
+reconciliation. The deadline does not control final HTTP or network transport
+completion. Every remote authentication verification, Provider operation, and
+target outbound operation is individually bounded and consumes the same
+remaining budget; child operations may have shorter configured timeouts but
+must not intentionally exceed that budget. The overall deadline is configured
+below the caller-side HTTP timeout, leaving transport and response margin,
+without hardcoding an external timeout. Expiry at any stage is a synchronization
+failure returning `500` under
+[ADR 0001](0001-inbound-synchronization-contract.md), and no new work
+intentionally starts after expiry.
 
-Valid synchronization work obtains bounded synchronization capacity before
-provider work. Local saturation, including failure to obtain capacity before the
-overall deadline, returns `500`, never a successful no-op, and starts no
-provider or adapter work. Capacity and in-flight synchronization remain
-bounded so slow downstreams cannot exhaust the runtime; the mechanism and
-limits are deferred. Deadline and cancellation pass through authentication,
-capacity waits, provider work, and adapter operations on a best-effort basis.
-A COMPLIANT Target Adapter has bounded execution: every remote I/O operation
-and every adapter-controlled wait or blocking operation is bounded,
-reconciliation cooperates with and observes the overall request deadline and
-propagated cancellation, no new downstream work starts after expiry, and
-reconciliation returns after its currently executing bounded operation
-completes without detaching or backgrounding work; see
+Selected-target synchronization obtains bounded synchronization capacity before
+Provider work. A targetless successful no-op does not acquire capacity. Local
+saturation, including failure to obtain capacity before the overall deadline,
+returns `500` for selected-target synchronization, never a successful
+selected-target result, and starts no Provider or Adapter work. Capacity and
+in-flight synchronization remain bounded so slow downstreams cannot exhaust the
+runtime; the mechanism and limits are deferred. Deadline and cancellation pass
+through authentication, capacity waits, Provider work, and Adapter operations on
+a best-effort basis. A COMPLIANT Target Adapter has bounded execution: every
+remote I/O operation and every adapter-controlled wait or blocking operation is
+bounded, reconciliation cooperates with and observes the overall request
+deadline and propagated cancellation, no new downstream work starts after
+expiry, and reconciliation returns after its currently executing bounded
+operation completes without detaching or backgrounding work; see
 [ADR 0007](0007-compile-time-rust-target-adapters.md). The synchronization
-capacity slot remains associated with the reconciliation until adapter work has
+capacity slot remains associated with the reconciliation until Adapter work has
 actually returned and is not released while reconciliation is still running.
-This cannot hard-interrupt arbitrary in-process adapter work. Already-issued
+This cannot hard-interrupt arbitrary in-process Adapter work. Already-issued
 downstream requests or effects remain uncertain, with no rollback or undo
 guarantee.
 
-Each inbound request makes at most one Permission Provider resolution
-invocation and one selected Target Adapter reconciliation invocation. One
-adapter reconciliation may make multiple downstream API calls, but neither
-those calls nor failed downstream operations are automatically retried in v1;
-the single-attempt, no-retry policy is defined by [ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md).
+Each selected-target synchronization makes at most one Permission Provider
+resolution invocation and one selected Target Adapter reconciliation invocation.
+A targetless successful no-op makes zero of both. One Adapter reconciliation may
+make multiple downstream API calls, but neither those calls nor failed downstream
+operations are automatically retried in v1; the single-attempt, no-retry policy
+is defined by [ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md).
 
 ### Operations, observability, and correlation
 
@@ -195,10 +204,14 @@ deferred and not selected here.
 PermissionSync telemetry MUST make it possible to determine at least:
 request/synchronization count by coarse outcome; end-to-end request duration;
 final or failure stage using bounded categories such as authentication,
-authorization, validation, routing, capacity, provider, and adapter; current
-in-flight synchronization work; local capacity or saturation
-rejection; Permission Provider outcome, failure, and latency; and Target
-Adapter reconciliation outcome, failure, and latency.
+authorization, validation, routing, capacity, Provider, and Adapter; current
+in-flight synchronization work; local capacity or saturation rejection;
+Permission Provider outcome, failure, and latency; and Target Adapter
+reconciliation outcome, failure, and latency. It MUST distinguish a targetless
+successful no-op, where no target was selected and no reconciliation was
+attempted, from selected-target reconciliation whose Adapter reported
+`unchanged`, using bounded coarse outcomes or stages without selecting concrete
+metric names.
 
 Metric dimensions or labels MUST use bounded, low-cardinality values.
 User-derived or otherwise unbounded or sensitive values MUST NOT be metric
@@ -208,15 +221,15 @@ available in safe structured logs where appropriate, but is not required as a
 metric label.
 
 Observability may record the technical caller's JWT `client_id` claim, adapter,
-result category, stage, duration or latency, coarse `changed`/`unchanged` result
-counts, inbound group count without group names, and a privacy-conscious
-technical caller identity. A username is allowed only when explicitly justified
-by logging and privacy policy. It must never record raw request bodies, full
-group paths, raw bearer tokens, client or provider credentials, target
-credentials, private keys, complete JWT claims, full sensitive provider payload
-documents or data, or target mapping or semantic details. Only coarse,
-non-sensitive summaries are recorded, and caller-facing errors contain only
-safe detail.
+result category, stage, duration or latency, coarse targetless no-op and
+selected-target `changed`/`unchanged` result counts, inbound group count without
+group names, and a privacy-conscious technical caller identity. A username is
+allowed only when explicitly justified by logging and privacy policy. It must
+never record raw request bodies, full group paths, raw bearer tokens, client or
+Provider credentials, target credentials, private keys, complete JWT claims,
+full sensitive Provider payload documents or data, or target mapping or semantic
+details. Only coarse, non-sensitive summaries are recorded, and caller-facing
+errors contain only safe detail.
 
 Distributed tracing and a concrete telemetry protocol or exporter are deferred
 and are not required for v1.

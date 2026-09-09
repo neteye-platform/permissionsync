@@ -14,16 +14,17 @@ specification.
 
 ## Decision
 
-Use a generic REST Permission Provider as the v1 desired-state boundary.
-PermissionSync calls the configured provider with synchronized-user identity
-context, relevant inbound group membership, and the logical target selected by
-the caller's authorized `permissionsync:<target>` JWT scope (see
-[ADR 0002](0002-receiver-side-jwt-verification.md)). The provider resolves and
-returns the versioned adapter-specific envelope for that user and target. The
-synchronized-user identity context is information about the end user whose
-desired permissions are being resolved; it is not an authentication identity or
-context and must not be confused with the technical caller authenticated by
-PermissionSync.
+Use a generic REST Permission Provider as the v1 desired-state boundary. Only a
+request that selects exactly one grammar-valid logical target under
+[ADR 0002](0002-receiver-side-jwt-verification.md) can invoke the configured
+provider. PermissionSync calls it with synchronized-user identity context,
+relevant inbound group membership, and that selected logical target. The
+provider resolves and returns the versioned adapter-specific envelope for that
+user and target. A targetless successful no-op does not invoke the provider or
+resolve desired state. The synchronized-user identity context is information
+about the end user whose desired permissions are being resolved; it is not an
+authentication identity or context and must not be confused with the technical
+caller authenticated by PermissionSync.
 
 The provider returns a common envelope containing a versioned, target-specific
 payload (`{version, payload}`). The envelope is defined by
@@ -63,8 +64,9 @@ lookups and target API behavior. The core strictly orchestrates this boundary,
 transports the model without interpreting its business meaning or target
 mappings, and owns neither WHAT nor HOW.
 
-PermissionSync makes at most one bounded provider attempt per inbound
-request and does not retry. Provider failure is explicit and fails
+For selected-target synchronization, PermissionSync makes at most one bounded
+provider attempt and does not retry. A targetless successful no-op makes zero
+Provider attempts. Provider failure is explicit and fails selected-target
 synchronization; it never means an empty desired-permission set. The provider
 does not reconcile the target, and neither adapters nor the core make
 permission decisions. The caller owns what to do with the returned
