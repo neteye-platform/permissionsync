@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/permissionsync-core",
+  "crates/permissionsync-provider-generic-rest",
   "crates/permissionsync-routing",
 ]
 resolver = "3"
