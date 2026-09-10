@@ -7,14 +7,16 @@
 //! isolation: linked code has PermissionSync process authority.
 //!
 //! Data-bearing Core types carrying potentially sensitive or unbounded
-//! synchronized-user identity or desired-state payloads intentionally avoid
-//! ordinary `Debug` implementations. Adding `Debug` for such types requires
-//! deliberate review against ADR 0006's safe-observability requirements.
+//! synchronized-user identity, technical-caller bearer material, or desired
+//! state payloads intentionally avoid ordinary formatting. Adding `Debug` or
+//! `Display` for such types requires deliberate review against ADR 0006's
+//! safe-observability requirements.
 
 mod desired_state;
 mod identity;
 mod ports;
 mod target;
+mod technical_caller;
 
 pub use desired_state::{
     DesiredStateEnvelope, EnvelopeVersion, InvalidOpaquePayload, OpaquePayload,
@@ -26,3 +28,4 @@ pub use ports::{
     TargetAdapterError, TargetAdapterRequest,
 };
 pub use target::{InvalidLogicalTarget, LogicalTarget};
+pub use technical_caller::TechnicalCallerBearerToken;
