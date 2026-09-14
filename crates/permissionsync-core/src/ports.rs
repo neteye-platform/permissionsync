@@ -1,6 +1,6 @@
 use std::{error::Error, fmt, future::Future, pin::Pin, time::Instant};
 
-use crate::{DesiredStateEnvelope, IdentityContext, LogicalTarget};
+use crate::{DesiredStateEnvelope, IdentityContext, LogicalTarget, TechnicalCallerBearerToken};
 
 /// A sendable future returned by a Core port.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -37,23 +37,34 @@ impl<'a> SynchronizationContext<'a> {
     }
 }
 
-/// Inputs for one Permission Provider desired-state resolution attempt.
+/// Inputs for one selected-target Permission Provider desired-state resolution attempt.
+///
+/// The identity describes the synchronized end user, while the bearer token is
+/// the separate technical-caller credential authenticated at the inbound
+/// boundary. The target is independently selected for Core routing, and the
+/// context carries the synchronization deadline and cancellation signal.
 pub struct PermissionProviderRequest<'a> {
     identity: &'a IdentityContext,
     target: &'a LogicalTarget,
+    technical_caller_bearer_token: &'a TechnicalCallerBearerToken,
     context: SynchronizationContext<'a>,
 }
 
 impl<'a> PermissionProviderRequest<'a> {
-    /// Creates inputs for a Permission Provider operation.
+    /// Creates inputs for a selected-target Permission Provider operation.
+    ///
+    /// The technical-caller bearer token is mandatory for every Provider
+    /// operation and remains separate from synchronized end-user identity.
     pub fn new(
         identity: &'a IdentityContext,
         target: &'a LogicalTarget,
+        technical_caller_bearer_token: &'a TechnicalCallerBearerToken,
         context: SynchronizationContext<'a>,
     ) -> Self {
         Self {
             identity,
             target,
+            technical_caller_bearer_token,
             context,
         }
     }
@@ -66,6 +77,15 @@ impl<'a> PermissionProviderRequest<'a> {
     /// Returns the authorized logical target being resolved.
     pub fn target(&self) -> &LogicalTarget {
         self.target
+    }
+
+    /// Returns the sensitive technical-caller bearer token for Provider use.
+    ///
+    /// This is not synchronized end-user identity. Consumers must treat the
+    /// token as sensitive and must not expose it through logs, formatting,
+    /// persistence, serialization, errors, or metrics.
+    pub fn technical_caller_bearer_token(&self) -> &TechnicalCallerBearerToken {
+        self.technical_caller_bearer_token
     }
 
     /// Returns the request deadline and cancellation context.
@@ -225,6 +245,7 @@ mod tests {
 
     use crate::{
         DesiredStateEnvelope, EnvelopeVersion, IdentityContext, LogicalTarget, OpaquePayload,
+        TechnicalCallerBearerToken,
     };
 
     use super::{
@@ -254,6 +275,40 @@ mod tests {
                 *self.deadline.lock().unwrap() = Some(request.context().deadline());
                 let _ = request.identity().username();
                 let _ = request.target().as_str();
+
+                Err(PermissionProviderError::new(SensitiveSource))
+            })
+        }
+    }
+
+    struct ProviderRequestObservation {
+        username: String,
+        groups: Vec<String>,
+        target: String,
+        bearer_token: String,
+        deadline: Instant,
+        cancelled: bool,
+    }
+
+    struct InspectingProvider {
+        observation: Mutex<Option<ProviderRequestObservation>>,
+    }
+
+    impl PermissionProvider for InspectingProvider {
+        fn resolve<'a>(
+            &'a self,
+            request: PermissionProviderRequest<'a>,
+        ) -> BoxFuture<'a, Result<DesiredStateEnvelope, PermissionProviderError>> {
+            Box::pin(async move {
+                let observation = ProviderRequestObservation {
+                    username: request.identity().username().to_owned(),
+                    groups: request.identity().groups().to_vec(),
+                    target: request.target().as_str().to_owned(),
+                    bearer_token: request.technical_caller_bearer_token().as_str().to_owned(),
+                    deadline: request.context().deadline(),
+                    cancelled: request.context().cancellation().is_cancelled(),
+                };
+                *self.observation.lock().unwrap() = Some(observation);
 
                 Err(PermissionProviderError::new(SensitiveSource))
             })
@@ -333,6 +388,7 @@ mod tests {
     fn ports_are_object_safe_and_send_sync() {
         fn assert_send_sync<T: ?Sized + Send + Sync>() {}
 
+        assert_send_sync::<TechnicalCallerBearerToken>();
         assert_send_sync::<dyn PermissionProvider>();
         assert_send_sync::<dyn TargetAdapter>();
         assert_send_sync::<dyn CancellationSignal>();
@@ -349,6 +405,43 @@ mod tests {
         let cancellation_signal: &dyn CancellationSignal = &cancellation;
 
         let _ = (provider_port, adapter_port, cancellation_signal);
+    }
+
+    #[test]
+    fn provider_receives_all_selected_target_inputs() {
+        let provider = InspectingProvider {
+            observation: Mutex::new(None),
+        };
+        let cancellation = Cancelled;
+        let identity = IdentityContext::new(
+            "jdoe".to_owned(),
+            vec!["/staff".to_owned(), "/staff/engineering".to_owned()],
+        );
+        let target = LogicalTarget::try_from("target".to_owned()).unwrap();
+        let raw_bearer_token = "  raw-token\u{00a0}\t";
+        let technical_caller_bearer_token =
+            TechnicalCallerBearerToken::new(raw_bearer_token.to_owned());
+        let deadline = Instant::now();
+        let context = SynchronizationContext::new(deadline, &cancellation);
+        let request = PermissionProviderRequest::new(
+            &identity,
+            &target,
+            &technical_caller_bearer_token,
+            context,
+        );
+
+        assert!(poll_ready(provider.resolve(request)).is_err());
+
+        let observation = provider.observation.lock().unwrap().take().unwrap();
+        assert_eq!(observation.username, "jdoe");
+        assert_eq!(
+            observation.groups,
+            ["/staff".to_owned(), "/staff/engineering".to_owned()]
+        );
+        assert_eq!(observation.target, "target");
+        assert_eq!(observation.bearer_token, raw_bearer_token);
+        assert_eq!(observation.deadline, deadline);
+        assert!(observation.cancelled);
     }
 
     #[test]
@@ -410,6 +503,7 @@ mod tests {
         let cancellation = Cancelled;
         let identity = IdentityContext::new("jdoe".to_owned(), Vec::new());
         let target = LogicalTarget::try_from("target".to_owned()).unwrap();
+        let technical_caller_bearer_token = TechnicalCallerBearerToken::new("raw-token".to_owned());
         let desired_state = DesiredStateEnvelope::new(
             EnvelopeVersion::new(1),
             OpaquePayload::try_from("null".to_owned()).unwrap(),
@@ -418,7 +512,12 @@ mod tests {
         let overall_deadline = Instant::now();
         let provider_context = SynchronizationContext::new(overall_deadline, &cancellation);
         let adapter_context = SynchronizationContext::new(overall_deadline, &cancellation);
-        let provider_request = PermissionProviderRequest::new(&identity, &target, provider_context);
+        let provider_request = PermissionProviderRequest::new(
+            &identity,
+            &target,
+            &technical_caller_bearer_token,
+            provider_context,
+        );
         let adapter_request = TargetAdapterRequest::new(&desired_state, adapter_context);
 
         assert!(poll_ready(provider.resolve(provider_request)).is_err());
