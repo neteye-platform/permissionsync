@@ -827,6 +827,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "permissionsync-orchestration"
+version = "0.1.0"
+dependencies = [
+ "permissionsync-core",
+ "permissionsync-routing",
+]
+
+[[package]]
 name = "permissionsync-provider-generic-rest"
 version = "0.1.0"
 dependencies = [
