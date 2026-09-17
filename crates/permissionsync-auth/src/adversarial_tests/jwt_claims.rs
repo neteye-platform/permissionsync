@@ -420,6 +420,60 @@ async fn required_claim_shapes_and_temporal_values_are_enforced() {
 }
 
 #[tokio::test]
+async fn optional_nbf_shape_and_temporal_values_are_enforced() {
+    let signing = SigningMaterial::new(JwtAlgorithm::RS256, "nbf-key");
+    let authenticator = cached_authenticator(&signing.jwks(), vec![JwtAlgorithm::RS256]).await;
+    let header = header_with_kid("nbf-key");
+
+    for (name, nbf) in [
+        ("past", json!(1_699_999_999_f64)),
+        ("current", json!(1_700_000_000_f64)),
+        ("at clock-skew boundary", json!(1_700_000_005_f64)),
+    ] {
+        let mut valid = claims(None);
+        valid["nbf"] = nbf;
+        assert!(
+            authenticate_token(&authenticator, &token(&signing, valid, &header))
+                .await
+                .is_ok(),
+            "{name}"
+        );
+    }
+
+    for (name, nbf) in [
+        (
+            "just beyond clock-skew boundary",
+            json!(1_700_000_005.5_f64),
+        ),
+        ("far future", json!(9_000_000_000_f64)),
+    ] {
+        let mut future = claims(None);
+        future["nbf"] = nbf;
+        assert_error(
+            authenticate_token(&authenticator, &token(&signing, future, &header)).await,
+            AuthenticationError::Rejected,
+            name,
+        );
+    }
+
+    for (name, nbf) in [
+        ("null", json!(null)),
+        ("string", json!("1700000000")),
+        ("boolean", json!(true)),
+        ("array", json!([1_700_000_000_f64])),
+        ("object", json!({"nbf": 1_700_000_000_f64})),
+    ] {
+        let mut malformed = claims(None);
+        malformed["nbf"] = nbf;
+        assert_error(
+            authenticate_token(&authenticator, &token(&signing, malformed, &header)).await,
+            AuthenticationError::Rejected,
+            name,
+        );
+    }
+}
+
+#[tokio::test]
 async fn scope_target_matrix_preserves_rejected_and_forbidden_precedence() {
     let signing = SigningMaterial::new(JwtAlgorithm::RS256, "scope-key");
     let authenticator = cached_authenticator(&signing.jwks(), vec![JwtAlgorithm::RS256]).await;
@@ -611,6 +665,11 @@ async fn unavailable_clock_follows_authentication_shape_before_scope_validation(
             claims["iat"] = json!("1700000000");
             claims
         }),
+        ("malformed nbf", {
+            let mut claims = claims(None);
+            claims["nbf"] = json!("1700000000");
+            claims
+        }),
         ("malformed client_id", {
             let mut claims = claims(None);
             claims["client_id"] = json!(["test-caller"]);
@@ -649,6 +708,14 @@ async fn unavailable_clock_follows_authentication_shape_before_scope_validation(
         authenticate_token(&authenticator, &token(&signing, claims(None), &header)).await,
         AuthenticationError::VerifierUnavailable,
         "otherwise-valid claims with no clock",
+    );
+
+    let mut valid_nbf = claims(None);
+    valid_nbf["nbf"] = json!(1_700_000_000_f64);
+    assert_error(
+        authenticate_token(&authenticator, &token(&signing, valid_nbf, &header)).await,
+        AuthenticationError::VerifierUnavailable,
+        "valid nbf with no clock",
     );
 
     assert_error(
@@ -706,6 +773,22 @@ async fn available_clock_orders_authentication_then_scope_authorization() {
         );
     }
 
+    for (name, scope) in [
+        (
+            "multiple valid PermissionSync scopes",
+            json!("permissionsync:glpi permissionsync:grafana"),
+        ),
+        ("malformed scope", json!("permissionsync:glpi  service")),
+    ] {
+        let mut future_nbf = claims(Some(scope));
+        future_nbf["nbf"] = json!(1_700_000_006_f64);
+        assert_error(
+            authenticate_token(&authenticator, &token(&signing, future_nbf, &header)).await,
+            AuthenticationError::Rejected,
+            name,
+        );
+    }
+
     assert_error(
         authenticate_token(
             &authenticator,
@@ -735,11 +818,10 @@ async fn ignored_claims_do_not_affect_identity_or_the_authentication_outcome() {
     let signing = SigningMaterial::new(JwtAlgorithm::RS256, "ignored-claims-key");
     let authenticator = cached_authenticator(&signing.jwks(), vec![JwtAlgorithm::RS256]).await;
     let mut ignored_claims = claims(Some(json!("permissionsync:glpi")));
-    ignored_claims["nbf"] = json!(9_000_000_000_f64);
-    ignored_claims["sub"] = json!("someone-else");
-    ignored_claims["azp"] = json!("some-authorized-party");
-    ignored_claims["jti"] = json!("11111111-1111-1111-1111-111111111111");
-    ignored_claims["acr"] = json!("urn:mace:incommon:iap:silver");
+    ignored_claims["sub"] = json!({"subject": "someone-else"});
+    ignored_claims["azp"] = json!(["some-authorized-party"]);
+    ignored_claims["jti"] = json!(false);
+    ignored_claims["acr"] = json!(42);
 
     let result = authenticate_token(
         &authenticator,

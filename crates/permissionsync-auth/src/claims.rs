@@ -13,10 +13,12 @@ struct ParsedAuthenticationClaims<'a> {
     client_id: &'a str,
     exp: f64,
     iat: f64,
+    nbf: Option<f64>,
 }
 
 /// Validates authentication claim shapes without consulting wall time: `iss`,
-/// `aud`, `exp`/`iat` numeric shape, and `client_id` shape.
+/// `aud`, `exp`/`iat` numeric shape, optional `nbf` numeric shape, and
+/// `client_id` shape.
 fn parse_authentication_claim_shapes<'a>(
     claims: &'a serde_json::Map<String, Value>,
     config: &Config,
@@ -32,10 +34,15 @@ fn parse_authentication_claim_shapes<'a>(
         .get("client_id")
         .and_then(Value::as_str)
         .ok_or(AuthenticationError::Rejected)?;
+    let nbf = claims
+        .get("nbf")
+        .map(|value| numeric_date(Some(value)).ok_or(AuthenticationError::Rejected))
+        .transpose()?;
     Ok(ParsedAuthenticationClaims {
         client_id,
         exp,
         iat,
+        nbf,
     })
 }
 
@@ -56,7 +63,8 @@ pub(crate) fn validate_claims(
     let now = clock
         .unix_seconds()
         .ok_or(AuthenticationError::VerifierUnavailable)?;
-    if parsed.exp <= now || parsed.iat > now + config.clock_skew.as_secs_f64() {
+    let allowed = now + config.clock_skew.as_secs_f64();
+    if parsed.exp <= now || parsed.iat > allowed || parsed.nbf.is_some_and(|nbf| nbf > allowed) {
         return Err(AuthenticationError::Rejected);
     }
     check_context(context)?;
