@@ -20,13 +20,17 @@ Technical caller access tokens should be short-lived.
 
 PermissionSync uses these JWT claims:
 
-Authentication:
+Required authentication claims:
 
     iss
     aud
     exp
     iat
     client_id
+
+Optional authentication constraint, enforced when present:
+
+    nbf
 
 Authorization and target selection:
 
@@ -35,8 +39,8 @@ Authorization and target selection:
 Authentication and authorization use these claims with distinct
 responsibilities:
 
-- **Authentication** validates `signature`, `iss`, `aud`, `exp`, `iat`, and
-  `client_id`.
+- **Authentication** validates `signature` and every required authentication
+  claim, and enforces optional `nbf` when present.
 - **Authorization** uses `scope`.
 
 Authentication validation semantics:
@@ -46,6 +50,10 @@ Authentication validation semantics:
   additional audience values are permitted.
 - `exp` MUST exist and the token MUST NOT be expired.
 - `iat` MUST exist and be temporally valid with bounded clock skew.
+- `nbf` is optional. When present, it MUST be a finite NumericDate in the
+  inclusive signed 53-bit range `-9_007_199_254_740_991` through
+  `9_007_199_254_740_991`, and MUST NOT be later than the current time plus
+  bounded clock skew.
 - `client_id` MUST exist and identifies the authenticated technical caller.
 - Signature verification MUST use the trusted Keycloak JWKS source and an
   explicit algorithm allowlist.
@@ -113,8 +121,11 @@ Examples:
 - `scope = "permissionsync:"` returns `403`: it is exactly one PermissionSync
   token with an invalid target suffix, not a zero-token request.
 
-Ordering matters: authentication verifies the signature and `iss`, `aud`,
-`exp`, `iat`, and `client_id` first. Structural scope validation, including RFC
+Ordering matters: authentication verifies the signature, parses the shapes of
+`iss`, `aud`, `exp`, `iat`, `client_id`, and optional `nbf`, then obtains the
+current time and computes one allowed bound: current time plus bounded clock
+skew. It rejects an expired `exp`, an `iat` later than that bound, or a present
+`nbf` later than that same bound. Structural scope validation, including RFC
 6749 validation for a nonempty `scope`, follows. PermissionSync then determines
 scope cardinality and validates the suffix when exactly one token is present.
 More than one exact PermissionSync token, or exactly one token with an invalid
@@ -128,6 +139,8 @@ Failure semantics:
 - A missing or malformed bearer token or JWT, an invalid signature, or a
   missing or malformed claim required for authentication (`iss`, `aud`, `exp`,
   `iat`, or `client_id`) returns `401`.
+- A malformed present `nbf`, or a present `nbf` later than the current time plus
+  bounded clock skew, returns `401`.
 - A structurally malformed or wrong-shaped `scope` claim, or a nonempty `scope`
   string that violates RFC 6749 syntax, makes the token structurally invalid
   and returns `401`.
@@ -169,6 +182,10 @@ verify that representative Client Credentials tokens:
 - contain the configured expected PermissionSync audience in `aud`; and
 - cover the complete PermissionSync-required token contract defined by this
   ADR;
+- have an absent `nbf`, a valid `nbf` at or before the current time plus clock
+  skew, and complete normally;
+- have a malformed present `nbf` or one later than the current time plus clock
+  skew and return `401`;
 - have an absent `scope` and, with an otherwise valid inbound body, complete as
   a targetless successful `204`;
 - have an empty string `scope` and, with an otherwise valid inbound body,
@@ -200,9 +217,9 @@ The audience assertion MUST accept standards-compliant `aud` representations
 while requiring the configured PermissionSync audience to be present; it MUST
 NOT require `aud` to equal exactly one audience value.
 
-PermissionSync does NOT depend on `sub`, `nbf`, `azp`, `jti`, `acr`, or other
-claims for its required authentication or authorization contract. These claims
-are not forbidden from appearing in the JWT; they are simply not required by
+PermissionSync does NOT depend on `sub`, `azp`, `jti`, `acr`, or other claims
+for its required authentication or authorization contract. These claims are not
+forbidden from appearing in the JWT; they are simply not required by
 PermissionSync.
 
 The `client_id` claim is the explicit technical caller identity. PermissionSync

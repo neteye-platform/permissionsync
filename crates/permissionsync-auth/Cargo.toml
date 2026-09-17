@@ -1,0 +1,29 @@
+[package]
+name = "permissionsync-auth"
+description = "Internal technical-caller authentication boundary for PermissionSync"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+bytes = { version = "=1.12.1", default-features = false }
+http-body-util = { version = "=0.1.5", default-features = false }
+hyper = { version = "=1.11.1", default-features = false, features = ["client", "http1"] }
+hyper-tls = { version = "=0.6.0", default-features = false }
+hyper-util = { version = "=0.1.20", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+josekit = { version = "=0.10.3", default-features = false }
+native-tls = { version = "=0.2.18", default-features = false }
+permissionsync-core = { path = "../permissionsync-core", version = "=0.1.0" }
+serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
+tokio = { version = "=1.53.1", default-features = false, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+openssl = { version = "=0.10.81", default-features = false }
+tokio = { version = "=1.53.1", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "test-util"] }
+tokio-native-tls = { version = "=0.3.1", default-features = false }
+
+[lints]
+workspace = true
