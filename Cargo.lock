@@ -970,6 +970,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "permissionsync-inbound-http"
+version = "0.1.0"
+dependencies = [
+ "permissionsync-auth",
+ "permissionsync-core",
+ "permissionsync-orchestration",
+ "permissionsync-routing",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "permissionsync-orchestration"
 version = "0.1.0"
 dependencies = [

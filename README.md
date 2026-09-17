@@ -8,10 +8,11 @@ The Rust workspace currently contains target-neutral Core domain contracts,
 deterministic runtime target routing, a concrete Generic REST Permission
 Provider, selected-target synchronization orchestration, and an internal
 `permissionsync-auth` boundary for technical-caller JWT verification and scope
-target selection. Inbound HTTP, authentication/authorization integration,
-runtime composition/configuration loading, and concrete Target Adapters remain
-unimplemented. Supported-Keycloak deployment integration/contract tests also
-remain future work; the internal auth-crate tests are not a deployment claim.
+target selection, plus framework-neutral inbound HTTP request processing with
+authentication/authorization integration. Actual HTTP server/listener/routing,
+runtime configuration/composition, health/readiness, concrete Target Adapters,
+supported-Keycloak deployment contract tests, and OCI/runtime integration remain
+future work; the internal auth-crate tests are not a deployment claim.
 
 ## Development
 
