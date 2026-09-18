@@ -389,6 +389,8 @@ mod tests {
 
     const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
     const MAX_REQUEST_HEADER_BYTES: usize = 8 * 1024;
+    const NOT_BEFORE: i64 = 1_700_000_000;
+    const NOT_AFTER: i64 = 4_100_000_000;
 
     struct ServerTask(Option<tokio::task::JoinHandle<()>>);
 
@@ -655,10 +657,10 @@ mod tests {
             .set_serial_number(&BigNum::from_u32(serial).unwrap().to_asn1_integer().unwrap())
             .unwrap();
         certificate
-            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .set_not_before(&Asn1Time::from_unix(NOT_BEFORE).unwrap())
             .unwrap();
         certificate
-            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .set_not_after(&Asn1Time::from_unix(NOT_AFTER).unwrap())
             .unwrap();
         certificate
     }
@@ -731,11 +733,7 @@ mod tests {
         let mut public_key = signing_key.to_public_key().unwrap();
         public_key.set_key_id("test-key");
         let jwks = serde_json::to_vec(&serde_json::json!({"keys":[public_key]})).unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as f64;
-        let payload = serde_json::to_vec(&serde_json::json!({"iss":"https://issuer.test","aud":"audience","exp":now+300.0,"iat":now,"client_id":"test-client","scope":"permissionsync:target-a"})).unwrap();
+        let payload = serde_json::to_vec(&serde_json::json!({"iss":"https://issuer.test","aud":"audience","exp":4_000_000_000_f64,"iat":1_700_000_000_f64,"client_id":"test-client","scope":"permissionsync:target-a"})).unwrap();
         let token = JwsContext::new()
             .serialize_compact(
                 &payload,
