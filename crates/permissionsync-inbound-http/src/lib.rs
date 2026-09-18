@@ -764,9 +764,9 @@ mod tests {
                 "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                 jwks.len()
             );
-            stream.write_all(response.as_bytes()).await.unwrap();
-            stream.write_all(&jwks).await.unwrap();
-            stream.shutdown().await.unwrap();
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(&jwks).await;
+            let _ = stream.shutdown().await;
         });
         let authenticator = permissionsync_auth::TechnicalCallerAuthenticator::new(
             TechnicalCallerAuthenticatorConfig::new(
