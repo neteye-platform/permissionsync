@@ -970,6 +970,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "permissionsync-inbound-http"
+version = "0.1.0"
+dependencies = [
+ "josekit",
+ "native-tls",
+ "openssl",
+ "permissionsync-auth",
+ "permissionsync-core",
+ "permissionsync-orchestration",
+ "permissionsync-routing",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-native-tls",
+]
+
+[[package]]
 name = "permissionsync-orchestration"
 version = "0.1.0"
 dependencies = [

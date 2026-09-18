@@ -2,6 +2,7 @@
 members = [
   "crates/permissionsync-core",
   "crates/permissionsync-auth",
+  "crates/permissionsync-inbound-http",
   "crates/permissionsync-orchestration",
   "crates/permissionsync-provider-generic-rest",
   "crates/permissionsync-routing",
