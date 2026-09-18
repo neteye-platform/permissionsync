@@ -178,6 +178,7 @@ impl<'a> InboundHttpHandler<'a> {
     ) -> HttpOutcome {
         let authenticated = match authentication {
             Ok(authenticated) => authenticated,
+            Err(_) if context_unavailable(&context) => return HttpOutcome::CancelledOrExpired,
             Err(error) => return authentication_failure_outcome(error),
         };
 
@@ -986,6 +987,45 @@ mod tests {
             );
             assert_eq!(count(&calls), (0, 0, 0));
         }
+    }
+
+    #[test]
+    fn unavailable_context_precedes_rejected_authentication_in_private_continuation() {
+        let calls = Arc::new(Calls::default());
+        let router = selected_router(calls.clone(), ResultKind::Changed, true);
+        let provider = FakeProvider {
+            calls: calls.clone(),
+            kind: ResultKind::Changed,
+        };
+        let capacity = FakeCapacity {
+            calls: calls.clone(),
+            fails: false,
+        };
+        let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let authenticator = auth();
+        let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
+
+        assert_outcome(
+            poll_ready(handler.continue_after_authentication(
+                Err(permissionsync_auth::AuthenticationError::Rejected),
+                body(),
+                context(&Cancelled),
+            )),
+            HttpOutcome::CancelledOrExpired,
+            500,
+        );
+        assert_eq!(count(&calls), (0, 0, 0));
+
+        assert_outcome(
+            poll_ready(handler.continue_after_authentication(
+                Err(permissionsync_auth::AuthenticationError::Rejected),
+                body(),
+                SynchronizationContext::new(Instant::now(), &NeverCancelled),
+            )),
+            HttpOutcome::CancelledOrExpired,
+            500,
+        );
+        assert_eq!(count(&calls), (0, 0, 0));
     }
 
     #[test]
