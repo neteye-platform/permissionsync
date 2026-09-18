@@ -318,10 +318,25 @@ mod tests {
         future::Future,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         task::{Context, Poll, Waker},
         time::{Duration, Instant},
+    };
+
+    use josekit::{
+        jwk::Jwk,
+        jws::{self, JwsContext, JwsHeader},
+    };
+    use openssl::{
+        asn1::Asn1Time,
+        bn::BigNum,
+        nid::Nid,
+        pkey::{PKey, Private},
+        x509::{
+            X509, X509NameRef,
+            extension::{BasicConstraints, KeyUsage, SubjectAlternativeName},
+        },
     };
 
     use permissionsync_auth::{
@@ -341,6 +356,13 @@ mod tests {
     use permissionsync_routing::{
         AdapterIdentifier, AdapterRegistration, TargetRoute, TargetRouter,
     };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sync::Notify,
+        time::timeout,
+    };
+    use tokio_native_tls::TlsAcceptor;
 
     use super::{
         HeaderField, HeaderList, HttpOutcome, InboundHttpHandler, LoginBody, extract_bearer,
@@ -357,6 +379,67 @@ mod tests {
         fn is_cancelled(&self) -> bool {
             true
         }
+    }
+    struct ToggleCancelled(AtomicBool);
+    impl CancellationSignal for ToggleCancelled {
+        fn is_cancelled(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    const FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
+    const MAX_REQUEST_HEADER_BYTES: usize = 8 * 1024;
+
+    struct ServerTask(Option<tokio::task::JoinHandle<()>>);
+
+    impl ServerTask {
+        fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+            Self(Some(handle))
+        }
+
+        async fn finish(mut self) {
+            let mut handle = self.0.take().unwrap();
+            match timeout(FIXTURE_TIMEOUT, &mut handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => panic!("JWKS fixture task failed: {error}"),
+                Err(_) => {
+                    handle.abort();
+                    let _ = timeout(FIXTURE_TIMEOUT, &mut handle).await;
+                    panic!("JWKS fixture task timed out");
+                }
+            }
+        }
+    }
+
+    impl Drop for ServerTask {
+        fn drop(&mut self) {
+            if let Some(handle) = self.0.take() {
+                handle.abort();
+            }
+        }
+    }
+
+    async fn read_request_header(stream: &mut tokio_native_tls::TlsStream<TcpStream>) -> Vec<u8> {
+        timeout(FIXTURE_TIMEOUT, async {
+            let mut header = Vec::with_capacity(1024);
+            let mut chunk = [0; 1024];
+            loop {
+                assert!(
+                    header.len() < MAX_REQUEST_HEADER_BYTES,
+                    "request header too large"
+                );
+                let remaining = MAX_REQUEST_HEADER_BYTES - header.len();
+                let chunk_length = remaining.min(chunk.len());
+                let read = stream.read(&mut chunk[..chunk_length]).await.unwrap();
+                assert_ne!(read, 0, "connection closed before request header completed");
+                header.extend_from_slice(&chunk[..read]);
+                if header.windows(4).any(|window| window == b"\r\n\r\n") {
+                    return header;
+                }
+            }
+        })
+        .await
+        .expect("request header must arrive before fixture timeout")
     }
 
     fn poll_ready<F: Future>(future: F) -> F::Output {
@@ -427,6 +510,37 @@ mod tests {
     struct FakeAdapter {
         calls: Arc<Calls>,
         kind: ResultKind,
+    }
+    struct PublicProvider<'a> {
+        calls: Arc<Calls>,
+        expected_bearer: &'a str,
+        bearer_matched: AtomicBool,
+    }
+    impl PermissionProvider for PublicProvider<'_> {
+        fn resolve<'a>(
+            &'a self,
+            request: PermissionProviderRequest<'a>,
+        ) -> BoxFuture<'a, Result<DesiredStateEnvelope, PermissionProviderError>> {
+            Box::pin(async move {
+                self.calls.provider.fetch_add(1, Ordering::SeqCst);
+                self.bearer_matched.store(
+                    request.technical_caller_bearer_token().as_str() == self.expected_bearer,
+                    Ordering::SeqCst,
+                );
+                *self.calls.observation.lock().unwrap() = Some(ProviderObservation {
+                    username: request.identity().username().to_owned(),
+                    groups: request.identity().groups().to_vec(),
+                    target: request.target().as_str().to_owned(),
+                    bearer: String::new(),
+                    deadline: request.context().deadline(),
+                    cancelled: request.context().cancellation().is_cancelled(),
+                });
+                Ok(DesiredStateEnvelope::new(
+                    EnvelopeVersion::new(1),
+                    OpaquePayload::try_from("null".to_owned()).unwrap(),
+                ))
+            })
+        }
     }
     impl TargetAdapter for FakeAdapter {
         fn reconcile<'a>(
@@ -523,6 +637,161 @@ mod tests {
                 Vec::new(),
             )
             .unwrap(),
+        )
+    }
+
+    fn certificate(
+        subject: &X509NameRef,
+        issuer: &X509NameRef,
+        key: &PKey<Private>,
+        serial: u32,
+    ) -> openssl::x509::X509Builder {
+        let mut certificate = X509::builder().unwrap();
+        certificate.set_version(2).unwrap();
+        certificate.set_subject_name(subject).unwrap();
+        certificate.set_issuer_name(issuer).unwrap();
+        certificate.set_pubkey(key).unwrap();
+        certificate
+            .set_serial_number(&BigNum::from_u32(serial).unwrap().to_asn1_integer().unwrap())
+            .unwrap();
+        certificate
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        certificate
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        certificate
+    }
+
+    fn tls_identity() -> (native_tls::TlsAcceptor, Vec<u8>) {
+        let root_key = PKey::generate_ed25519().unwrap();
+        let mut root_name = openssl::x509::X509NameBuilder::new().unwrap();
+        root_name
+            .append_entry_by_nid(Nid::COMMONNAME, "inbound-test-root")
+            .unwrap();
+        let root_name = root_name.build();
+        let mut root = certificate(&root_name, &root_name, &root_key, 1);
+        root.append_extension(BasicConstraints::new().critical().ca().build().unwrap())
+            .unwrap();
+        root.append_extension(KeyUsage::new().critical().key_cert_sign().build().unwrap())
+            .unwrap();
+        root.sign(&root_key, openssl::hash::MessageDigest::null())
+            .unwrap();
+        let root = root.build();
+        let leaf_key = PKey::generate_ed25519().unwrap();
+        let mut leaf_name = openssl::x509::X509NameBuilder::new().unwrap();
+        leaf_name
+            .append_entry_by_nid(Nid::COMMONNAME, "127.0.0.1")
+            .unwrap();
+        let leaf_name = leaf_name.build();
+        let mut leaf = certificate(&leaf_name, root.subject_name(), &leaf_key, 2);
+        leaf.append_extension(BasicConstraints::new().critical().build().unwrap())
+            .unwrap();
+        leaf.append_extension(
+            KeyUsage::new()
+                .critical()
+                .digital_signature()
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+        leaf.append_extension(
+            SubjectAlternativeName::new()
+                .ip("127.0.0.1")
+                .build(&leaf.x509v3_context(None, None))
+                .unwrap(),
+        )
+        .unwrap();
+        leaf.sign(&root_key, openssl::hash::MessageDigest::null())
+            .unwrap();
+        let leaf = leaf.build();
+        let identity = native_tls::Identity::from_pkcs8(
+            &leaf.to_pem().unwrap(),
+            &leaf_key.private_key_to_pem_pkcs8().unwrap(),
+        )
+        .unwrap();
+        (
+            native_tls::TlsAcceptor::builder(identity).build().unwrap(),
+            root.to_pem().unwrap(),
+        )
+    }
+
+    async fn jwks_fixture(
+        wait_for_release: bool,
+    ) -> (
+        permissionsync_auth::TechnicalCallerAuthenticator,
+        String,
+        Arc<AtomicUsize>,
+        Arc<Notify>,
+        Arc<Notify>,
+        ServerTask,
+    ) {
+        let mut signing_key = Jwk::generate_rsa_key(2048).unwrap();
+        signing_key.set_key_id("test-key");
+        let mut public_key = signing_key.to_public_key().unwrap();
+        public_key.set_key_id("test-key");
+        let jwks = serde_json::to_vec(&serde_json::json!({"keys":[public_key]})).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as f64;
+        let payload = serde_json::to_vec(&serde_json::json!({"iss":"https://issuer.test","aud":"audience","exp":now+300.0,"iat":now,"client_id":"test-client","scope":"permissionsync:target-a"})).unwrap();
+        let token = JwsContext::new()
+            .serialize_compact(
+                &payload,
+                &JwsHeader::new(),
+                &jws::RS256.signer_from_jwk(&signing_key).unwrap(),
+            )
+            .unwrap();
+        let (acceptor, root) = tls_identity();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let server_count = count.clone();
+        let server_release = release.clone();
+        let server_arrived = arrived.clone();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = TlsAcceptor::from(acceptor).accept(stream).await.unwrap();
+            let request = read_request_header(&mut stream).await;
+            assert!(request.starts_with(b"GET /jwks HTTP/1.1\r\n"));
+            server_count.fetch_add(1, Ordering::SeqCst);
+            server_arrived.notify_one();
+            if wait_for_release {
+                server_release.notified().await;
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                jwks.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(&jwks).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let authenticator = permissionsync_auth::TechnicalCallerAuthenticator::new(
+            TechnicalCallerAuthenticatorConfig::new(
+                "https://issuer.test".to_owned(),
+                "audience".to_owned(),
+                TrustedVerificationSource::DirectJwks {
+                    uri: format!("https://{address}/jwks"),
+                },
+                vec![JwtAlgorithm::RS256],
+                Duration::from_secs(5),
+                VerificationCachePolicy::new(Duration::from_secs(30), Duration::ZERO),
+                Duration::ZERO,
+                vec![root],
+            )
+            .unwrap(),
+        );
+        (
+            authenticator,
+            token,
+            count,
+            arrived,
+            release,
+            ServerTask::new(task),
         )
     }
 
@@ -1002,7 +1271,7 @@ mod tests {
         let authenticator = auth();
         let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
         let bearer = TechnicalCallerBearerToken::new("token".to_owned());
-        let deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        let deadline = Instant::now();
         assert_outcome(
             poll_ready(handler.handle_authenticated(
                 &bearer,
@@ -1014,5 +1283,155 @@ mod tests {
             500,
         );
         assert_eq!(count(&calls), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn public_handle_authenticates_over_trusted_loopback_https_and_preserves_selected_inputs()
+    {
+        let (authenticator, token, jwks_calls, _arrived, _release, server) =
+            jwks_fixture(false).await;
+        let calls = Arc::new(Calls::default());
+        let router = selected_router(calls.clone(), ResultKind::Changed, true);
+        let provider = PublicProvider {
+            calls: calls.clone(),
+            expected_bearer: &token,
+            bearer_matched: AtomicBool::new(false),
+        };
+        let capacity = FakeCapacity {
+            calls: calls.clone(),
+            fails: false,
+        };
+        let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
+        let cancellation = NeverCancelled;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let header_value = format!("Bearer {token}");
+        let headers = [HeaderField::new(b"Authorization", header_value.as_bytes())];
+        let body = "{\"event_type\":\"LOGIN\",\"username\":\"ü\",\"groups\":[\"a\",\"a\",\" b \"]}";
+        let outcome = timeout(
+            Duration::from_secs(10),
+            handler.handle(
+                HeaderList::new(&headers),
+                body.as_bytes(),
+                SynchronizationContext::new(deadline, &cancellation),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_outcome(outcome, HttpOutcome::Changed, 200);
+        assert_eq!(jwks_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(count(&calls), (1, 1, 1));
+        assert!(provider.bearer_matched.load(Ordering::SeqCst));
+        let observation = calls.observation.lock().unwrap().take().unwrap();
+        assert_eq!(observation.username, "ü");
+        assert_eq!(observation.groups, ["a", "a", " b "]);
+        assert_eq!(observation.target, "target-a");
+        assert_eq!(observation.deadline, deadline);
+        assert!(!observation.cancelled);
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn public_handle_rejects_one_segment_bearer_before_jwks_or_target_work() {
+        let calls = Arc::new(Calls::default());
+        let router = selected_router(calls.clone(), ResultKind::Changed, true);
+        let provider = FakeProvider {
+            calls: calls.clone(),
+            kind: ResultKind::Changed,
+        };
+        let capacity = FakeCapacity {
+            calls: calls.clone(),
+            fails: false,
+        };
+        let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let authenticator = auth();
+        let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
+        let headers = [HeaderField::new(b"Authorization", b"Bearer segment")];
+        assert_outcome(
+            handler
+                .handle(HeaderList::new(&headers), b"{", context(&NeverCancelled))
+                .await,
+            HttpOutcome::AuthenticationRejected,
+            401,
+        );
+        assert_eq!(count(&calls), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn public_pre_cancelled_and_expired_contexts_return_without_target_work() {
+        let calls = Arc::new(Calls::default());
+        let router = selected_router(calls.clone(), ResultKind::Changed, true);
+        let provider = FakeProvider {
+            calls: calls.clone(),
+            kind: ResultKind::Changed,
+        };
+        let capacity = FakeCapacity {
+            calls: calls.clone(),
+            fails: false,
+        };
+        let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let authenticator = auth();
+        let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
+        let headers = [HeaderField::new(b"Authorization", b"Bearer segment")];
+        assert_outcome(
+            handler
+                .handle(HeaderList::new(&headers), body(), context(&Cancelled))
+                .await,
+            HttpOutcome::CancelledOrExpired,
+            500,
+        );
+        let past = Instant::now();
+        assert_outcome(
+            handler
+                .handle(
+                    HeaderList::new(&headers),
+                    body(),
+                    SynchronizationContext::new(past, &NeverCancelled),
+                )
+                .await,
+            HttpOutcome::CancelledOrExpired,
+            500,
+        );
+        assert_eq!(count(&calls), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn public_handle_observes_cancellation_during_one_joined_jwks_response() {
+        let (authenticator, token, jwks_calls, arrived, release, server) = jwks_fixture(true).await;
+        let calls = Arc::new(Calls::default());
+        let router = selected_router(calls.clone(), ResultKind::Changed, true);
+        let provider = FakeProvider {
+            calls: calls.clone(),
+            kind: ResultKind::Changed,
+        };
+        let capacity = FakeCapacity {
+            calls: calls.clone(),
+            fails: false,
+        };
+        let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
+        let cancellation = ToggleCancelled(AtomicBool::new(false));
+        let header_value = format!("Bearer {token}");
+        let headers = [HeaderField::new(b"Authorization", header_value.as_bytes())];
+        let mut request =
+            Box::pin(handler.handle(HeaderList::new(&headers), body(), context(&cancellation)));
+        tokio::select! {
+            outcome = &mut request => panic!("handler completed before the JWKS response: {outcome:?}"),
+            arrival = timeout(Duration::from_secs(10), arrived.notified()) => {
+                arrival.expect("JWKS request must arrive before cancellation");
+            }
+        }
+        cancellation.0.store(true, Ordering::SeqCst);
+        release.notify_one();
+        assert_outcome(
+            timeout(Duration::from_secs(10), &mut request)
+                .await
+                .unwrap(),
+            HttpOutcome::CancelledOrExpired,
+            500,
+        );
+        assert_eq!(jwks_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(count(&calls), (0, 0, 0));
+        server.finish().await;
     }
 }
