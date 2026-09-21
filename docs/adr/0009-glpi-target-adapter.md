@@ -15,9 +15,6 @@ In GLPI, the relevant relationship is `Profile_User`. One assignment links a
 user, entity, and profile, and carries `is_recursive`. A GLPI permission state
 is therefore the complete set of those assignments for one user.
 
-This record defines the adapter contract. The crate identifier, runtime
-configuration, registration, and HTTP implementation details are deferred.
-
 ## Decision
 
 ### Identity, scope, and ownership
@@ -78,12 +75,17 @@ The payload is one object with exactly `permissions`; it contains no `user`,
 more objects. Every permission object has exactly the non-empty strings `entity`
 and `profile`, and the boolean `recursive`.
 
-The adapter rejects unsupported versions, unknown or duplicate JSON members,
-wrong types, empty selectors, exact duplicate desired permissions, and
-permissions for the same entity and profile with conflicting `recursive` values.
-Multiple distinct entity/profile assignments, including `Technician` and
-`Read-Only`, are valid. The adapter does not trim, normalize, default, or
-otherwise rewrite selectors or recursive values.
+The adapter rejects unsupported versions, unknown JSON members, wrong types,
+empty selectors, exact duplicate desired permissions, and permissions for the
+same entity and profile with conflicting `recursive` values. As GLPI-specific
+payload validation, it rejects duplicate `permissions` members in the payload
+object and duplicate `entity`, `profile`, or `recursive` members in a permission
+object before any GLPI request. This is separate from ADR 0008's common envelope
+handling of duplicate `version` and `payload` members. Semantic desired-
+permission duplicates and conflicts remain separate validation rules. Multiple
+distinct entity/profile assignments, including `Technician` and `Read-Only`, are
+valid. The adapter does not trim, normalize, default, or otherwise rewrite
+selectors or recursive values.
 
 The Permission Provider resolves the envelope for the synchronized
 `IdentityContext`. The generic adapter request carries that identity separately
@@ -269,12 +271,13 @@ They do not use public Internet, production GLPI, fixed ports, arbitrary sleeps,
 or retries. At minimum, they must prove:
 
 - strict v1 payload validation: the payload has exactly `permissions`, has no
-  username, and rejects unknown or duplicate payload members, malformed
-  permission fields, exact duplicate desired permissions, and conflicting
-  `recursive` values for the same entity/profile; distinct entity/profile
-  assignments are valid;
-- duplicate payload members are rejected before GLPI calls. This is distinct
-  from duplicate envelope-member validation under ADR 0008;
+  username, and rejects unknown payload members, malformed permission fields,
+  exact duplicate desired permissions, and conflicting `recursive` values for
+  the same entity/profile; distinct entity/profile assignments are valid;
+- before ANY GLPI request, GLPI-specific payload validation rejects duplicate
+  `permissions` members in the payload object and duplicate `entity`, `profile`,
+  or `recursive` members in a permission object. This is separate from ADR
+  0008's common envelope handling of duplicate `version` and `payload` members;
 - no GLPI request starts before complete payload validation, and every desired
   reference is resolved before mutation;
 - the generic request carries identity separately from payload; exact
@@ -306,7 +309,8 @@ or retries. At minimum, they must prove:
   CA; reject untrusted certificates; and keep sentinel tokens, usernames,
   selectors, and raw GLPI responses out of ordinary errors and telemetry.
 
-An optional real-GLPI compatibility check is outside required CI.
+Real-GLPI compatibility checks may supplement, but never replace, the
+deterministic conformance suite.
 
 ## Alternatives considered
 
@@ -330,7 +334,11 @@ set-reconciliation algorithm. It requires a service account with only the GLPI
 rights needed to find/create users and manage their `Profile_User` assignments.
 
 Crate layout, registration, runtime configuration schema, HTTP client choice,
-concrete timeout values, and target credential/trust delivery remain deferred.
+concrete timeout values, and target credential/trust delivery are not prescribed
+by this ADR. Implementation choices must preserve this ADR's GLPI decisions and
+the runtime, adapter-boundary, and security requirements in
+[ADR 0006](0006-runtime-configuration-oci-and-observability.md) and
+[ADR 0007](0007-compile-time-rust-target-adapters.md).
 
 ## References
 
