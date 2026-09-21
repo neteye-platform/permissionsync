@@ -309,8 +309,51 @@ or retries. At minimum, they must prove:
   CA; reject untrusted certificates; and keep sentinel tokens, usernames,
   selectors, and raw GLPI responses out of ordinary errors and telemetry.
 
-Real-GLPI compatibility checks may supplement, but never replace, the
-deterministic conformance suite.
+### Two-layer test policy
+
+A compliant GLPI adapter MUST have both this deterministic, hermetic
+fake-based conformance suite and a real GLPI 11 integration suite. Both suites
+MUST run for every pull request. Normal
+`cargo test --workspace --all-features --locked` remains hermetic and MUST NOT
+require a real GLPI instance.
+
+The fake-based suite MUST remain deterministic and exhaustive, and MUST NOT use
+a real instance. Its conformance cases cover strict parsing, including duplicate
+members; malformed desired state; ambiguity; pagination; operation order and
+request construction; targeted failure injection and partial mutation; no
+retry or rollback; deadline and cancellation; transport, TLS, redirects,
+redaction, and idempotency; and malformed GLPI responses. The detailed
+conformance requirements above remain mandatory; no real GLPI test can replace
+this suite.
+
+The real integration suite MUST run in a dedicated pull-request workflow that
+automatically bootstraps an ephemeral, disposable real GLPI 11 instance. It
+MUST NOT use shared, long-lived, external, or manually managed state,
+credentials, or databases. It MUST use the disposable, pinned database service
+required by the exact GLPI image and automatically provision fixtures through
+supported GLPI configuration or APIs. It MUST capture useful failure diagnostics
+without secrets and always tear down the instance and database.
+
+At minimum, the real integration suite MUST cover:
+
+- session establishment and `App-Token`, user-token, and `Session-Token`
+  behavior, including session cleanup;
+- exact `User.name` lookup and missing-user creation;
+- entity and profile lookup;
+- `Profile_User` reads, creation, and deletion, including `is_recursive`;
+- authoritative and empty reconciliation, including duplicate current rows where
+  practical; and
+- `Changed`/`Unchanged` idempotency.
+
+The integration workflow MUST reference the official `glpi/glpi` image with both
+an exact GLPI 11 `x.y.z` tag and an immutable `sha256` digest. The image and
+digest MUST be Renovate-managed; Renovate MUST remain constrained to GLPI 11 and
+MUST NOT automatically move the major version. A new GLPI major version requires
+an explicit architecture decision. The exact database image MUST also be pinned
+and Renovate-managed.
+
+The integration workflow MUST follow repository conventions for SHA pins with
+version comments, least-privilege permissions, and explicit timeouts.
 
 ## Alternatives considered
 
