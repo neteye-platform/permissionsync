@@ -89,6 +89,11 @@ permissions. Two permissions conflict when they name the same entity and
 profile, including when their `recursive` values differ. The adapter does not
 trim, normalize, default, or otherwise rewrite selectors or recursive values.
 
+The Permission Provider must produce the GLPI desired state for the
+`IdentityContext` it resolved. A payload naming another user is a Provider
+contract defect. Core treats the payload as opaque, and the GLPI adapter
+receives no `IdentityContext` with which to cross-check it.
+
 An empty list is an authoritative empty state:
 
 ```json
@@ -109,21 +114,27 @@ assignment for that user, and finish with no assignments.
 ### User, entity, and profile resolution
 
 `user.username` is the Provider-supplied selector for the PermissionSync user.
-The adapter receives no `IdentityContext` and does not compare it with the
-inbound username. It matches the selector exactly against the GLPI `User.name`
-login and fails if lookup returns more than one exact match.
+It is a non-empty string preserved exactly. The adapter matches it exactly
+against the GLPI `User.name` login and fails if lookup returns more than one
+exact match.
 
 GLPI's search `equals` operator is not a strict-string guarantee and is
 paginated. The adapter must retrieve all relevant pages, then perform its own
 exact, case-sensitive string comparison for user, entity, and profile
-selectors. It must reject a username that GLPI would reject as a login before
-any mutation.
+selectors.
 
-If no matching user exists, the adapter creates a User whose only
-Provider-controlled value is exactly that `name`. It does not set a password,
-default profile, default entity, or any other user attribute. GLPI may apply its
-own defaults, rules, or dynamic assignment during creation; the subsequent
-authoritative `Profile_User` reconciliation removes any assignment not desired.
+If no matching user exists, GLPI, not PermissionSync, decides whether the exact
+username may be created. The adapter makes `POST /apirest.php/User/` as a
+separate mutation request before any `Profile_User` mutation. It sends the
+preserved username as `name` and only the target-configuration user-provisioning
+fields required for the deployment-selected GLPI authentication source,
+including `authtype` and `auths_id` when needed. Those fields are never
+Provider payload. The adapter never creates a password and does not
+subsequently synchronize unrelated user attributes. If creation fails,
+reconciliation fails, no `Profile_User` mutation starts, and there is no
+automatic retry or fallback. GLPI may apply its own defaults, rules, or dynamic
+assignment during creation; the subsequent authoritative `Profile_User`
+reconciliation removes any assignment not desired.
 
 `entity` is the exact full entity path stored by GLPI as `Entity.completename`,
 such as `Root Entity > IT`. It is not a numeric ID or a path that the adapter
@@ -164,10 +175,12 @@ not concurrently manage those assignments.
 
 The adapter must delete every stale assignment before it creates any missing
 assignment. It must not update an assignment in place to change `recursive`.
-It uses one mutation per request and verifies that each response represents the
-requested successful mutation before beginning the next one. A failed removal,
-including a mixed-status response, stops reconciliation; the add phase does not
-start.
+Each `POST /apirest.php/Profile_User/` assignment creation is its own request
+and is never combined with the missing-user `POST /apirest.php/User/` request.
+It uses one permission-assignment mutation per request and verifies that each
+response represents the requested successful mutation before beginning the next
+one. A failed removal, including a mixed-status response, stops reconciliation;
+the add phase does not start.
 
 | Stage | Example assignment |
 | --- | --- |
@@ -186,11 +199,11 @@ successfully adds or removes an assignment. These are the existing
 
 ### GLPI API and authentication
 
-The adapter uses GLPI 11's V1 REST API at the configured HTTPS
+The target is GLPI 11. The adapter uses its V1 REST API at the configured HTTPS
 `apirest.php` endpoint. This is the only selected API contract; there is no
-V1/V2 fallback. GLPI 11.0.0 is the verified compatibility baseline. A later
-GLPI 11.x implementation update must validate the same contract before it is
-supported.
+V1/V2 fallback. API and source evidence was checked on GLPI 11.0.0.
+Implementation and compatibility tests must ensure the selected V1 contract
+behaves on the deployed GLPI 11 version.
 
 The V1 API exposes the `Profile_User` item type and its
 `users_id`, `profiles_id`, `entities_id`, and `is_recursive` fields. Its generic
@@ -202,8 +215,9 @@ contract.
 | Need | V1 REST operation |
 | --- | --- |
 | Begin authentication | `GET /apirest.php/initSession/` |
-| Resolve users, entities, profiles, assignments | `GET /apirest.php/search/:itemtype/` and item reads |
-| Create missing user or assignment | `POST /apirest.php/:itemtype/` |
+| Resolve GLPI objects | `GET /apirest.php/search/:itemtype/` and item reads |
+| Create missing user | `POST /apirest.php/User/` |
+| Create one missing assignment | `POST /apirest.php/Profile_User/` |
 | Remove stale assignment | `DELETE /apirest.php/Profile_User/:id` |
 | End the request-scoped session | `GET /apirest.php/killSession/` |
 
@@ -217,9 +231,12 @@ budget permits. It does not persist, share, or log user tokens or session
 tokens. Cleanup never starts after observed cancellation or expiry. A
 `killSession` failure after otherwise successful reconciliation is an adapter
 failure; after an earlier failure, it does not replace the primary failure.
+Authenticated GLPI API requests MUST NOT follow HTTP redirects.
 
 Endpoint, user token, App-Token, TLS trust material, and operation timeouts are
-runtime target configuration. They are not part of the desired state.
+runtime target configuration. The authentication-source provisioning fields
+needed for missing-user creation are also target configuration. None of these
+values are part of the desired state.
 
 ### Failure, partial state, and request bounds
 
@@ -255,7 +272,8 @@ arbitrary sleeps, or retries. At minimum, it must prove:
   validated before mutation;
 - exact username lookup, missing-user creation, ambiguous-user failure, and
   missing user plus an empty desired state creating no assignments after final
-  reconciliation;
+  reconciliation; a GLPI-rejected missing-user creation is an adapter failure
+  with no `Profile_User` mutation, automatic retry, or fallback;
 - exact full-path entity resolution and exact profile-name resolution, including
   nested paths, missing and ambiguous references, pagination, lookalike or
   selector-metacharacter values, and no entity/profile creation;
