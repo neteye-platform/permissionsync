@@ -179,8 +179,8 @@ Each `POST /apirest.php/Profile_User/` assignment creation is its own request
 and is never combined with the missing-user `POST /apirest.php/User/` request.
 It uses one permission-assignment mutation per request and verifies that each
 response represents the requested successful mutation before beginning the next
-one. A failed removal, including a mixed-status response, stops reconciliation;
-the add phase does not start.
+one. The first failed mutation stops reconciliation. If a removal fails, the add
+phase does not start.
 
 | Stage | Example assignment |
 | --- | --- |
@@ -285,7 +285,7 @@ arbitrary sleeps, or retries. At minimum, it must prove:
   the same desired state is `Unchanged`, and no duplicate effects occur;
 - partial failure after user creation, during deletion, and during the add phase
   after removals: no rollback or automatic retry, then later legitimate
-  convergence; including mixed-status mutation responses;
+  convergence;
 - deadline and cancellation: bounded return, no operation starts after observed
   expiry/cancellation, and no detached work remains; and
 - the selected V1 endpoints plus `Authorization`, `App-Token`, `Session-Token`,
