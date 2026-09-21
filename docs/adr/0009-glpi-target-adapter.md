@@ -6,9 +6,9 @@
 
 ## Context
 
-PermissionSync needs a concrete Target Adapter for GLPI 11. The Provider
-decides which permissions a user should have. The adapter must turn that desired
-state into GLPI's user, entity, profile, and recursive-assignment model without
+PermissionSync needs a concrete Target Adapter for GLPI. The Provider decides
+which permissions a user should have. The adapter must turn that desired state
+into GLPI's user, entity, profile, and recursive-assignment model without
 putting GLPI concepts into Core or routing.
 
 In GLPI, the relevant relationship is `Profile_User`. One assignment links a
@@ -20,10 +20,12 @@ is therefore the complete set of those assignments for one user.
 ### Identity, scope, and ownership
 
 The adapter is named **GLPI Target Adapter**. Its runtime adapter identifier is
-`glpi`; its crate identifier is `permissionsync-adapter-glpi`.
+`glpi`; its crate identifier is `permissionsync-adapter-glpi`. These identifiers
+remain stable across compatible GLPI version and major-version changes;
+supported GLPI versions are compatibility information, not adapter identity.
 
-It targets GLPI 11 and owns reconciliation of one user's complete
-`Profile_User` assignment set. The authoritative permission key is:
+It targets GLPI and owns reconciliation of one user's complete `Profile_User`
+assignment set. The authoritative permission key is:
 
 | Field | GLPI relationship field |
 | --- | --- |
@@ -199,18 +201,18 @@ successfully adds or removes an assignment. These are the existing
 
 ### GLPI API and authentication
 
-The target is GLPI 11. The adapter uses its V1 REST API at the configured HTTPS
-`apirest.php` endpoint. This is the only selected API contract; there is no
-V1/V2 fallback. API and source evidence was checked on GLPI 11.0.0.
+The adapter selects GLPI V1 REST API at the configured HTTPS `apirest.php`
+endpoint. This is the only selected API contract; there is no V1/V2 fallback.
+API and source evidence for this decision was verified against GLPI 11.0.0.
 Conformance and compatibility tests must ensure the selected V1 contract behaves
-on the deployed GLPI 11 version.
+on each supported GLPI version.
 
 The V1 API exposes the `Profile_User` item type and its
 `users_id`, `profiles_id`, `entities_id`, and `is_recursive` fields. Its generic
 itemtype endpoints provide the reads, creates, and deletes needed for
-reconciliation. The verified GLPI 11.0.0 High-Level API inventory has no
-equivalent `Profile_User` operation. V2 is therefore not selected for this
-contract.
+reconciliation. The GLPI 11.0.0 High-Level API inventory reviewed as historical
+evidence has no equivalent `Profile_User` operation. V2 is therefore not
+selected for this contract.
 
 | Need | V1 REST operation |
 | --- | --- |
@@ -312,8 +314,8 @@ or retries. At minimum, they must prove:
 ### Two-layer test policy
 
 A compliant GLPI adapter MUST have both this deterministic, hermetic
-fake-based conformance suite and a real GLPI 11 integration suite. Both suites
-MUST run for every pull request. Normal
+fake-based conformance suite and a real GLPI integration suite against the exact
+pinned real GLPI release. Both suites MUST run for every pull request. Normal
 `cargo test --workspace --all-features --locked` remains hermetic and MUST NOT
 require a real GLPI instance.
 
@@ -327,12 +329,12 @@ conformance requirements above remain mandatory; no real GLPI test can replace
 this suite.
 
 The real integration suite MUST run in a dedicated pull-request workflow that
-automatically bootstraps an ephemeral, disposable real GLPI 11 instance. It
-MUST NOT use shared, long-lived, external, or manually managed state,
-credentials, or databases. It MUST use the disposable, pinned database service
-required by the exact GLPI image and automatically provision fixtures through
-supported GLPI configuration or APIs. It MUST capture useful failure diagnostics
-without secrets and always tear down the instance and database.
+automatically bootstraps an ephemeral, disposable instance of the exact pinned
+GLPI release. It MUST NOT use shared, long-lived, external, or manually managed
+state, credentials, or databases. It MUST use the disposable, pinned database
+service required by the exact GLPI image and automatically provision fixtures
+through supported GLPI configuration or APIs. It MUST capture useful failure
+diagnostics without secrets and always tear down the instance and database.
 
 At minimum, the real integration suite MUST cover:
 
@@ -345,15 +347,20 @@ At minimum, the real integration suite MUST cover:
   practical; and
 - `Changed`/`Unchanged` idempotency.
 
-The integration workflow MUST reference the official `glpi/glpi` image with both
-an exact GLPI 11 `x.y.z` tag and an immutable `sha256` digest. The image and
-digest MUST be Renovate-managed; Renovate MUST remain constrained to GLPI 11 and
-MUST NOT automatically move the major version. A new GLPI major version requires
-an explicit architecture decision. The exact database image MUST also be pinned
-and Renovate-managed.
+The dedicated integration workflow MUST reference the official `glpi/glpi`
+image with both an exact supported GLPI release tag and an immutable `sha256`
+digest.
+The database image MUST use an exact version or tag and an immutable digest when
+its distribution mechanism supports it. An automated dependency-update mechanism
+MUST open pull requests for newer GLPI or database versions and digest changes.
+Each update pull request MUST run the same mandatory fake and real suites,
+receive normal review, and merge only after validation; automatic merge is not
+permitted. A GLPI major update does not change adapter identity and does not
+inherently require a new ADR; it is assessed through normal update-pull-request
+review and compatibility validation.
 
-The integration workflow MUST follow repository conventions for SHA pins with
-version comments, least-privilege permissions, and explicit timeouts.
+The dedicated integration workflow MUST follow repository conventions for SHA
+pins with version comments, least-privilege permissions, and explicit timeouts.
 
 ## Alternatives considered
 
@@ -371,10 +378,11 @@ version comments, least-privilege permissions, and explicit timeouts.
 
 ## Consequences
 
-This decision defines one GLPI 11 API and session contract, a Provider payload
-free of GLPI IDs, credentials, and identity, and an explicit authoritative
-set-reconciliation algorithm. It requires a service account with only the GLPI
-rights needed to find/create users and manage their `Profile_User` assignments.
+This decision defines one selected GLPI V1 API and session contract, a Provider
+payload free of GLPI IDs, credentials, and identity, and an explicit
+authoritative set-reconciliation algorithm. It requires a service account with
+only the GLPI rights needed to find/create users and manage their `Profile_User`
+assignments.
 
 Crate layout, registration, runtime configuration schema, HTTP client choice,
 concrete timeout values, and target credential/trust delivery are not prescribed
