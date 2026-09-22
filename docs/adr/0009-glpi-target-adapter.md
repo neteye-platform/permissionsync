@@ -25,7 +25,10 @@ remain stable across compatible GLPI version and major-version changes;
 supported GLPI versions are compatibility information, not adapter identity.
 
 It targets GLPI and owns reconciliation of one user's complete `Profile_User`
-assignment set. The authoritative permission key is:
+assignment set. For the synchronized user, `(entity, profile, recursive)` is a
+complete desired or current GLPI assignment. `(entity, profile)` is solely the
+normalization and grouping identity; a physical `Profile_User` row may also
+carry GLPI metadata. The GLPI relationship fields are:
 
 | Field | GLPI relationship field |
 | --- | --- |
@@ -84,12 +87,56 @@ or `recursive` members in a permission object before any GLPI request. This is
 separate from ADR 0008's common envelope handling of duplicate `version` and
 `payload` members.
 
-The adapter structurally validates every permission entry, then groups entries
-by the exact `(entity, profile)` pair. Repeated complete permission objects and
-mixed `recursive` values for one pair are valid. The canonical `recursive` value
-is `true` when any entry in the group is `true`; otherwise it is `false`.
-Selector strings are never altered; normalization removes only semantic
-repetition. Canonicalization is owned by the GLPI adapter, not Core.
+The Provider supplies every valid permission entry and its requested `recursive`
+value. The adapter structurally validates every permission entry, then groups
+valid entries by the exact `(entity, profile)` pair. Repeated complete permission
+objects and mixed `recursive` values for one pair are valid. The canonical
+`recursive` value is `true` when any entry in the group is `true`; otherwise it
+is `false`. The adapter does not independently choose an input `recursive`
+value. It owns only deterministic representation normalization: selector strings
+are never altered, and normalization removes only semantic repetition. This
+canonicalization is owned by the GLPI adapter, not Core.
+
+Repeated complete objects in the `permissions` array are valid Provider intent:
+
+```json
+{
+  "permissions": [
+    {"entity": "Root Entity > IT", "profile": "Technician", "recursive": false},
+    {"entity": "Root Entity > IT", "profile": "Technician", "recursive": false}
+  ]
+}
+```
+
+This is accepted and normalizes to one complete desired assignment for `Root
+Entity > IT` / `Technician` / `false`.
+
+```json
+{
+  "permissions": [
+    {"entity": "Root Entity > IT", "profile": "Technician", "recursive": false},
+    {"entity": "Root Entity > IT", "profile": "Technician", "recursive": true}
+  ]
+}
+```
+
+This is accepted and normalizes to one complete desired assignment for `Root
+Entity > IT` / `Technician` / `true`.
+
+These are not repeated member names within JSON objects. For example, this
+permission object is contract-invalid because `entity` appears twice:
+
+```json
+{
+  "entity": "Root Entity > IT",
+  "entity": "Root Entity > IT",
+  "profile": "Technician",
+  "recursive": false
+}
+```
+
+The adapter rejects this GLPI-specific duplicate-member form before any GLPI
+request. It does not normalize invalid repeated entries.
 
 The Permission Provider resolves the envelope for the synchronized
 `IdentityContext`. The generic adapter request carries that identity separately
@@ -149,12 +196,15 @@ profile; a missing or ambiguous profile is an error. This deliberate
 single-match rule makes a non-unique GLPI profile name safe for the Provider
 contract without leaking GLPI IDs.
 
-Before any GLPI request, the adapter completes payload validation, including
-version support, schema, member uniqueness, field validity, and in-payload
-permission consistency. It then resolves every entity and profile reference
-before it changes GLPI. If any reference is missing or ambiguous, reconciliation
-fails before user creation, assignment deletion, or assignment creation.
-Entities and profiles are never created as a fallback.
+The conceptual order is: parse; complete structural validation of the payload
+and every permission entry; semantic normalization of only valid entries;
+entity/profile resolution; GLPI user lookup/creation; complete current
+`Profile_User` read; authoritative reconciliation. No GLPI request starts before
+complete GLPI-specific structural validation. Invalid repeated entries fail
+rather than being hidden by normalization. If any entity or profile reference is
+missing or ambiguous, reconciliation fails before user creation, assignment
+deletion, or assignment creation. Entities and profiles are never created as a
+fallback.
 
 ### Authoritative reconciliation
 
@@ -163,8 +213,9 @@ current `Profile_User` assignments. The service account must have an active
 GLPI profile and entity access that makes this read complete; incomplete ACL
 visibility is invalid target configuration, not a partial reconciliation mode.
 
-The desired semantic key is `(entity, profile)`. The adapter canonicalizes each
-desired key to `true` if any grouped entry is `true`, otherwise to `false`.
+The normalization identity for desired permission entries is `(entity, profile)`.
+The adapter canonicalizes each grouped identity to `true` if any entry is `true`,
+otherwise to `false`.
 Physical current rows may be duplicate or have mixed `is_recursive` values. The
 [GLPI `Profile_User` source](https://github.com/glpi-project/glpi/blob/11.0.0/src/Profile_User.php)
 and
@@ -192,14 +243,15 @@ The canonical final state contains exactly one physical row for every desired
   removed.
 - An empty desired list removes all current assignments for the user.
 
-The adapter must delete every stale assignment before it creates any missing
-assignment. It must not update an assignment in place to change `recursive`.
-Each `POST /apirest.php/Profile_User/` assignment creation is its own request
-and is never combined with the missing-user `POST /apirest.php/User/` request.
-It uses one permission-assignment mutation per request and verifies that each
-response represents the requested successful mutation before beginning the next
-one. The first failed mutation stops reconciliation. If a removal fails, the add
-phase does not start.
+The adapter MUST NOT update any `Profile_User` row in place. It resolves every
+divergence through removals and creations, deleting every stale assignment before
+creating any missing assignment. Each `POST /apirest.php/Profile_User/`
+assignment creation is its own request and is never combined with the
+missing-user `POST /apirest.php/User/` request. It uses one
+permission-assignment mutation per request and verifies that each response
+represents the requested successful mutation before beginning the next one. The
+first failed mutation stops reconciliation. If a removal fails, the add phase
+does not start.
 
 | Stage | Example assignment |
 | --- | --- |
@@ -289,20 +341,23 @@ They do not use public Internet, production GLPI, fixed ports, arbitrary sleeps,
 or retries. At minimum, they must prove:
 
 - strict v1 payload validation: the payload has exactly `permissions`, has no
-  username, and rejects unknown payload members, malformed permission fields,
-  and empty selectors; repeated complete permission objects and mixed
-  `recursive` values for the same entity/profile are valid;
+  username, and rejects unknown payload members, wrong-type or incomplete
+  permission fields, and empty selectors; repeated complete permission objects
+  and mixed `recursive` values for the same entity/profile are valid;
 - before ANY GLPI request, GLPI-specific payload validation rejects duplicate
   `permissions` members in the payload object and duplicate `entity`, `profile`,
   or `recursive` members in a permission object. This is separate from ADR
   0008's common envelope handling of duplicate `version` and `payload` members;
 - no GLPI request starts before complete payload validation, and every desired
   reference is resolved before mutation;
-- the generic request carries identity separately from payload; exact
-  `IdentityContext`-driven `User.name` lookup covers existing, missing,
-  ambiguous, and GLPI-rejected users. Missing user plus an empty desired state
-  creates the user and finishes with no assignments; rejected creation is an
-  adapter failure with no `Profile_User` mutation, automatic retry, or fallback;
+- the generic request carries identity separately from payload, and exact
+  `IdentityContext`-driven `User.name` lookup covers existing, missing, and
+  ambiguous users;
+- a missing user plus an empty desired state is created and finishes with no
+  assignments;
+- GLPI-rejected missing-user creation is an adapter failure with no
+  `Profile_User` mutation;
+- failed missing-user creation has no automatic retry or fallback;
 - exact full-path entity resolution and exact profile-name resolution, including
   nested paths, missing and ambiguous references, pagination, lookalike or
   selector-metacharacter values, and no entity/profile creation;
@@ -319,9 +374,9 @@ or retries. At minimum, they must prove:
   - duplicate Provider desired entries with an already canonical current row
     returning `Unchanged`;
   - strict-validation interaction: duplicate complete objects are valid;
-    duplicate JSON members and unknown fields are invalid; malformed repeated
-    entries fail before normalization; and every invalid input makes zero GLPI
-    requests;
+    duplicate JSON members and unknown fields are invalid; structurally invalid
+    repeated entries fail before normalization; and every invalid input makes
+    zero GLPI requests;
   - cleanup for desired canonical `false`: one `false`, duplicate `false`, one
     `true`, `true` plus `false`, and `false` plus `false` plus `true` current
     rows;
@@ -331,10 +386,11 @@ or retries. At minimum, they must prove:
   - undesired-pair cleanup with one, duplicate, mixed, and several current rows;
   - pagination of duplicate current rows, independent plans, and exactly one
     canonical physical row per desired pair;
-  - remove-before-add recursive changes; deletion failure blocking addition;
-    partial duplicate cleanup with no rollback followed by later convergence;
-    a second successful reconciliation returning `Unchanged`; no retry; and no
-    unnecessary `POST` when a canonical acceptable row already exists;
+  - remove-before-add recursive changes; cleanup failure blocking addition with
+    no rollback; partial duplicate cleanup followed by later convergence;
+    dirty-row cleanup returning `Changed`, followed by a second successful
+    reconciliation returning `Unchanged`; no automatic retry; and no unnecessary
+    `POST` when a canonical acceptable row already exists;
 - observable operation order proving removals happen before additions;
 - idempotency: an intentionally divergent first reconciliation is `Changed`,
   the same desired state is `Unchanged`, and no duplicate effects occur;
@@ -363,20 +419,26 @@ require a real GLPI instance.
 
 The fake-based suite MUST remain deterministic and exhaustive, and MUST NOT use
 a real instance. Its conformance cases cover strict parsing, including duplicate
-members; malformed desired state; ambiguity; pagination; operation order and
-request construction; targeted failure injection and partial mutation; no
-retry or rollback; deadline and cancellation; transport, TLS, redirects,
+members; structurally invalid desired state; ambiguity; pagination; operation
+order and request construction; targeted failure injection and partial
+mutation; no retry or rollback; deadline and cancellation; transport, TLS, redirects,
 redaction, and idempotency; and malformed GLPI responses. The detailed
 conformance requirements above remain mandatory; no real GLPI test can replace
 this suite.
 
-The real integration suite MUST run in a dedicated pull-request workflow that
-automatically bootstraps an ephemeral, disposable instance of the exact pinned
-GLPI release. It MUST NOT use shared, long-lived, external, or manually managed
+Before adapter scenarios, the real integration suite MUST automatically bootstrap
+wholly within its disposable integration environment. The bootstrap MUST make
+the selected V1 `apirest.php` API available; provision ephemeral `App-Token`,
+service-account and user-token credentials, required profile and entity access,
+and deterministic entities, profiles, users, and scenario fixtures; and verify
+readiness before adapter tests.
+It MUST NOT use shared, staging, manually configured, external, or long-lived
 state, credentials, or databases. It MUST use the disposable, pinned database
-service required by the exact GLPI image and automatically provision fixtures
-through supported GLPI configuration or APIs. It MUST capture useful failure
-diagnostics without secrets and always tear down the instance and database.
+service required by the exact GLPI image, capture useful failure diagnostics
+while redacting secrets, and tear down the entire environment. Bootstrap may use
+a local administrative mechanism in that environment where necessary, but it is
+test infrastructure: adapter tests still exercise the selected production
+`apirest.php` V1 contract.
 
 At minimum, the real integration suite MUST cover:
 
@@ -392,9 +454,11 @@ At minimum, the real integration suite MUST cover:
 - cleanup returning `Changed`, followed by the same reconciliation returning
   `Unchanged`.
 
-The dedicated integration workflow MUST reference the official `glpi/glpi`
-image with both an exact supported GLPI release tag and an immutable `sha256`
-digest.
+These real-GLPI tests are the mandatory key-normalization baseline. The fake
+suite remains exhaustive and irreplaceable.
+
+The integration environment MUST reference the official `glpi/glpi` image with
+both an exact supported GLPI release tag and an immutable `sha256` digest.
 The database image MUST use an exact version or tag and an immutable digest when
 its distribution mechanism supports it. An automated dependency-update mechanism
 MUST open pull requests for newer GLPI or database versions and digest changes.
@@ -404,8 +468,8 @@ permitted. A GLPI major update does not change adapter identity and does not
 inherently require a new ADR; it is assessed through normal update-pull-request
 review and compatibility validation.
 
-The dedicated integration workflow MUST follow repository conventions for SHA
-pins with version comments, least-privilege permissions, and explicit timeouts.
+CI implementation MUST follow repository conventions for SHA pins with version
+comments, least-privilege permissions, and explicit timeouts.
 
 ## Alternatives considered
 
