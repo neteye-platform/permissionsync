@@ -94,8 +94,11 @@ impl<'a> SelectedTargetSynchronizer<'a> {
                 return Err(SelectedTargetSynchronizationError::Cancelled);
             }
 
-            let adapter_request =
-                TargetAdapterRequest::new(&desired_state, copy_context(request.context()));
+            let adapter_request = TargetAdapterRequest::new(
+                request.identity(),
+                &desired_state,
+                copy_context(request.context()),
+            );
 
             let outcome = adapter
                 .reconcile(adapter_request)
