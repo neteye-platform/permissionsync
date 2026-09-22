@@ -1,0 +1,46 @@
+name: glpi
+services:
+  db:
+    image: mariadb:11.4@sha256:70cc072b29b4a89ae07abb2d4da2c64678a7f2dfe092751bb51c87d67dc1338b
+    environment:
+      MARIADB_ROOT_PASSWORD: glpi-test-root-password
+      MARIADB_DATABASE: glpi
+      MARIADB_USER: glpi
+      MARIADB_PASSWORD: glpi-test-password
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    tmpfs:
+      - /var/lib/mysql
+
+  glpi:
+    image: glpi/glpi:11.0.9@sha256:7b50172cdb7d0878c57f4f0031837c40191dd8aced81d15598ed8f8880e0ba0e
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      GLPI_DB_HOST: db
+      GLPI_DB_NAME: glpi
+      GLPI_DB_USER: glpi
+      GLPI_DB_PASSWORD: glpi-test-password
+      TZ: UTC
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/apirest.php/getGlpiConfig"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+    ports:
+      - "8080:80"
+
+  tls-proxy:
+    image: nginx:1.27@sha256:6784fb0834aa7dbbe12e3d7471e69c290df3e6ba810dc38b34ae33d3c1c05f7d
+    depends_on:
+      glpi:
+        condition: service_healthy
+    volumes:
+      - ./tls:/etc/nginx/tls:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8443:8443"
