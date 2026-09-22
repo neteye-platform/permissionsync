@@ -21,9 +21,7 @@ is therefore the complete set of those assignments for one user.
 
 The adapter is named **GLPI Target Adapter**. Its runtime adapter identifier is
 `glpi`; its crate identifier is `permissionsync-adapter-glpi`. These identifiers
-remain stable across GLPI release and major-version changes. At each repository
-revision, the sole currently supported GLPI release is compatibility information,
-never part of the `glpi` or `permissionsync-adapter-glpi` identity.
+remain stable across GLPI release and major-version changes.
 
 It targets GLPI and owns reconciliation of one user's complete `Profile_User`
 assignment set. For the synchronized user, `(entity, profile, recursive)` is a
@@ -223,19 +221,13 @@ The normalization identity for desired permission entries is `(entity, profile)`
 The adapter canonicalizes each grouped identity to `true` if any entry is `true`,
 otherwise to `false`.
 Physical current rows may be duplicate or have mixed `is_recursive` values. The
-[GLPI `Profile_User` source](https://github.com/glpi-project/glpi/blob/11.0.0/src/Profile_User.php)
-and
-[schema](https://github.com/glpi-project/glpi/blob/11.0.0/install/mysql/glpi-empty.sql)
-show that duplicate `Profile_User` rows are representable. For the same user,
-entity, and profile, GLPI's effective session behavior favors recursive access.
-The [GLPI `Session` source](https://github.com/glpi-project/glpi/blob/11.0.0/src/Session.php)
-and [`DbUtils::getSonsOf()`](https://github.com/glpi-project/glpi/blob/11.0.0/src/DbUtils.php)
-show that recursive access includes the entity and descendants and semantically
-subsumes non-recursive access. `is_dynamic`, `is_default_profile`, and other
-relationship metadata are not desired-state fields; the adapter does not create
-or update them separately. It nevertheless owns every `Profile_User` row for the
-synchronized user. GLPI rules, LDAP synchronization, or another writer must not
-concurrently manage those assignments.
+GLPI represents duplicate `Profile_User` rows, and recursive access includes an
+entity and its descendants and semantically subsumes non-recursive access.
+`is_dynamic`, `is_default_profile`, and other relationship metadata are not
+desired-state fields; the adapter does not create or update them separately. It
+nevertheless owns every `Profile_User` row for the synchronized user. GLPI rules,
+LDAP synchronization, or another writer must not concurrently manage those
+assignments.
 
 The canonical final state contains exactly one physical row for every desired
 `(entity, profile)` pair, with `is_recursive` set to its canonical value.
@@ -279,15 +271,12 @@ detail is returned to the caller.
 
 The adapter selects GLPI V1 REST API at the configured HTTPS `apirest.php`
 endpoint. This is the only selected API contract; there is no V1/V2 fallback.
-API and source evidence support this decision. Conformance and compatibility
-tests must ensure the selected V1 contract behaves on the current supported GLPI
-release.
 
 The V1 API exposes the `Profile_User` item type and its
 `users_id`, `profiles_id`, `entities_id`, and `is_recursive` fields. Its generic
 itemtype endpoints provide the reads, creates, and deletes needed for
-reconciliation. The reviewed High-Level API inventory has no equivalent
-`Profile_User` operation. V2 is therefore not selected for this contract.
+reconciliation. V2 has no equivalent `Profile_User` operation and is not
+selected for this contract.
 
 | Need | V1 REST operation |
 | --- | --- |
@@ -429,8 +418,7 @@ or retries. At minimum, they must prove:
 ### Two-layer test policy
 
 A compliant GLPI adapter MUST have both this deterministic, hermetic
-fake-based conformance suite and a real GLPI integration suite against the exact
-pinned real GLPI release. Both suites MUST run for every pull request. Normal
+fake-based conformance suite and a real GLPI integration suite. Normal
 `cargo test --workspace --all-features --locked` remains hermetic and MUST NOT
 require a real GLPI instance.
 
@@ -474,31 +462,23 @@ At minimum, the real integration suite MUST cover:
 These real-GLPI tests are the mandatory key-normalization baseline. The fake
 suite remains exhaustive and irreplaceable.
 
-At each repository revision, exactly one GLPI release is currently supported: the
-exact release tag and immutable `sha256` digest used by the mandatory real
-integration environment. The current supported release is compatibility
-information, never part of the `glpi` or `permissionsync-adapter-glpi` identity.
-Historical GLPI 11.0.0 source citations are evidence only, not a permanent
-support promise.
+Exactly one GLPI release is supported at a time, selected by the exact release
+tag and immutable `sha256` digest used by the mandatory real integration
+environment. This release selection does not affect the `glpi` or
+`permissionsync-adapter-glpi` identifiers.
 
 The integration environment MUST reference the official `glpi/glpi` image with
-that exact release tag and immutable digest. The database image MUST use an exact
+an exact release tag and immutable digest. The database image MUST use an exact
 version or tag and an immutable digest when its distribution mechanism supports
-it. An automated dependency-update mechanism MUST open pull requests for newer
-GLPI or database versions and digest changes. Each such pull request MUST change
-the pin, run the complete fake suite and complete real suite against the proposed
-exact release, receive normal human review, and merge only when compatibility is
-demonstrated; automatic merge is not permitted. On merge, the new pin becomes the
-sole supported release; the previous release is no longer simultaneously
-guaranteed. There is no old-release per-pull-request compatibility matrix.
+it.
+
+Updating a GLPI or database pin requires the complete fake suite and complete
+real integration suite against the proposed release, normal human review, and no
+automatic merge.
 
 A GLPI major upgrade changes neither the adapter identifier nor the crate and
-needs no new adapter architecture decision unless an API or semantic
-incompatibility cannot meet this ADR. In that case, an explicit ADR is required
-before support moves.
-
-CI implementation MUST follow repository conventions for SHA pins with version
-comments, least-privilege permissions, and explicit timeouts.
+requires a new ADR only when an API or semantic incompatibility prevents
+conformance to this ADR.
 
 ## Alternatives considered
 
@@ -510,8 +490,8 @@ comments, least-privilege permissions, and explicit timeouts.
   adapter's permission-assignment ownership.
 - **Add assignments before removing stale ones:** rejected in favor of the
   explicit remove-before-add plan.
-- **GLPI V2, or runtime V1/V2 fallback:** rejected because the reviewed V2
-  inventory has no equivalent `Profile_User` operation, and fallback would make
+- **GLPI V2, or runtime V1/V2 fallback:** rejected because V2 has no equivalent
+  `Profile_User` operation, and fallback would make
   the API contract non-deterministic.
 
 ## Consequences
