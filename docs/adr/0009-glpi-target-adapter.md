@@ -21,8 +21,9 @@ is therefore the complete set of those assignments for one user.
 
 The adapter is named **GLPI Target Adapter**. Its runtime adapter identifier is
 `glpi`; its crate identifier is `permissionsync-adapter-glpi`. These identifiers
-remain stable across compatible GLPI version and major-version changes;
-supported GLPI versions are compatibility information, not adapter identity.
+remain stable across GLPI release and major-version changes. At each repository
+revision, the sole currently supported GLPI release is compatibility information,
+never part of the `glpi` or `permissionsync-adapter-glpi` identity.
 
 It targets GLPI and owns reconciliation of one user's complete `Profile_User`
 assignment set. For the synchronized user, `(entity, profile, recursive)` is a
@@ -166,12 +167,17 @@ returns `Changed`.
 The adapter derives the username from `IdentityContext` under the inbound
 identity contract and preserves it exactly. No username exists in the payload.
 The adapter matches the username exactly against the GLPI `User.name` login and
-fails if lookup returns more than one exact match.
+fails if lookup returns more than one exact match. It uses a result only when
+exactly one exact match exists.
 
 GLPI's search `equals` operator is not a strict-string guarantee and is
 paginated. The adapter must retrieve all relevant pages, then perform its own
 exact, case-sensitive string comparison for user, entity, and profile
-selectors.
+selectors. Complete visibility of GLPI User records relevant to the adapter is
+required target and service-account configuration before it decides a user is
+absent. An empty or filtered zero-result lookup proves absence only under that
+guarantee; otherwise reconciliation MUST fail closed before creation and MUST
+NOT treat the user as absent.
 
 If no matching user exists, GLPI, not PermissionSync, decides whether the exact
 username may be created. The adapter makes `POST /apirest.php/User/` as a
@@ -274,7 +280,8 @@ detail is returned to the caller.
 The adapter selects GLPI V1 REST API at the configured HTTPS `apirest.php`
 endpoint. This is the only selected API contract; there is no V1/V2 fallback.
 API and source evidence support this decision. Conformance and compatibility
-tests must ensure the selected V1 contract behaves on supported GLPI releases.
+tests must ensure the selected V1 contract behaves on the current supported GLPI
+release.
 
 The V1 API exposes the `Profile_User` item type and its
 `users_id`, `profiles_id`, `entities_id`, and `is_recursive` fields. Its generic
@@ -302,6 +309,12 @@ tokens. Cleanup never starts after observed cancellation or expiry. A
 `killSession` failure after otherwise successful reconciliation is an adapter
 failure; after an earlier failure, it does not replace the primary failure.
 Authenticated GLPI API requests MUST NOT follow HTTP redirects.
+
+Every GLPI V1 `GET` request used by the adapter, including `initSession`, search,
+item reads, `killSession`, and any other `GET`, MUST have an empty request body
+and place request parameters in the URL or query. `Authorization`, `App-Token`,
+and `Session-Token` remain request headers. This is distinct from JSON mutation
+requests, which have the following `Content-Type` requirement.
 
 Every GLPI mutation request with a JSON body, including missing-user and
 `Profile_User` creation, MUST send `Content-Type: application/json`.
@@ -353,6 +366,8 @@ or retries. At minimum, they must prove:
 - the generic request carries identity separately from payload, and exact
   `IdentityContext`-driven `User.name` lookup covers existing, missing, and
   ambiguous users;
+- deterministic fake coverage of incomplete User lookup visibility failing closed
+  with no user creation;
 - a missing user plus an empty desired state is created and finishes with no
   assignments;
 - GLPI-rejected missing-user creation is an adapter failure with no
@@ -402,6 +417,8 @@ or retries. At minimum, they must prove:
 - the selected V1 endpoints plus `Authorization`, `App-Token`, `Session-Token`,
   `initSession`, `killSession`, cleanup, primary-failure semantics, and
   `Content-Type: application/json` on JSON mutation bodies;
+- V1 `GET` request construction: empty request bodies, request parameters in the
+  URL or query, and no JSON body on `GET` requests;
 - complete-assignment access required of the configured GLPI service account;
   and
 - transport and redaction safety: reject HTTP, redirects, and disabled
@@ -430,8 +447,8 @@ Before adapter scenarios, the real integration suite MUST automatically bootstra
 wholly within its disposable integration environment. The bootstrap MUST make
 the selected V1 `apirest.php` API available; provision ephemeral `App-Token`,
 service-account and user-token credentials, required profile and entity access,
-and deterministic entities, profiles, users, and scenario fixtures; and verify
-readiness before adapter tests.
+complete User lookup visibility, and deterministic entities, profiles, users,
+and scenario fixtures; and verify readiness before adapter tests.
 It MUST NOT use shared, staging, manually configured, external, or long-lived
 state, credentials, or databases. It MUST use the disposable, pinned database
 service required by the exact GLPI image, capture useful failure diagnostics
@@ -457,16 +474,28 @@ At minimum, the real integration suite MUST cover:
 These real-GLPI tests are the mandatory key-normalization baseline. The fake
 suite remains exhaustive and irreplaceable.
 
+At each repository revision, exactly one GLPI release is currently supported: the
+exact release tag and immutable `sha256` digest used by the mandatory real
+integration environment. The current supported release is compatibility
+information, never part of the `glpi` or `permissionsync-adapter-glpi` identity.
+Historical GLPI 11.0.0 source citations are evidence only, not a permanent
+support promise.
+
 The integration environment MUST reference the official `glpi/glpi` image with
-both an exact supported GLPI release tag and an immutable `sha256` digest.
-The database image MUST use an exact version or tag and an immutable digest when
-its distribution mechanism supports it. An automated dependency-update mechanism
-MUST open pull requests for newer GLPI or database versions and digest changes.
-Each update pull request MUST run the same mandatory fake and real suites,
-receive normal review, and merge only after validation; automatic merge is not
-permitted. A GLPI major update does not change adapter identity and does not
-inherently require a new ADR; it is assessed through normal update-pull-request
-review and compatibility validation.
+that exact release tag and immutable digest. The database image MUST use an exact
+version or tag and an immutable digest when its distribution mechanism supports
+it. An automated dependency-update mechanism MUST open pull requests for newer
+GLPI or database versions and digest changes. Each such pull request MUST change
+the pin, run the complete fake suite and complete real suite against the proposed
+exact release, receive normal human review, and merge only when compatibility is
+demonstrated; automatic merge is not permitted. On merge, the new pin becomes the
+sole supported release; the previous release is no longer simultaneously
+guaranteed. There is no old-release per-pull-request compatibility matrix.
+
+A GLPI major upgrade changes neither the adapter identifier nor the crate and
+needs no new adapter architecture decision unless an API or semantic
+incompatibility cannot meet this ADR. In that case, an explicit ADR is required
+before support moves.
 
 CI implementation MUST follow repository conventions for SHA pins with version
 comments, least-privilege permissions, and explicit timeouts.
@@ -507,6 +536,7 @@ the runtime, adapter-boundary, and security requirements in
 - [ADR 0005](0005-versioned-adapter-specific-desired-state-envelope.md)
 - [ADR 0006](0006-runtime-configuration-oci-and-observability.md)
 - [ADR 0007](0007-compile-time-rust-target-adapters.md)
+- [ADR 0008](0008-generic-rest-permission-provider-wire-and-transport-contract.md)
 - [GLPI REST API documentation](https://github.com/glpi-project/glpi/blob/11.0.0/apirest.md)
 - [GLPI `Session` source](https://github.com/glpi-project/glpi/blob/11.0.0/src/Session.php)
 - [GLPI `Profile_User` source](https://github.com/glpi-project/glpi/blob/11.0.0/src/Profile_User.php)
