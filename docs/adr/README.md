@@ -58,3 +58,4 @@ PermissionSync uses these statuses:
    Compile-Time Rust Target Adapters (Accepted)
 8. [0008](0008-generic-rest-permission-provider-wire-and-transport-contract.md)
    Generic REST Permission Provider Wire and Transport Contract (Accepted)
+9. [0009](0009-glpi-target-adapter.md) GLPI Target Adapter (Accepted)
