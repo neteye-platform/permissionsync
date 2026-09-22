@@ -45,8 +45,7 @@ This adapter has one configured GLPI backend per PermissionSync process.
 `TargetAdapterRequest` conceptually carries the synchronized `IdentityContext`
 separately from the desired-state envelope and `SynchronizationContext`; it has
 no logical-target or target-configuration selector. `glpi` identifies one
-registered adapter instance. Several independently configured GLPI instances
-require an architecture decision; this record does not define that mechanism.
+registered adapter instance.
 
 ### Desired-state payload v1
 
@@ -418,9 +417,9 @@ or retries. At minimum, they must prove:
 ### Two-layer test policy
 
 A compliant GLPI adapter MUST have both this deterministic, hermetic
-fake-based conformance suite and a real GLPI integration suite. Normal
-`cargo test --workspace --all-features --locked` remains hermetic and MUST NOT
-require a real GLPI instance.
+fake-based conformance suite and a real GLPI integration suite. Both MUST run
+for every pull request. Normal `cargo test --workspace --all-features --locked`
+remains hermetic and MUST NOT require a real GLPI instance.
 
 The fake-based suite MUST remain deterministic and exhaustive, and MUST NOT use
 a real instance. Its conformance cases cover strict parsing, including duplicate
@@ -472,9 +471,15 @@ an exact release tag and immutable digest. The database image MUST use an exact
 version or tag and an immutable digest when its distribution mechanism supports
 it.
 
-Updating a GLPI or database pin requires the complete fake suite and complete
-real integration suite against the proposed release, normal human review, and no
-automatic merge.
+An automated dependency-update mechanism MUST open pull requests for newer GLPI
+releases/tags and digest changes and newer database versions/tags and digest
+changes where supported. Each such pull request requires the complete fake suite
+and complete real integration suite against the proposed release, normal human
+review, and no automatic merge.
+
+CI implementation MUST follow repository conventions for immutable GitHub Action
+SHA pins with version comments, least-privilege permissions, and explicit
+timeouts.
 
 A GLPI major upgrade changes neither the adapter identifier nor the crate and
 requires a new ADR only when an API or semantic incompatibility prevents
