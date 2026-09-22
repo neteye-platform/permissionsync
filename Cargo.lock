@@ -944,6 +944,24 @@ name = "permissionsync"
 version = "0.1.0"
 
 [[package]]
+name = "permissionsync-adapter-glpi"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "native-tls",
+ "openssl",
+ "permissionsync-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-native-tls",
+ "url",
+]
+
+[[package]]
 name = "permissionsync-auth"
 version = "0.1.0"
 dependencies = [
