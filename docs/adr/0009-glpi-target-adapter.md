@@ -468,14 +468,13 @@ environment. This release selection does not affect the `glpi` or
 
 The integration environment MUST reference the official `glpi/glpi` image with
 an exact release tag and immutable digest. The database image MUST use an exact
-version or tag and an immutable digest when its distribution mechanism supports
-it.
+version or tag and an immutable digest.
 
 An automated dependency-update mechanism MUST open pull requests for newer GLPI
 releases/tags and digest changes and newer database versions/tags and digest
-changes where supported. Each such pull request requires the complete fake suite
-and complete real integration suite against the proposed release, normal human
-review, and no automatic merge.
+changes. Each such pull request requires the complete fake suite and complete
+real integration suite against the proposed release, normal human review, and no
+automatic merge.
 
 CI implementation MUST follow repository conventions for immutable GitHub Action
 SHA pins with version comments, least-privilege permissions, and explicit
