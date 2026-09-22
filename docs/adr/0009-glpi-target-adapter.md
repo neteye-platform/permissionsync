@@ -77,17 +77,19 @@ The payload is one object with exactly `permissions`; it contains no `user`,
 more objects. Every permission object has exactly the non-empty strings `entity`
 and `profile`, and the boolean `recursive`.
 
-The adapter rejects unsupported versions, unknown JSON members, wrong types,
-empty selectors, exact duplicate desired permissions, and permissions for the
-same entity and profile with conflicting `recursive` values. As GLPI-specific
-payload validation, it rejects duplicate `permissions` members in the payload
-object and duplicate `entity`, `profile`, or `recursive` members in a permission
-object before any GLPI request. This is separate from ADR 0008's common envelope
-handling of duplicate `version` and `payload` members. Semantic desired-
-permission duplicates and conflicts remain separate validation rules. Multiple
-distinct entity/profile assignments, including `Technician` and `Read-Only`, are
-valid. The adapter does not trim, normalize, default, or otherwise rewrite
-selectors or recursive values.
+The adapter rejects unsupported versions, unknown JSON members, wrong types, and
+empty selectors. As GLPI-specific payload validation, it rejects duplicate
+`permissions` members in the payload object and duplicate `entity`, `profile`,
+or `recursive` members in a permission object before any GLPI request. This is
+separate from ADR 0008's common envelope handling of duplicate `version` and
+`payload` members.
+
+The adapter structurally validates every permission entry, then groups entries
+by the exact `(entity, profile)` pair. Repeated complete permission objects and
+mixed `recursive` values for one pair are valid. The canonical `recursive` value
+is `true` when any entry in the group is `true`; otherwise it is `false`.
+Selector strings are never altered; normalization removes only semantic
+repetition. Canonicalization is owned by the GLPI adapter, not Core.
 
 The Permission Provider resolves the envelope for the synchronized
 `IdentityContext`. The generic adapter request carries that identity separately
@@ -161,18 +163,33 @@ current `Profile_User` assignments. The service account must have an active
 GLPI profile and entity access that makes this read complete; incomplete ACL
 visibility is invalid target configuration, not a partial reconciliation mode.
 
-The adapter compares the resolved `(entity, profile, recursive)` tuples with
-the desired set. `is_dynamic`, `is_default_profile`, and other relationship
-metadata are not desired-state fields; the adapter does not create or update
-them separately. It nevertheless owns every `Profile_User` row for the
-synchronized user. GLPI rules, LDAP synchronization, or another writer must
-not concurrently manage those assignments.
+The desired semantic key is `(entity, profile)`. The adapter canonicalizes each
+desired key to `true` if any grouped entry is `true`, otherwise to `false`.
+Physical current rows may be duplicate or have mixed `is_recursive` values. The
+[GLPI `Profile_User` source](https://github.com/glpi-project/glpi/blob/11.0.0/src/Profile_User.php)
+and
+[schema](https://github.com/glpi-project/glpi/blob/11.0.0/install/mysql/glpi-empty.sql)
+show that duplicate `Profile_User` rows are representable. For the same user,
+entity, and profile, GLPI's effective session behavior favors recursive access.
+The [GLPI `Session` source](https://github.com/glpi-project/glpi/blob/11.0.0/src/Session.php)
+and [`DbUtils::getSonsOf()`](https://github.com/glpi-project/glpi/blob/11.0.0/src/DbUtils.php)
+show that recursive access includes the entity and descendants and semantically
+subsumes non-recursive access. `is_dynamic`, `is_default_profile`, and other
+relationship metadata are not desired-state fields; the adapter does not create
+or update them separately. It nevertheless owns every `Profile_User` row for the
+synchronized user. GLPI rules, LDAP synchronization, or another writer must not
+concurrently manage those assignments.
 
-- One desired tuple already present is retained.
-- A desired tuple not present is missing and must be added.
-- A current tuple not desired is stale and must be removed.
-- A different `recursive` value is both a stale tuple and a missing tuple.
-- Extra current rows with the same desired tuple are stale and must be removed.
+The canonical final state contains exactly one physical row for every desired
+`(entity, profile)` pair, with `is_recursive` set to its canonical value.
+
+- One current row with a desired pair's canonical value is retained.
+- Every additional current row for that pair, and every row with its
+  noncanonical `is_recursive` value, is stale and must be removed.
+- If no current row has a desired pair's canonical value, that canonical row is
+  missing and must be added after stale rows are removed.
+- Every row for an undesired `(entity, profile)` pair is stale and must be
+  removed.
 - An empty desired list removes all current assignments for the user.
 
 The adapter must delete every stale assignment before it creates any missing
@@ -193,26 +210,25 @@ phase does not start.
 | Plan | **REMOVE** `Root Entity > Legacy` / `Read-Only` / `false` |
 | Plan | **ADD** `Root Entity > IT > Operations` / `Read-Only` / `false` |
 
-The final state is exactly the desired state. Successful reconciliation returns
-`Unchanged` only when the user already existed and its assignment set exactly
-matched the desired set. It returns `Changed` when it creates the user or
-successfully adds or removes an assignment. These are the existing
-`ReconciliationOutcome` values; no GLPI detail is returned to the caller.
+The final state is exactly the canonical desired state. Successful reconciliation
+returns `Unchanged` only when the user already existed and its physical
+assignment set already had exactly one canonical row for each desired pair. It
+returns `Changed` when it creates the user or successfully adds or removes an
+assignment. These are the existing `ReconciliationOutcome` values; no GLPI
+detail is returned to the caller.
 
 ### GLPI API and authentication
 
 The adapter selects GLPI V1 REST API at the configured HTTPS `apirest.php`
 endpoint. This is the only selected API contract; there is no V1/V2 fallback.
-API and source evidence for this decision was verified against GLPI 11.0.0.
-Conformance and compatibility tests must ensure the selected V1 contract behaves
-on each supported GLPI version.
+API and source evidence support this decision. Conformance and compatibility
+tests must ensure the selected V1 contract behaves on supported GLPI releases.
 
 The V1 API exposes the `Profile_User` item type and its
 `users_id`, `profiles_id`, `entities_id`, and `is_recursive` fields. Its generic
 itemtype endpoints provide the reads, creates, and deletes needed for
-reconciliation. The GLPI 11.0.0 High-Level API inventory reviewed as historical
-evidence has no equivalent `Profile_User` operation. V2 is therefore not
-selected for this contract.
+reconciliation. The reviewed High-Level API inventory has no equivalent
+`Profile_User` operation. V2 is therefore not selected for this contract.
 
 | Need | V1 REST operation |
 | --- | --- |
@@ -274,8 +290,8 @@ or retries. At minimum, they must prove:
 
 - strict v1 payload validation: the payload has exactly `permissions`, has no
   username, and rejects unknown payload members, malformed permission fields,
-  exact duplicate desired permissions, and conflicting `recursive` values for
-  the same entity/profile; distinct entity/profile assignments are valid;
+  and empty selectors; repeated complete permission objects and mixed
+  `recursive` values for the same entity/profile are valid;
 - before ANY GLPI request, GLPI-specific payload validation rejects duplicate
   `permissions` members in the payload object and duplicate `entity`, `profile`,
   or `recursive` members in a permission object. This is separate from ADR
@@ -293,6 +309,32 @@ or retries. At minimum, they must prove:
 - authoritative additions, removals, empty-state removal, recursive differences,
   duplicate current rows, dynamic/default assignment created by GLPI, and an
   exact final assignment set;
+- desired normalization and canonical reconciliation, including:
+  - one desired `false`, one desired `true`, duplicate `false`, duplicate `true`,
+    `false` then `true`, `true` then `false`, and three or more mixed values for
+    one entity/profile pair;
+  - multiple independent pairs where only some repeat, the same entity with
+    different profiles, the same profile with different entities, and
+    order-independent input;
+  - duplicate Provider desired entries with an already canonical current row
+    returning `Unchanged`;
+  - strict-validation interaction: duplicate complete objects are valid;
+    duplicate JSON members and unknown fields are invalid; malformed repeated
+    entries fail before normalization; and every invalid input makes zero GLPI
+    requests;
+  - cleanup for desired canonical `false`: one `false`, duplicate `false`, one
+    `true`, `true` plus `false`, and `false` plus `false` plus `true` current
+    rows;
+  - cleanup for desired canonical `true`: one `true`, duplicate `true`, one
+    `false`, `false` plus `true`, and `true` plus `true` plus `false` current
+    rows;
+  - undesired-pair cleanup with one, duplicate, mixed, and several current rows;
+  - pagination of duplicate current rows, independent plans, and exactly one
+    canonical physical row per desired pair;
+  - remove-before-add recursive changes; deletion failure blocking addition;
+    partial duplicate cleanup with no rollback followed by later convergence;
+    a second successful reconciliation returning `Unchanged`; no retry; and no
+    unnecessary `POST` when a canonical acceptable row already exists;
 - observable operation order proving removals happen before additions;
 - idempotency: an intentionally divergent first reconciliation is `Changed`,
   the same desired state is `Unchanged`, and no duplicate effects occur;
@@ -342,10 +384,13 @@ At minimum, the real integration suite MUST cover:
   behavior, including session cleanup;
 - exact `User.name` lookup and missing-user creation;
 - entity and profile lookup;
-- `Profile_User` reads, creation, and deletion, including `is_recursive`;
-- authoritative and empty reconciliation, including duplicate current rows where
-  practical; and
-- `Changed`/`Unchanged` idempotency.
+- `Profile_User` reads, creation, and deletion, including `is_recursive`, exact
+  duplicate current rows, and mixed current values;
+- duplicate and mixed desired input, all true-wins desired variants, exactly one
+  canonical final row per desired pair, and authoritative and empty
+  reconciliation; and
+- cleanup returning `Changed`, followed by the same reconciliation returning
+  `Unchanged`.
 
 The dedicated integration workflow MUST reference the official `glpi/glpi`
 image with both an exact supported GLPI release tag and an immutable `sha256`
@@ -372,9 +417,9 @@ pins with version comments, least-privilege permissions, and explicit timeouts.
   adapter's permission-assignment ownership.
 - **Add assignments before removing stale ones:** rejected in favor of the
   explicit remove-before-add plan.
-- **GLPI V2, or runtime V1/V2 fallback:** rejected because the verified GLPI
-  11.0.0 V2 inventory has no equivalent `Profile_User` operation, and fallback
-  would make the API contract non-deterministic.
+- **GLPI V2, or runtime V1/V2 fallback:** rejected because the reviewed V2
+  inventory has no equivalent `Profile_User` operation, and fallback would make
+  the API contract non-deterministic.
 
 ## Consequences
 
@@ -399,7 +444,10 @@ the runtime, adapter-boundary, and security requirements in
 - [ADR 0006](0006-runtime-configuration-oci-and-observability.md)
 - [ADR 0007](0007-compile-time-rust-target-adapters.md)
 - [GLPI REST API documentation](https://github.com/glpi-project/glpi/blob/11.0.0/apirest.md)
+- [GLPI `Session` source](https://github.com/glpi-project/glpi/blob/11.0.0/src/Session.php)
 - [GLPI `Profile_User` source](https://github.com/glpi-project/glpi/blob/11.0.0/src/Profile_User.php)
 - [GLPI `User` source](https://github.com/glpi-project/glpi/blob/11.0.0/src/User.php)
+- [GLPI `DbUtils` source](https://github.com/glpi-project/glpi/blob/11.0.0/src/DbUtils.php)
+- [GLPI empty database schema](https://github.com/glpi-project/glpi/blob/11.0.0/install/mysql/glpi-empty.sql)
 - [GLPI V2 OpenAPI generator](https://github.com/glpi-project/glpi/blob/11.0.0/src/Glpi/Api/HL/OpenAPIGenerator.php)
 - [GLPI High-Level API documentation](https://glpi-developer-documentation.readthedocs.io/en/master/devapi/hlapi/index.html)
