@@ -5,11 +5,12 @@
 use std::{collections::HashMap, time::Instant};
 
 use hyper::Method;
+use permissionsync_core::SynchronizationContext;
 use serde_json::Value;
 
 use crate::{
-    config::ValidatedConfig, error::GlpiFailure, session::GlpiSession, session::session_headers,
-    transport,
+    adapter::check_context, config::ValidatedConfig, error::GlpiFailure, session::GlpiSession,
+    session::session_headers, transport,
 };
 
 /// Rows-per-page for every paginated GLPI search. Small and fixed so
@@ -104,6 +105,7 @@ type Row = HashMap<u64, Value>;
 /// criterion, and returns every row across every page. Fails on non-progress
 /// (a page that does not advance the observed range) or inconsistent
 /// `totalcount` between pages, rather than looping forever.
+#[allow(clippy::too_many_arguments)]
 async fn search_all_pages(
     config: &ValidatedConfig,
     session: &GlpiSession,
@@ -111,6 +113,8 @@ async fn search_all_pages(
     criterion_field: u64,
     criterion_value: &str,
     forcedisplay: &[u64],
+    sort_field: u64,
+    context: &SynchronizationContext<'_>,
     effective_deadline: Instant,
 ) -> Result<Vec<Row>, GlpiFailure> {
     let mut rows = Vec::new();
@@ -118,6 +122,11 @@ async fn search_all_pages(
     let mut expected_total: Option<u64> = None;
 
     loop {
+        // Cancellation/deadline must be re-checked at the top of every page
+        // iteration, not only once before the overall paginated search
+        // starts: a large result set can span many pages, each involving a
+        // real outbound request.
+        check_context(context, effective_deadline)?;
         let end = start + PAGE_SIZE - 1;
         let mut url = config
             .base
@@ -129,6 +138,11 @@ async fn search_all_pages(
             query.append_pair("criteria[0][field]", &criterion_field.to_string());
             query.append_pair("criteria[0][searchtype]", "equals");
             query.append_pair("criteria[0][value]", criterion_value);
+            // Pin an explicit, stable sort so monotonic page progress is
+            // actually provable across pages, rather than relying on GLPI's
+            // unspecified default order.
+            query.append_pair("sort", &sort_field.to_string());
+            query.append_pair("order", "ASC");
             for (index, field) in forcedisplay.iter().enumerate() {
                 query.append_pair(&format!("forcedisplay[{index}]"), &field.to_string());
             }
@@ -213,6 +227,7 @@ fn numeric_id(row: &Row, field: u64) -> Option<u64> {
 /// Resolves exactly one GLPI object id whose stable semantic field exactly
 /// (case-sensitively) equals `selector`, using GLPI search as a narrowing
 /// filter only. Zero or more than one exact match is an adapter failure.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_exact_id(
     config: &ValidatedConfig,
     session: &GlpiSession,
@@ -220,6 +235,7 @@ async fn resolve_exact_id(
     id_field: u64,
     name_field: u64,
     selector: &str,
+    context: &SynchronizationContext<'_>,
     effective_deadline: Instant,
 ) -> Result<u64, GlpiFailure> {
     let rows = search_all_pages(
@@ -229,6 +245,8 @@ async fn resolve_exact_id(
         name_field,
         selector,
         &[id_field, name_field],
+        id_field,
+        context,
         effective_deadline,
     )
     .await?;
@@ -236,7 +254,7 @@ async fn resolve_exact_id(
     let mut matches: Vec<u64> = Vec::new();
     for row in &rows {
         if exact_string_field(row, name_field) == Some(selector) {
-            let id = numeric_id(row, id_field).ok_or(GlpiFailure::MissingReference)?;
+            let id = numeric_id(row, id_field).ok_or(GlpiFailure::MalformedReference)?;
             if !matches.contains(&id) {
                 matches.push(id);
             }
@@ -255,6 +273,7 @@ pub(crate) async fn resolve_entity_id(
     session: &GlpiSession,
     options: &SearchOptions,
     selector: &str,
+    context: &SynchronizationContext<'_>,
     effective_deadline: Instant,
 ) -> Result<u64, GlpiFailure> {
     resolve_exact_id(
@@ -264,6 +283,7 @@ pub(crate) async fn resolve_entity_id(
         options.require("Entity.id")?,
         options.require("Entity.completename")?,
         selector,
+        context,
         effective_deadline,
     )
     .await
@@ -274,6 +294,7 @@ pub(crate) async fn resolve_profile_id(
     session: &GlpiSession,
     options: &SearchOptions,
     selector: &str,
+    context: &SynchronizationContext<'_>,
     effective_deadline: Instant,
 ) -> Result<u64, GlpiFailure> {
     resolve_exact_id(
@@ -283,6 +304,7 @@ pub(crate) async fn resolve_profile_id(
         options.require("Profile.id")?,
         options.require("Profile.name")?,
         selector,
+        context,
         effective_deadline,
     )
     .await
@@ -297,6 +319,7 @@ pub(crate) async fn resolve_user_id(
     session: &GlpiSession,
     options: &SearchOptions,
     username: &str,
+    context: &SynchronizationContext<'_>,
     effective_deadline: Instant,
 ) -> Result<Option<u64>, GlpiFailure> {
     match resolve_exact_id(
@@ -306,6 +329,7 @@ pub(crate) async fn resolve_user_id(
         options.require("User.id")?,
         options.require("User.name")?,
         username,
+        context,
         effective_deadline,
     )
     .await
@@ -316,68 +340,165 @@ pub(crate) async fn resolve_user_id(
     }
 }
 
+/// The per-user `Profile_User` candidate-row sanity bound. Real GLPI
+/// deployments own at most a small number of assignment rows per user; a
+/// user with more candidate rows than this is treated as malformed search
+/// metadata rather than issued an unbounded number of per-row item reads.
+const MAX_ASSIGNMENTS_PER_USER: usize = 10_000;
+
 /// Reads the complete current `Profile_User` assignment set for `user_id`.
+///
+/// `Profile_User`'s own search options expose only semantic joined display
+/// fields (the joined `User.name`), never the raw `users_id`/`profiles_id`/
+/// `entities_id`/`is_recursive` foreign-key fields, so GLPI search is used
+/// only to discover candidate row ids for `username`. Every raw field is
+/// then read authoritatively from the generic V1 item endpoint
+/// `GET /apirest.php/Profile_User/:id`, which does return the raw fields
+/// directly from the item.
 pub(crate) async fn read_current_assignments(
     config: &ValidatedConfig,
     session: &GlpiSession,
     options: &SearchOptions,
+    username: &str,
     user_id: u64,
+    context: &SynchronizationContext<'_>,
     effective_deadline: Instant,
 ) -> Result<Vec<crate::plan::CurrentRow>, GlpiFailure> {
     let id_field = options.require("Profile_User.id")?;
-    let users_id_field = options.require("Profile_User.users_id")?;
-    let profiles_id_field = options.require("Profile_User.profiles_id")?;
-    let entities_id_field = options.require("Profile_User.entities_id")?;
-    let is_recursive_field = options.require("Profile_User.is_recursive")?;
+    let user_name_field = options.require("User.name")?;
 
     let rows = search_all_pages(
         config,
         session,
         "Profile_User",
-        users_id_field,
-        &user_id.to_string(),
-        &[
-            id_field,
-            users_id_field,
-            profiles_id_field,
-            entities_id_field,
-            is_recursive_field,
-        ],
+        user_name_field,
+        username,
+        &[id_field, user_name_field],
+        id_field,
+        context,
         effective_deadline,
     )
     .await?;
 
-    let mut current = Vec::with_capacity(rows.len());
+    let mut candidate_ids: Vec<u64> = Vec::new();
     for row in &rows {
-        let id = numeric_id(row, id_field).ok_or(GlpiFailure::SearchPagination)?;
-        let entities_id =
-            numeric_id(row, entities_id_field).ok_or(GlpiFailure::SearchPagination)?;
-        let profiles_id =
-            numeric_id(row, profiles_id_field).ok_or(GlpiFailure::SearchPagination)?;
-        let is_recursive = match row.get(&is_recursive_field) {
-            Some(Value::Bool(value)) => *value,
-            Some(Value::Number(number)) => number.as_u64() == Some(1),
-            Some(Value::String(text)) => text == "1",
-            _ => return Err(GlpiFailure::SearchPagination),
-        };
+        if exact_string_field(row, user_name_field) == Some(username) {
+            let id = numeric_id(row, id_field).ok_or(GlpiFailure::MalformedReference)?;
+            if !candidate_ids.contains(&id) {
+                candidate_ids.push(id);
+            }
+        }
+    }
+
+    if candidate_ids.len() > MAX_ASSIGNMENTS_PER_USER {
+        return Err(GlpiFailure::AssignmentCountExceeded);
+    }
+
+    let mut current = Vec::with_capacity(candidate_ids.len());
+    for candidate_id in candidate_ids {
+        let item =
+            read_profile_user_item(config, session, candidate_id, effective_deadline).await?;
+        if item.users_id != user_id {
+            // The search-discovered candidate's own joined display name
+            // matched `username` exactly, but its raw item-read `users_id`
+            // must still equal the resolved synchronized user id. Fail
+            // closed rather than silently drop or reconcile a mismatch.
+            return Err(GlpiFailure::SearchPagination);
+        }
         current.push(crate::plan::CurrentRow {
-            id,
-            entities_id,
-            profiles_id,
-            is_recursive,
+            id: candidate_id,
+            entities_id: item.entities_id,
+            profiles_id: item.profiles_id,
+            is_recursive: item.is_recursive,
         });
     }
 
     Ok(current)
 }
 
+/// The raw fields of one `Profile_User` item, read directly from the
+/// generic V1 item endpoint rather than from any search result row.
+struct ProfileUserItem {
+    users_id: u64,
+    profiles_id: u64,
+    entities_id: u64,
+    is_recursive: bool,
+}
+
+/// Reads one `Profile_User` item's raw fields via
+/// `GET /apirest.php/Profile_User/:id`, the generic V1 item endpoint. Every
+/// field is validated at the same strictness as the item-read replaces:
+/// `users_id`/`profiles_id`/`entities_id` must be plain numeric ids, and
+/// `is_recursive` must be the raw wire integer `0` or `1`; anything else,
+/// including a mismatched `id`, is rejected rather than coerced.
+async fn read_profile_user_item(
+    config: &ValidatedConfig,
+    session: &GlpiSession,
+    id: u64,
+    effective_deadline: Instant,
+) -> Result<ProfileUserItem, GlpiFailure> {
+    let url = config
+        .base
+        .join(&format!("Profile_User/{id}"))
+        .map_err(|_| GlpiFailure::Transport)?;
+    let headers = session_headers(session, config)?;
+
+    let response = transport::request(
+        &config.tls_connector,
+        Method::GET,
+        &url,
+        &headers,
+        None,
+        effective_deadline,
+    )
+    .await?;
+
+    if response.status != hyper::StatusCode::OK {
+        return Err(GlpiFailure::SearchPagination);
+    }
+
+    let parsed: Value =
+        serde_json::from_slice(&response.body).map_err(|_| GlpiFailure::SearchPagination)?;
+    let object = parsed.as_object().ok_or(GlpiFailure::SearchPagination)?;
+
+    let item_id = object
+        .get("id")
+        .and_then(Value::as_u64)
+        .ok_or(GlpiFailure::SearchPagination)?;
+    if item_id != id {
+        return Err(GlpiFailure::SearchPagination);
+    }
+
+    let users_id = object
+        .get("users_id")
+        .and_then(Value::as_u64)
+        .ok_or(GlpiFailure::SearchPagination)?;
+    let profiles_id = object
+        .get("profiles_id")
+        .and_then(Value::as_u64)
+        .ok_or(GlpiFailure::SearchPagination)?;
+    let entities_id = object
+        .get("entities_id")
+        .and_then(Value::as_u64)
+        .ok_or(GlpiFailure::SearchPagination)?;
+    let is_recursive = match object.get("is_recursive") {
+        // GLPI's `is_recursive` column is a raw integer (0 or 1) on the
+        // wire; anything else (bool, string, other numbers, absent) is
+        // rejected rather than coerced.
+        Some(Value::Number(number)) if number.as_u64() == Some(0) => false,
+        Some(Value::Number(number)) if number.as_u64() == Some(1) => true,
+        _ => return Err(GlpiFailure::SearchPagination),
+    };
+
+    Ok(ProfileUserItem {
+        users_id,
+        profiles_id,
+        entities_id,
+        is_recursive,
+    })
+}
+
 pub(crate) const REQUIRED_ENTITY_UIDS: &[&str] = &["Entity.id", "Entity.completename"];
 pub(crate) const REQUIRED_PROFILE_UIDS: &[&str] = &["Profile.id", "Profile.name"];
 pub(crate) const REQUIRED_USER_UIDS: &[&str] = &["User.id", "User.name"];
-pub(crate) const REQUIRED_PROFILE_USER_UIDS: &[&str] = &[
-    "Profile_User.id",
-    "Profile_User.users_id",
-    "Profile_User.profiles_id",
-    "Profile_User.entities_id",
-    "Profile_User.is_recursive",
-];
+pub(crate) const REQUIRED_PROFILE_USER_UIDS: &[&str] = &["Profile_User.id", "User.name"];

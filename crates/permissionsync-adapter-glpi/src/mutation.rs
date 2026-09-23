@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::{
     config::{GlpiAuthenticationSource, ValidatedConfig},
     error::GlpiFailure,
-    session::{GlpiSession, session_headers},
+    session::{GlpiSession, session_headers, trim_ascii},
     transport,
 };
 
@@ -139,6 +139,15 @@ pub(crate) async fn delete_assignment(
     .await?;
 
     if response.status != hyper::StatusCode::OK {
+        return Err(GlpiFailure::MutationFailed);
+    }
+
+    // Mirror `force_all_entities`/`kill_session`: a `200 OK` status alone is
+    // not sufficient to consider the deletion successful. GLPI returns the
+    // bare JSON literal `true` on a successful delete; anything else is
+    // rejected rather than assumed successful.
+    let trimmed = trim_ascii(&response.body);
+    if trimmed != b"true" {
         return Err(GlpiFailure::MutationFailed);
     }
 

@@ -948,6 +948,8 @@ name = "permissionsync-adapter-glpi"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "hickory-net",
+ "hickory-resolver",
  "http-body-util",
  "hyper",
  "hyper-util",

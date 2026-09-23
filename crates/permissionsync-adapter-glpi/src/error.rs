@@ -21,6 +21,8 @@ pub(crate) enum GlpiFailure {
     SearchPagination,
     AmbiguousReference,
     MissingReference,
+    MalformedReference,
+    AssignmentCountExceeded,
     UserCreationFailed,
     MutationFailed,
     CleanupFailed,

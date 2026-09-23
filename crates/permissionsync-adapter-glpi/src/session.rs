@@ -4,8 +4,8 @@
 //! configured user token and App-Token, uses the returned session token for
 //! every subsequent request, and ends the session with `killSession` on
 //! every exit path where cleanup is still allowed. See ADR 0009 "GLPI API
-//! and authentication" and the resolved visibility precondition in
-//! `.slim/deepwork/glpi-adapter.md`.
+//! and authentication" for the resolved visibility precondition this
+//! session lifecycle establishes.
 
 use std::time::Instant;
 
@@ -202,6 +202,15 @@ pub(crate) async fn kill_session(
         return Err(GlpiFailure::CleanupFailed);
     }
 
+    // Mirror `force_all_entities`: a `200 OK` status alone is not sufficient
+    // to consider the mutation successful. GLPI returns the bare JSON
+    // literal `true` on a successful `killSession`; anything else is
+    // rejected rather than assumed successful.
+    let trimmed = trim_ascii(&response.body);
+    if trimmed != b"true" {
+        return Err(GlpiFailure::CleanupFailed);
+    }
+
     Ok(())
 }
 
@@ -212,7 +221,7 @@ pub(crate) fn session_headers(
     Ok([session_token_header(session)?, app_token_header(config)?])
 }
 
-fn trim_ascii(bytes: &[u8]) -> &[u8] {
+pub(crate) fn trim_ascii(bytes: &[u8]) -> &[u8] {
     let start = bytes.iter().position(|byte| !byte.is_ascii_whitespace());
     let end = bytes.iter().rposition(|byte| !byte.is_ascii_whitespace());
     match (start, end) {
