@@ -1,6 +1,7 @@
-name: GLPI Adapter Conformance (Real Instance)
+---
+name: GLPI Adapter Tests
 
-on:
+"on":
   pull_request:
     branches:
       - "**"
@@ -9,13 +10,14 @@ permissions:
   contents: read
 
 jobs:
-  real-glpi-conformance:
-    name: Real GLPI Conformance
+  glpi-adapter-tests:
+    name: GLPI Adapter Tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -24,7 +26,7 @@ jobs:
 
       - name: Bootstrap disposable GLPI environment
         working-directory: crates/permissionsync-adapter-glpi/tests/real-glpi
-        run: ./bootstrap.sh > "$RUNNER_TEMP/glpi-env.sh"
+        run: ./bootstrap.sh
 
       - name: Run the real GLPI integration suite
         env:
@@ -32,21 +34,20 @@ jobs:
         run: |
           set -a
           # shellcheck disable=SC1090
-          source "$RUNNER_TEMP/glpi-env.sh"
+          source "$GLPI_TEST_RUNTIME_ENV"
           set +a
-          cargo test -p permissionsync-adapter-glpi --test real_glpi --locked -- --ignored
+          cargo test -p permissionsync-adapter-glpi --test real_glpi --locked \
+            -- --ignored
 
       - name: Collect GLPI container logs on failure
         if: failure()
         working-directory: crates/permissionsync-adapter-glpi/tests/real-glpi
         run: |
-          if [[ -f .real-glpi-run-env ]]; then
-            # shellcheck disable=SC1091
-            source .real-glpi-run-env
-          fi
-          if [[ -n "${PERMISSIONSYNC_GLPI_PROJECT_NAME:-}" ]]; then
-            docker compose -p "$PERMISSIONSYNC_GLPI_PROJECT_NAME" logs --no-color glpi db tls-proxy || true
-          fi
+          # shellcheck disable=SC1090
+          source "$GLPI_TEST_RUNTIME_ENV"
+          docker compose --env-file "$GLPI_TEST_RUNTIME_ENV" \
+            -p "$PERMISSIONSYNC_GLPI_PROJECT_NAME" \
+            logs --no-color glpi db tls-proxy
 
       - name: Tear down the disposable environment
         if: always()
