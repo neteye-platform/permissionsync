@@ -652,10 +652,12 @@ fn assert_outgoing_wire_contract(recorded: &RecordedRequest) {
         }
         ("POST", "/apirest.php/changeActiveEntities") => {
             assert!(query.is_empty());
-            assert_json_body(
-                recorded,
-                serde_json::json!({"entities_id":"all","is_recursive":true}),
-            );
+            // `entities_id` is deliberately absent: GLPI 11.0.9's
+            // `API::changeActiveEntities()` only preserves its internal
+            // `"all"` sentinel when the field is entirely unset. Sending the
+            // literal string `"all"` would instead hit `intval("all")` (PHP
+            // `0`), selecting entity ID `0` rather than every visible entity.
+            assert_json_body(recorded, serde_json::json!({"is_recursive":true}));
         }
         ("POST", "/apirest.php/User") => {
             assert!(query.is_empty());
@@ -3783,6 +3785,1140 @@ async fn deadline_already_elapsed_before_start_makes_zero_requests() {
         Err(kind) => assert_eq!(kind, std::io::ErrorKind::WouldBlock),
         Ok(()) => panic!("adapter unexpectedly connected to GLPI past an elapsed deadline"),
     }
+}
+
+// =============================================================================
+// LANE A ADDITIONS: deterministic cleanup race, entity/profile resolution
+// matrices, partial-failure convergence, and GLPI-default-assignment cleanup
+// =============================================================================
+
+/// A cancellation signal that stays `false` until the fake server has
+/// completed `threshold` requests, then returns `false` exactly once more
+/// (its very next read) before becoming permanently cancelled thereafter.
+/// This deterministically exercises the exact race ADR 0009 closes:
+/// cancellation becoming observable strictly *between* reconciliation's
+/// `cleanup_allowed` eligibility check and its immediately-following second
+/// `effective_deadline` observation right before `kill_session` (see
+/// `adapter.rs::reconcile`'s doc comment on that `Err(_)` arm). Unlike
+/// `CancelAfterRequests` above (which reports the same answer on every call
+/// once its threshold is reached, so it cannot distinguish "checked once" vs
+/// "checked twice"), this signal proves the second, later check is what
+/// actually suppresses cleanup.
+struct CancelOnSecondReadAfterThreshold {
+    completed: Arc<AtomicUsize>,
+    threshold: usize,
+    reads_after_threshold: AtomicUsize,
+}
+
+impl CancellationSignal for CancelOnSecondReadAfterThreshold {
+    fn is_cancelled(&self) -> bool {
+        if self.completed.load(Ordering::SeqCst) < self.threshold {
+            return false;
+        }
+        let read_index = self.reads_after_threshold.fetch_add(1, Ordering::SeqCst);
+        read_index >= 1
+    }
+}
+
+/// Cancellation flipping to `true` strictly between the `cleanup_allowed`
+/// eligibility check and the second `effective_deadline` observation right
+/// before `kill_session` must suppress `killSession` entirely (never send
+/// it), without turning an already-successful reconciliation into a
+/// reported failure.
+#[tokio::test]
+async fn cancellation_flip_between_cleanup_eligibility_check_and_kill_session_suppresses_cleanup() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let completed = Arc::new(AtomicUsize::new(0));
+    // 14 requests complete the primary reconciliation (see `oversized_script`
+    // comments): the 15th would be `killSession`.
+    let cancellation = CancelOnSecondReadAfterThreshold {
+        completed: Arc::clone(&completed),
+        threshold: 14,
+        reads_after_threshold: AtomicUsize::new(0),
+    };
+
+    let server = tokio::spawn(run_counted_scripted_server(
+        listener,
+        identity.acceptor,
+        oversized_script(),
+        Arc::clone(&completed),
+    ));
+
+    let identity_ctx = IdentityContext::new("jdoe".to_owned(), vec![]);
+    let context = SynchronizationContext::new(far_future_deadline(), &cancellation);
+    let envelope = one_permission_envelope();
+    let request = TargetAdapterRequest::new(&identity_ctx, &envelope, context);
+    let outcome = adapter.reconcile(request).await;
+    server.abort();
+
+    assert_eq!(
+        outcome.unwrap(),
+        ReconciliationOutcome::Changed,
+        "an already-successful primary outcome must not become a reported failure"
+    );
+    assert_eq!(
+        completed.load(Ordering::SeqCst),
+        14,
+        "killSession must never be sent once cancellation is observed inside the race window \
+         between the eligibility check and the pre-kill_session deadline recomputation"
+    );
+}
+
+// --- Entity resolution coverage matrix ---------------------------------------
+
+/// A selector that differs from the row's `Entity.completename` only in
+/// letter case must NOT match: no case-fold is ever applied.
+#[tokio::test]
+async fn entity_selector_case_mismatch_is_not_a_match() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        // Only a case-differing candidate row: zero exact matches.
+        ok(&search_body(1, &[(10, "root entity > it", "2")])),
+        ok("true"), // killSession
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    let recorded = server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(
+        outcome.is_err(),
+        "a case-differing candidate must not resolve as an exact match"
+    );
+    assert_eq!(
+        recorded.len(),
+        9,
+        "no request after the failed Entity search except cleanup"
+    );
+}
+
+/// More than one exact `Entity.completename` match is an adapter failure,
+/// and it happens before any User lookup or creation request.
+#[tokio::test]
+async fn ambiguous_exact_entity_fails_before_any_user_lookup() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        // Two rows with an identical exact `completename` match.
+        ok(&search_body(
+            2,
+            &[(10, "Root Entity > IT", "2"), (11, "Root Entity > IT", "2")],
+        )),
+        ok("true"), // killSession
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    let recorded = server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err(), "an ambiguous exact entity must fail");
+    assert_eq!(
+        recorded.len(),
+        9,
+        "ambiguous entity resolution must fail before any User or Profile_User request"
+    );
+}
+
+/// A fuzzy/lookalike GLPI search candidate that is not an exact
+/// `completename` match must not be accepted: only exact equality counts.
+#[tokio::test]
+async fn entity_fuzzy_lookalike_is_not_accepted_as_a_match() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        // "Root Entity > IT > Ops" is a fuzzy, non-exact result for
+        // "Root Entity > IT".
+        ok(&search_body(1, &[(10, "Root Entity > IT > Ops", "2")])),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(
+        outcome.is_err(),
+        "a fuzzy-only entity result must not resolve"
+    );
+}
+
+/// Entity resolution reads every page before deciding a match, and the
+/// desired exact-match row may be found on a page beyond the first.
+#[tokio::test]
+async fn entity_resolution_reads_every_page_before_matching() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let page_one_names: Vec<String> = (0..50)
+        .map(|index| format!("Other Entity {index}"))
+        .collect();
+    let page_one_rows: Vec<(u64, &str, &str)> = page_one_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (2000 + index as u64, name.as_str(), "2"))
+        .collect();
+    let page_one = search_page_body(51, 0, &page_one_rows);
+    let page_two = search_page_body(51, 50, &[(10, "Root Entity > IT", "2")]);
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        partial(&page_one),
+        partial(&page_two),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(0, &[])),
+        created(r#"{"id":99,"message":"created"}"#),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope())
+        .await
+        .expect("the exact match on the second page must resolve");
+    server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
+}
+
+/// A malformed entity search row (a non-numeric `Entity.id`) fails closed
+/// rather than being silently skipped.
+#[tokio::test]
+async fn malformed_entity_row_fails_closed() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(
+            r#"{"totalcount":1,"count":1,"content-range":"0-0/1","data":[{"1":"not-a-number","2":"Root Entity > IT"}]}"#,
+        ),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(
+        outcome.is_err(),
+        "a malformed exact-match entity row must fail closed"
+    );
+}
+
+/// Inconsistent `totalcount` between successive pages of an Entity search
+/// fails closed rather than silently trusting the later value.
+#[tokio::test]
+async fn malformed_entity_pagination_fails_closed() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let page_one_names: Vec<String> = (0..50)
+        .map(|index| format!("Other Entity {index}"))
+        .collect();
+    let page_one_rows: Vec<(u64, &str, &str)> = page_one_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (2000 + index as u64, name.as_str(), "2"))
+        .collect();
+    let page_one = search_page_body(51, 0, &page_one_rows);
+    // Second page declares a different totalcount than the first.
+    let page_two = search_page_body(52, 50, &[(10, "Root Entity > IT", "2")]);
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        partial(&page_one),
+        partial(&page_two),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+}
+
+// --- Profile resolution coverage matrix ---------------------------------------
+
+/// A missing profile (zero exact `Profile.name` matches) is a direct
+/// failure before any User lookup or creation request.
+#[tokio::test]
+async fn missing_profile_fails_before_any_user_lookup() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])), // entity resolves
+        ok(&search_body(0, &[])),                              // zero exact Profile matches
+        ok("true"),                                            // killSession
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    let recorded = server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+    assert_eq!(
+        recorded.len(),
+        10,
+        "no request after the failed Profile search except cleanup"
+    );
+}
+
+/// More than one exact `Profile.name` match is an adapter failure, and it
+/// happens before any User lookup or creation/Profile_User mutation.
+#[tokio::test]
+async fn ambiguous_exact_profile_fails_before_any_user_lookup() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(
+            2,
+            &[(20, "Technician", "2"), (21, "Technician", "2")],
+        )),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    let recorded = server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+    assert_eq!(
+        recorded.len(),
+        10,
+        "ambiguous profile resolution must fail before any User or Profile_User request"
+    );
+}
+
+/// A selector differing only in letter case from the row's `Profile.name`
+/// must NOT match.
+#[tokio::test]
+async fn profile_selector_case_mismatch_is_not_a_match() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "technician", "2")])),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(
+        outcome.is_err(),
+        "a case-differing candidate must not resolve as an exact profile match"
+    );
+}
+
+/// A profile selector containing search metacharacters is percent-encoded
+/// on the wire, and the exact percent-decoded value still reaches GLPI.
+#[tokio::test]
+async fn profile_selector_metacharacters_are_percent_encoded() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let profile_selector = "Level 1 & Support=Y";
+    let envelope = envelope_json(&format!(
+        r#"{{"permissions": [{{"entity": "Root Entity > IT", "profile": "{profile_selector}", "recursive": true}}]}}"#
+    ));
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(0, &[])), // zero exact matches
+        ok("true"),               // killSession
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &envelope).await;
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert!(outcome.is_err(), "zero exact matches must fail");
+    assert!(!recorded[8].0.contains(profile_selector));
+    assert_eq!(
+        query_value(&recorded[8], "criteria[0][value]"),
+        Some(profile_selector.to_owned())
+    );
+}
+
+/// Profile resolution reads every page before deciding a match, and the
+/// desired exact-match row may be found on a page beyond the first.
+#[tokio::test]
+async fn profile_resolution_reads_every_page_before_matching() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let page_one_names: Vec<String> = (0..50)
+        .map(|index| format!("Other Profile {index}"))
+        .collect();
+    let page_one_rows: Vec<(u64, &str, &str)> = page_one_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (3000 + index as u64, name.as_str(), "2"))
+        .collect();
+    let page_one = search_page_body(51, 0, &page_one_rows);
+    let page_two = search_page_body(51, 50, &[(20, "Technician", "2")]);
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        partial(&page_one),
+        partial(&page_two),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(0, &[])),
+        created(r#"{"id":99,"message":"created"}"#),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope())
+        .await
+        .expect("the exact match on the second page must resolve");
+    server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
+}
+
+/// A malformed profile search row (a non-numeric `Profile.id`) fails closed
+/// rather than being silently skipped.
+#[tokio::test]
+async fn malformed_profile_row_fails_closed() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(
+            r#"{"totalcount":1,"count":1,"content-range":"0-0/1","data":[{"1":"nope","2":"Technician"}]}"#,
+        ),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(
+        outcome.is_err(),
+        "a malformed exact-match profile row must fail closed"
+    );
+}
+
+/// Inconsistent `totalcount` between successive pages of a Profile search
+/// fails closed rather than silently trusting the later value.
+#[tokio::test]
+async fn malformed_profile_pagination_fails_closed() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let page_one_names: Vec<String> = (0..50)
+        .map(|index| format!("Other Profile {index}"))
+        .collect();
+    let page_one_rows: Vec<(u64, &str, &str)> = page_one_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (3000 + index as u64, name.as_str(), "2"))
+        .collect();
+    let page_one = search_page_body(51, 0, &page_one_rows);
+    let page_two = search_page_body(52, 50, &[(20, "Technician", "2")]);
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        partial(&page_one),
+        partial(&page_two),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+}
+
+// --- Partial failure after user creation, and after removals -----------------
+
+/// A missing user is created, then the subsequent current-assignment
+/// (`Profile_User`) read fails: exactly one `POST /User` request occurred,
+/// the overall result is an error, and no `Profile_User` mutation is ever
+/// attempted. The server task completing exactly its script proves there is
+/// no automatic retry.
+#[tokio::test]
+async fn partial_failure_after_user_creation_during_current_assignment_read_makes_no_assignment_mutation()
+ {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(0, &[])),                    // search User: absent
+        created(r#"{"id":55,"message":"created"}"#), // POST User succeeds exactly once
+        json_response("500 Internal Server Error", "{}"), // current-assignment read fails
+        ok("true"),                                  // killSession still attempted
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    let recorded = server
+        .await
+        .expect("scripted server completed exactly its script, proving no automatic retry");
+
+    assert!(outcome.is_err());
+    let user_creation_requests = recorded
+        .iter()
+        .filter(|recorded| {
+            let (method, path, _) = parsed_request_line(&recorded.0);
+            method == "POST" && path == "/apirest.php/User"
+        })
+        .count();
+    assert_eq!(user_creation_requests, 1, "exactly one POST /User request");
+    assert!(
+        !recorded.iter().any(|recorded| {
+            let (method, path, _) = parsed_request_line(&recorded.0);
+            path.starts_with("/apirest.php/Profile_User")
+                && (method == "POST" || method == "DELETE")
+        }),
+        "no Profile_User mutation may be attempted after the current-assignment read fails"
+    );
+}
+
+/// After the partial-failure scenario above leaves a user created with no
+/// assignments yet, a later legitimate reconciliation converges: the first
+/// call (current assignments still empty) is `Changed`, and an identical
+/// second call against the now-canonical state is `Unchanged`.
+#[tokio::test]
+async fn reconciliation_after_partial_user_creation_failure_converges_then_becomes_unchanged() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    // First run: the user already exists (created by the earlier partial
+    // run) but has no current assignments yet; the desired assignment must
+    // be added.
+    let script_one = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(1, &[(55, "jdoe", "2")])),
+        ok(&profile_user_search_body(0, &[])),
+        created(r#"{"id":200,"message":"created"}"#),
+        ok("true"),
+    ];
+    let server_one = tokio::spawn(run_scripted_server(listener, identity.acceptor, script_one));
+    let outcome_one = reconcile(&adapter, &one_permission_envelope())
+        .await
+        .unwrap();
+    server_one.await.expect("first scripted server completed");
+    assert_eq!(outcome_one, ReconciliationOutcome::Changed);
+
+    // Second run: the added assignment is now the canonical current state.
+    let listener_two = bind_loopback_listener().await;
+    let port_two = listener_two.local_addr().unwrap().port();
+    let identity_two = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter_two = adapter_for(port_two, identity_two.trust_anchor_pem.clone());
+    let script_two = vec![
+        ok(r#"{"session_token": "sess-2"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(1, &[(55, "jdoe", "2")])),
+        ok(&profile_user_search_body(1, &[(200, "jdoe")])),
+        ok(&profile_user_item_body(200, 55, 20, 10, 1)),
+        ok("true"),
+    ];
+    let server_two = tokio::spawn(run_scripted_server(
+        listener_two,
+        identity_two.acceptor,
+        script_two,
+    ));
+    let outcome_two = reconcile(&adapter_two, &one_permission_envelope())
+        .await
+        .unwrap();
+    server_two.await.expect("second scripted server completed");
+    assert_eq!(outcome_two, ReconciliationOutcome::Unchanged);
+}
+
+/// Two desired pairs, both missing: stale-row deletion succeeds, the first
+/// addition succeeds, and the second addition fails. Earlier successful
+/// deletions/additions are never undone (the scripted server's fixed,
+/// exhausted-exactly-once script itself proves no compensating request and
+/// no retry occur).
+#[tokio::test]
+async fn add_phase_partial_failure_after_removal_and_first_addition_makes_no_compensating_request()
+{
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let envelope = envelope_json(
+        r#"{"permissions": [
+            {"entity": "Root Entity > IT", "profile": "Technician", "recursive": true},
+            {"entity": "Root Entity > IT > Operations", "profile": "Read-Only", "recursive": false}
+        ]}"#,
+    );
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(
+            1,
+            &[(11, "Root Entity > IT > Operations", "2")],
+        )),
+        ok(&search_body(1, &[(21, "Read-Only", "2")])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        // A stale row for an undesired pair.
+        ok(&profile_user_item_body(99, 30, 99, 99, 0)),
+        deleted(99),                                      // removal succeeds
+        created(r#"{"id":100,"message":"created"}"#),     // first addition (10,20) succeeds
+        json_response("500 Internal Server Error", "{}"), // second addition (11,21) fails
+        ok("true"),                                       // killSession still attempted
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &envelope).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script, proving no retry or rollback");
+
+    assert!(outcome.is_err());
+}
+
+/// After the add-phase partial failure above, a later reconciliation reads
+/// real partial state (the stale row gone, the first addition present, the
+/// second addition still missing) and converges; a second identical
+/// reconciliation after that is `Unchanged`.
+#[tokio::test]
+async fn reconciliation_after_add_phase_partial_failure_converges_then_becomes_unchanged() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let envelope = envelope_json(
+        r#"{"permissions": [
+            {"entity": "Root Entity > IT", "profile": "Technician", "recursive": true},
+            {"entity": "Root Entity > IT > Operations", "profile": "Read-Only", "recursive": false}
+        ]}"#,
+    );
+
+    // First run: only the surviving (10,20) addition is present; (11,21)
+    // must still be added.
+    let script_one = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(
+            1,
+            &[(11, "Root Entity > IT > Operations", "2")],
+        )),
+        ok(&search_body(1, &[(21, "Read-Only", "2")])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(1, &[(100, "jdoe")])),
+        ok(&profile_user_item_body(100, 30, 20, 10, 1)),
+        created(r#"{"id":101,"message":"created"}"#), // add missing (11,21)
+        ok("true"),
+    ];
+    let server_one = tokio::spawn(run_scripted_server(listener, identity.acceptor, script_one));
+    let outcome_one = reconcile(&adapter, &envelope).await.unwrap();
+    server_one.await.expect("first scripted server completed");
+    assert_eq!(outcome_one, ReconciliationOutcome::Changed);
+
+    // Second run: both pairs are now canonical; converges to Unchanged.
+    let listener_two = bind_loopback_listener().await;
+    let port_two = listener_two.local_addr().unwrap().port();
+    let identity_two = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter_two = adapter_for(port_two, identity_two.trust_anchor_pem.clone());
+    let script_two = vec![
+        ok(r#"{"session_token": "sess-2"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(
+            1,
+            &[(11, "Root Entity > IT > Operations", "2")],
+        )),
+        ok(&search_body(1, &[(21, "Read-Only", "2")])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(
+            2,
+            &[(100, "jdoe"), (101, "jdoe")],
+        )),
+        ok(&profile_user_item_body(100, 30, 20, 10, 1)),
+        ok(&profile_user_item_body(101, 30, 21, 11, 0)),
+        ok("true"),
+    ];
+    let server_two = tokio::spawn(run_scripted_server(
+        listener_two,
+        identity_two.acceptor,
+        script_two,
+    ));
+    let outcome_two = reconcile(&adapter_two, &envelope).await.unwrap();
+    server_two.await.expect("second scripted server completed");
+    assert_eq!(outcome_two, ReconciliationOutcome::Unchanged);
+}
+
+/// A GLPI-created/default `Profile_User` row that appears immediately after
+/// missing-user creation (representing GLPI's own rule- or default-driven
+/// assignment) is deleted as part of normal authoritative reconciliation,
+/// proving user creation never lets the adapter assume an empty assignment
+/// set.
+#[tokio::test]
+async fn glpi_default_assignment_after_user_creation_is_cleaned_up() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(0, &[])),                    // search User: absent
+        created(r#"{"id":55,"message":"created"}"#), // POST User
+        ok(&profile_user_search_body(1, &[(200, "jdoe")])), // GLPI created a default row
+        ok(&profile_user_item_body(200, 55, 99, 99, 0)), // an undesired pair
+        deleted(200),                                // the undesired default row is removed
+        created(r#"{"id":201,"message":"created"}"#), // the desired assignment is added
+        ok("true"),                                  // killSession
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope())
+        .await
+        .unwrap();
+    server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
 }
 
 trait TryAcceptNonblocking {

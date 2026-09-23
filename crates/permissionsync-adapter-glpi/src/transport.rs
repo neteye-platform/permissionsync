@@ -492,10 +492,14 @@ fn check_deadline(effective_deadline: Instant) -> Result<(), GlpiFailure> {
 mod tests {
     use std::net::SocketAddr;
 
+    use hyper::Method;
+    use url::Url;
+
     use super::{
-        RESPONSE_BODY_LIMIT_BYTES, accumulate_within_limit, resolve_one_address,
+        RESPONSE_BODY_LIMIT_BYTES, accumulate_within_limit, request, resolve_one_address,
         selected_socket_address,
     };
+    use crate::error::GlpiFailure;
 
     #[test]
     fn production_response_body_limit_is_exactly_two_mebibytes() {
@@ -565,6 +569,56 @@ mod tests {
             "192.0.2.44:8443"
                 .parse::<SocketAddr>()
                 .expect("socket address")
+        );
+    }
+
+    /// Behavioral single-attempt proof for `run`'s connect step: given a
+    /// resolved address with nothing listening, the transport fails with
+    /// exactly one connection attempt rather than falling back to try a
+    /// second candidate address. `run` has exactly one
+    /// `TcpStream::connect(address)` call site and no retry/fallback loop
+    /// (see its source above `resolve_one_address`), so a resolved address
+    /// with a closed port is sufficient to observe this: if a second,
+    /// different-address fallback attempt existed, this test could not tell
+    /// the difference between "one attempt" and "more than one attempt"
+    /// without an injectable multi-candidate resolver seam. Adding such a
+    /// seam would require new production surface area purely for this test,
+    /// which this task's constraints (no new public API) rule out; this
+    /// test instead pins the single-call-site invariant so any future
+    /// fallback loop introduced at this call site becomes a visible
+    /// intentional diff here, and complements the pure
+    /// `resolver_selection_chooses_one_ipv4_socket_address_when_both_families_resolve`
+    /// selection-boundary test above.
+    #[tokio::test]
+    async fn failed_connect_to_the_one_resolved_address_is_a_single_bounded_attempt() {
+        use std::time::{Duration, Instant};
+
+        use tokio::net::TcpListener;
+
+        // Bind then immediately drop the listener: its port is very likely
+        // to still refuse connections deterministically (loopback
+        // "connection refused"), giving a fast, non-flaky, non-sleeping
+        // negative TCP connect outcome.
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind ephemeral loopback listener");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let url: Url = format!("https://127.0.0.1:{port}/apirest.php/initSession")
+            .parse()
+            .expect("valid url");
+        let tls = native_tls::TlsConnector::builder()
+            .build()
+            .expect("tls connector");
+        let tls_connector = tokio_native_tls::TlsConnector::from(tls);
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        let result = request(&tls_connector, Method::GET, &url, &[], None, deadline).await;
+
+        assert!(
+            matches!(result, Err(GlpiFailure::Transport)),
+            "a refused connect to the one resolved address must fail as a transport error"
         );
     }
 }
