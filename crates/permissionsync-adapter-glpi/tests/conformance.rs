@@ -2774,7 +2774,7 @@ async fn delete_failure_blocks_every_subsequent_removal_and_addition() {
 /// GLPI 11.0.9 deletion result is rejected: an HTTP status alone is never
 /// sufficient to consider a mutation successful.
 #[tokio::test]
-async fn delete_with_200_status_but_non_true_body_is_rejected() {
+async fn delete_with_200_status_but_invalid_structured_result_is_rejected() {
     let listener = bind_loopback_listener().await;
     let port = listener.local_addr().unwrap().port();
     let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
