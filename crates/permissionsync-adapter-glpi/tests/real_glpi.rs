@@ -1,11 +1,11 @@
 //! Real GLPI integration suite (ADR 0009 "Two-layer test policy").
 //!
 //! These ignored tests exercise the production GLPI V1 `apirest.php` contract
-//! against the disposable environment created by `tests/real-glpi/bootstrap.sh`.
+//! against the disposable environment created by `integration/glpi/bootstrap.sh`.
 //! Invoke them explicitly after sourcing the runtime environment it prints:
 //!
 //! ```sh
-//! source <(crates/permissionsync-adapter-glpi/tests/real-glpi/bootstrap.sh)
+//! source <(crates/permissionsync-adapter-glpi/integration/glpi/bootstrap.sh)
 //! set -a
 //! source "$GLPI_TEST_RUNTIME_ENV"
 //! set +a
@@ -52,7 +52,7 @@ struct RealGlpiEnvironment {
     /// sibling-entity visibility topology test. This account holds separate
     /// non-recursive `Profile_User` rows on two independent sibling entities
     /// under `Root entity` and, deliberately, none on `Root entity` itself
-    /// (see `tests/real-glpi/bootstrap.php`).
+    /// (see `integration/glpi/bootstrap.php`).
     topology_user_token: String,
     /// Full `Entity.completename` of the second sibling branch granted to the
     /// topology service account above.
@@ -65,7 +65,7 @@ fn real_environment() -> RealGlpiEnvironment {
     fn required(name: &str) -> String {
         env::var(name).unwrap_or_else(|_| {
             panic!(
-                "{name} is not set. Run `source <(crates/permissionsync-adapter-glpi/tests/real-glpi/bootstrap.sh)` first; missing real-GLPI configuration is a hard failure."
+                "{name} is not set. Run `source <(crates/permissionsync-adapter-glpi/integration/glpi/bootstrap.sh)` first; missing real-GLPI configuration is a hard failure."
             )
         })
     }
@@ -360,7 +360,7 @@ fn insert_fixture_recursive_variant(
 /// conformance suite retains the request-level `killSession` proof; this real
 /// suite does not falsely claim that final assignment state proves cleanup.
 #[tokio::test]
-#[ignore = "requires a disposable real GLPI environment; see tests/real-glpi/bootstrap.sh"]
+#[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
 async fn missing_user_is_created_through_v1_and_gains_a_canonical_assignment() {
     let environment = real_environment();
     let username = "permissionsync-real-missing-user";
@@ -383,7 +383,7 @@ async fn missing_user_is_created_through_v1_and_gains_a_canonical_assignment() {
 /// Empty desired state is authoritative and exercises real `Profile_User`
 /// deletion after a real V1 user/assignment creation.
 #[tokio::test]
-#[ignore = "requires a disposable real GLPI environment; see tests/real-glpi/bootstrap.sh"]
+#[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
 async fn empty_desired_state_removes_all_assignments() {
     let environment = real_environment();
     let username = "permissionsync-real-empty-state";
@@ -409,7 +409,7 @@ async fn empty_desired_state_removes_all_assignments() {
 /// Ordinary true and false assignments each converge to one physical row and
 /// an identical repeat performs no REST mutation.
 #[tokio::test]
-#[ignore = "requires a disposable real GLPI environment; see tests/real-glpi/bootstrap.sh"]
+#[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
 async fn ordinary_recursive_values_are_idempotent() {
     let environment = real_environment();
     let profile = environment.target_profile_b.as_str();
@@ -448,7 +448,7 @@ async fn ordinary_recursive_values_are_idempotent() {
 /// and dedicated target profiles are immutable shared lookup fixtures; every
 /// test mutates only its own user and that user's Profile_User rows.
 #[tokio::test]
-#[ignore = "requires a disposable real GLPI environment; see tests/real-glpi/bootstrap.sh"]
+#[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
 async fn desired_duplicate_matrix_canonicalizes_and_is_idempotent() {
     let environment = real_environment();
     let profile = environment.target_profile_a.as_str();
@@ -518,7 +518,7 @@ async fn desired_duplicate_matrix_canonicalizes_and_is_idempotent() {
 /// reconciled solely through production V1 REST. This proves physical duplicate
 /// cleanup for desired true and false, rather than merely desired normalization.
 #[tokio::test]
-#[ignore = "requires a disposable real GLPI environment; see tests/real-glpi/bootstrap.sh"]
+#[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
 async fn mixed_current_rows_are_cleaned_to_the_desired_canonical_value() {
     let environment = real_environment();
     let profile = environment.target_profile_b.as_str();
@@ -580,7 +580,7 @@ async fn mixed_current_rows_are_cleaned_to_the_desired_canonical_value() {
 /// Exact duplicate current rows are a separate physical cleanup case from the
 /// mixed-current matrix: both rows already hold the desired recursive value.
 #[tokio::test]
-#[ignore = "requires a disposable real GLPI environment; see tests/real-glpi/bootstrap.sh"]
+#[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
 async fn duplicate_current_rows_are_cleaned_and_then_unchanged() {
     let environment = real_environment();
     let username = "permissionsync-real-duplicate-current";
@@ -616,7 +616,7 @@ async fn duplicate_current_rows_are_cleaned_and_then_unchanged() {
 /// Independent assignments remain canonical while an undesired assignment is
 /// removed, exercising an authoritative multi-pair plan through V1 REST.
 #[tokio::test]
-#[ignore = "requires a disposable real GLPI environment; see tests/real-glpi/bootstrap.sh"]
+#[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
 async fn several_assignments_converge_and_stale_assignment_is_removed() {
     let environment = real_environment();
     let username = "permissionsync-real-several-and-stale";
@@ -650,7 +650,7 @@ async fn several_assignments_converge_and_stale_assignment_is_removed() {
 /// Recursive flips must delete the old physical row before creating its opposite
 /// value; both directions finish with exactly one row of the requested value.
 #[tokio::test]
-#[ignore = "requires a disposable real GLPI environment; see tests/real-glpi/bootstrap.sh"]
+#[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
 async fn recursive_flips_converge_in_both_directions() {
     let environment = real_environment();
     let profile = environment.target_profile_c.as_str();
@@ -693,7 +693,7 @@ async fn recursive_flips_converge_in_both_directions() {
 /// than fifty earlier physical candidates before V1 reconciliation, so its
 /// removal proves the adapter consumed a later real search page.
 #[tokio::test]
-#[ignore = "requires a disposable real GLPI environment; see tests/real-glpi/bootstrap.sh"]
+#[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
 async fn current_assignment_pagination_removes_a_stale_row_from_a_later_page() {
     let environment = real_environment();
     let username = "permissionsync-real-pagination";
@@ -790,7 +790,7 @@ async fn current_assignment_pagination_removes_a_stale_row_from_a_later_page() {
 /// recursively.
 ///
 /// The dedicated topology service account provisioned by
-/// `tests/real-glpi/bootstrap.php` holds two separate non-recursive
+/// `integration/glpi/bootstrap.php` holds two separate non-recursive
 /// `Profile_User` rows, one on each of two independent sibling entities under
 /// `Root entity`, and deliberately none on `Root entity` itself. GLPI's
 /// `Session::changeActiveEntities()` (src/Session.php, 11.0.9) only allows
@@ -810,7 +810,7 @@ async fn current_assignment_pagination_removes_a_stale_row_from_a_later_page() {
 /// account intentionally does, to keep every other test in this suite able to
 /// operate on `Root entity`).
 #[tokio::test]
-#[ignore = "requires a disposable real GLPI environment; see tests/real-glpi/bootstrap.sh"]
+#[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
 async fn all_entities_semantics_reach_a_sibling_branch_with_no_root_grant() {
     let environment = real_environment();
     let username = "permissionsync-real-topology-branch-two";

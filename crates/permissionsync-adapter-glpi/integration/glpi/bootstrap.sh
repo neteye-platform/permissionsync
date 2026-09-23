@@ -46,15 +46,12 @@ compose() {
 
 cleanup_failed_bootstrap() {
   local status=$?
-  # Best-effort teardown of any containers/volumes that may have started.
-  # Deliberately does NOT delete runtime_dir: bootstrap.stderr,
+  # Deliberately does NOT run `docker compose down` and does NOT delete
+  # runtime_dir: any containers, volumes, bootstrap.stderr,
   # compose-base.stderr, and other diagnostics must remain available for the
   # workflow's dedicated failure-diagnostics step. teardown.sh (invoked by the
-  # workflow's `if: always()` step) is the sole owner of final directory
-  # deletion.
-  if ! compose down --volumes --remove-orphans >/dev/null 2>&1; then
-    printf '%s\n' 'GLPI bootstrap cleanup failed; docker compose down diagnostics were redacted.' >&2
-  fi
+  # workflow's `if: always()` step) is the sole owner of destructive cleanup
+  # and final directory deletion.
   exit "$status"
 }
 trap cleanup_failed_bootstrap EXIT INT TERM
