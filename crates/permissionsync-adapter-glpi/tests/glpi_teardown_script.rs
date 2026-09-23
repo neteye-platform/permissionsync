@@ -37,6 +37,47 @@ fn unique_suffix() -> String {
     String::from_utf8(chars.to_vec()).unwrap()
 }
 
+const FRESH_PATH_ALLOCATION_ATTEMPTS: usize = 1_024;
+
+/// Create a fresh, exclusive test directory in the system temporary
+/// directory. Existing paths are never reused or removed: a collision gets a
+/// new deterministic suffix instead.
+fn create_fresh_test_dir(prefix: &str) -> PathBuf {
+    for _ in 0..FRESH_PATH_ALLOCATION_ATTEMPTS {
+        let candidate = env::temp_dir().join(format!("{prefix}{}", unique_suffix()));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!(
+                "create exclusive test directory {}: {error}",
+                candidate.display()
+            ),
+        }
+    }
+
+    panic!(
+        "could not allocate an exclusive test directory with prefix {prefix:?} after \
+         {FRESH_PATH_ALLOCATION_ATTEMPTS} attempts"
+    );
+}
+
+/// Return a unique path in the system temporary directory that does not exist.
+/// This is for locators that deliberately must remain absent, so unlike
+/// `create_fresh_test_dir` it never creates or removes anything.
+fn fresh_missing_path(prefix: &str) -> PathBuf {
+    for _ in 0..FRESH_PATH_ALLOCATION_ATTEMPTS {
+        let candidate = env::temp_dir().join(format!("{prefix}{}", unique_suffix()));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    panic!(
+        "could not allocate a missing test path with prefix {prefix:?} after \
+         {FRESH_PATH_ALLOCATION_ATTEMPTS} attempts"
+    );
+}
+
 /// RAII guard that best-effort removes the runtime directory and fake bin
 /// directory on drop, so cleanup still runs even if a test assertion panics
 /// partway through.
@@ -63,11 +104,7 @@ fn setup_runtime_env_and_fake_docker(
     docker_exit_code: u8,
     secret_marker: &str,
 ) -> (PathBuf, PathBuf, PathBuf) {
-    let suffix = unique_suffix();
-    let runtime_dir = env::temp_dir().join(format!("permissionsync-glpi.{suffix}"));
-    fs::create_dir_all(&runtime_dir).expect(
-        "create test runtime dir (must not already exist at a freshly unique generated path)",
-    );
+    let runtime_dir = create_fresh_test_dir("permissionsync-glpi.");
 
     let runtime_env = runtime_dir.join("runtime.env");
     let mut env_file = File::create(&runtime_env).expect("create runtime.env");
@@ -85,10 +122,7 @@ fn setup_runtime_env_and_fake_docker(
     writeln!(env_file, "export GLPI_TEST_SECRET_MARKER={secret_marker}").unwrap();
     drop(env_file);
 
-    let fake_bin_dir =
-        env::temp_dir().join(format!("permissionsync-glpi-fakebin-{test_name}-{suffix}"));
-    fs::create_dir_all(&fake_bin_dir)
-        .expect("create fake bin dir (must not already exist at a freshly unique generated path)");
+    let fake_bin_dir = create_fresh_test_dir(&format!("permissionsync-glpi-fakebin-{test_name}-"));
 
     let fake_docker = fake_bin_dir.join("docker");
     let mut docker_file = File::create(&fake_docker).expect("create fake docker script");
@@ -125,10 +159,7 @@ fn teardown_succeeds_when_runtime_env_was_never_set() {
 /// tear down": teardown must fail closed with a non-zero exit status.
 #[test]
 fn teardown_fails_when_runtime_env_locator_is_set_but_file_is_missing() {
-    let suffix = unique_suffix();
-    let missing_dir = env::temp_dir().join(format!(
-        "permissionsync-glpi.teardown-test-missing-{suffix}"
-    ));
+    let missing_dir = fresh_missing_path("permissionsync-glpi.teardown-test-missing-");
     let missing_runtime_env = missing_dir.join("runtime.env");
     assert!(
         !missing_runtime_env.exists(),
@@ -253,8 +284,7 @@ fn teardown_fails_when_runtime_env_declares_mismatched_runtime_dir() {
     // directory than the one it physically resides in. This must trigger
     // teardown.sh's "declares an unexpected runtime directory" fail-closed
     // check, which runs before any `docker compose down` invocation.
-    let bogus_suffix = unique_suffix();
-    let bogus_target_dir = env::temp_dir().join(format!("permissionsync-glpi.{bogus_suffix}"));
+    let bogus_target_dir = fresh_missing_path("permissionsync-glpi.");
     assert_ne!(
         bogus_target_dir, runtime_dir,
         "bogus target must differ from the real runtime dir"

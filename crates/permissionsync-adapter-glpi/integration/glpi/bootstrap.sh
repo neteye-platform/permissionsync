@@ -162,6 +162,13 @@ mask_secret "$GLPI_TEST_APP_TOKEN"
 mask_secret "$GLPI_TEST_USER_TOKEN"
 mask_secret "$GLPI_TEST_TOPOLOGY_USER_TOKEN"
 
+killsession_log="${proxy_log_dir}/killsession.log"
+# The private runtime directory contains only this safe timestamp/method/status
+# log. Initialize it before nginx starts so the exclusive cleanup test can
+# require exactly one record without truncating a live log.
+: > "$killsession_log"
+chmod 666 "$killsession_log"
+
 if ! compose up -d --wait --wait-timeout 60 tls-proxy >/dev/null; then
   printf '%s\n' 'GLPI tls-proxy did not start.' >&2
   exit 1
@@ -174,12 +181,20 @@ if [[ -z "$https_port" || ! "$https_port" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 env_put GLPI_TEST_HTTPS_PORT "$https_port"
+cleanup_https_port_mapping="$(compose port tls-proxy 8444)"
+cleanup_https_port="${cleanup_https_port_mapping##*:}"
+if [[ -z "$cleanup_https_port" || ! "$cleanup_https_port" =~ ^[0-9]+$ ]]; then
+  printf '%s\n' 'Could not determine the Docker-assigned tls-proxy cleanup HTTPS host port.' >&2
+  exit 1
+fi
+env_put GLPI_TEST_CLEANUP_HTTPS_PORT "$cleanup_https_port"
 # shellcheck disable=SC1090
 source "$runtime_env"
 
 # GLPI_TEST_ENDPOINT depends on the real (not preselected) HTTPS port, so it
 # is computed only now that port is known.
 env_put GLPI_TEST_ENDPOINT "https://127.0.0.1:${GLPI_TEST_HTTPS_PORT}/apirest.php"
+env_put GLPI_TEST_CLEANUP_ENDPOINT "https://127.0.0.1:${GLPI_TEST_CLEANUP_HTTPS_PORT}/apirest.php"
 env_put GLPI_TEST_CA_PEM_PATH "${tls_dir}/ca.crt"
 env_put GLPI_TEST_COMPOSE_PROJECT "$project_name"
 # shellcheck disable=SC1090
@@ -209,8 +224,15 @@ PY
         -H "Session-Token: ${session_token}" \
         -H "App-Token: ${GLPI_TEST_APP_TOKEN}" \
         "https://127.0.0.1:${GLPI_TEST_HTTPS_PORT}/apirest.php/killSession" 2>/dev/null)" || kill_status=''
-      kill_body="$(tr -d '[:space:]' < "$killsession_response" 2>/dev/null)" || kill_body=''
-      if [[ "$kill_status" == '200' && "$kill_body" == 'true' ]]; then
+      if [[ "$kill_status" == '200' ]] && python3 - "$killsession_response" >/dev/null 2>&1 <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as response:
+    if json.load(response) is not True:
+        raise SystemExit(1)
+PY
+      then
         init_session_ok=1
         break
       fi
@@ -221,7 +243,7 @@ done
 rm -f "$init_response" "$killsession_response"
 
 if [[ "$init_session_ok" != '1' ]]; then
-  printf '%s\n' 'initSession did not succeed with the generated credentials.' >&2
+  printf '%s\n' 'initSession and killSession did not both succeed with the generated credentials.' >&2
   exit 1
 fi
 

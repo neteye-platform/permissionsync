@@ -53,3 +53,4 @@ services:
     ports:
       # Docker-assigned ephemeral host port; discovered via `docker compose port`.
       - "127.0.0.1::8443"
+      - "127.0.0.1::8444"

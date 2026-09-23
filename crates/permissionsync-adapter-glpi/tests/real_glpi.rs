@@ -65,8 +65,11 @@ struct RealGlpiEnvironment {
     /// Host directory bind-mounted into the `tls-proxy` container at
     /// `/var/log/nginx/killsession`, containing only the non-secret
     /// `killsession.log` (timestamp, method, status) written by the dedicated
-    /// `nginx.conf` `location = /apirest.php/killSession` block.
+    /// 8444 `nginx.conf` `location = /apirest.php/killSession` block.
     proxy_log_dir: String,
+    /// HTTPS endpoint on the dedicated 8444 TLS-proxy listener used only by
+    /// the cleanup observation test.
+    cleanup_endpoint: String,
 }
 
 /// Loads the credentials emitted by the disposable bootstrap. This deliberately
@@ -99,6 +102,7 @@ fn real_environment() -> RealGlpiEnvironment {
         topology_user_token: required("GLPI_TEST_TOPOLOGY_USER_TOKEN"),
         topology_branch_two: required("GLPI_TEST_TOPOLOGY_BRANCH_TWO"),
         proxy_log_dir: required("GLPI_TEST_PROXY_LOG_DIR"),
+        cleanup_endpoint: required("GLPI_TEST_CLEANUP_ENDPOINT"),
     }
 }
 
@@ -303,8 +307,12 @@ fn root_permissions_payload(permissions: &[(&str, bool)]) -> String {
 }
 
 fn adapter(environment: &RealGlpiEnvironment) -> GlpiAdapter {
+    adapter_with_endpoint(environment, &environment.endpoint)
+}
+
+fn adapter_with_endpoint(environment: &RealGlpiEnvironment, endpoint: &str) -> GlpiAdapter {
     GlpiAdapter::new(GlpiAdapterConfig {
-        endpoint: environment.endpoint.clone(),
+        endpoint: endpoint.to_owned(),
         app_token: GlpiAppToken::new(environment.app_token.clone()),
         user_token: GlpiUserToken::new(environment.user_token.clone()),
         operation_timeout: Duration::from_secs(20),
@@ -371,8 +379,9 @@ fn insert_fixture_recursive_variant(
 /// Cleanup itself (`killSession` actually reaching the real endpoint) is
 /// separately proved at the TLS-proxy boundary by
 /// `production_adapter_killsession_is_observed_at_the_tls_proxy_boundary`
-/// below, which observes the dedicated `nginx.conf` access log rather than
-/// inspecting any session.
+/// below. It uses the exclusive 8444 listener; ordinary tests use 8443 and
+/// cannot write the dedicated `nginx.conf` access log, which avoids inspecting
+/// any session.
 #[tokio::test]
 #[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
 async fn missing_user_is_created_through_v1_and_gains_a_canonical_assignment() {
@@ -866,17 +875,11 @@ async fn all_entities_semantics_succeeds_with_full_non_recursive_entity_coverage
     );
 }
 
-/// Proves that the production adapter's `killSession` request really reaches
-/// the real `apirest.php` endpoint, observed independently at the TLS-proxy
-/// boundary rather than by inspecting any session. `nginx.conf` logs only
-/// non-secret facts (timestamp, method, status) for
-/// `location = /apirest.php/killSession` to an append-only file bind-mounted
-/// from `GLPI_TEST_PROXY_LOG_DIR`. Other tests in this suite run concurrently
-/// and also append to this same log, so this test asserts only that the line
-/// count strictly increases and that a `200` line is present after a
-/// successful reconciliation, never an exact delta: every appended line is
-/// still proof that a real killSession request from the production adapter
-/// reached the real endpoint through the real TLS proxy.
+/// Proves that the production adapter's `killSession` request reaches the real
+/// `apirest.php` endpoint at the TLS-proxy boundary without inspecting a
+/// session token. Only the dedicated 8444 cleanup listener writes this
+/// bind-mounted log; ordinary tests use 8443 and cannot satisfy this proof.
+/// Its sole record contains only timestamp, method, and status facts.
 #[tokio::test]
 #[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
 async fn production_adapter_killsession_is_observed_at_the_tls_proxy_boundary() {
@@ -885,33 +888,54 @@ async fn production_adapter_killsession_is_observed_at_the_tls_proxy_boundary() 
     let profile = environment.target_profile_b.as_str();
     let log_path = Path::new(&environment.proxy_log_dir).join("killsession.log");
 
-    let lines_before = fs::read_to_string(&log_path)
-        .unwrap_or_default()
-        .lines()
-        .count();
+    let contents_before = fs::read_to_string(&log_path).unwrap_or_else(|error| {
+        panic!("killsession proxy log at {log_path:?} must exist and be readable: {error}")
+    });
+    assert!(
+        contents_before.is_empty(),
+        "exclusive killsession proxy log must be empty before the cleanup reconciliation"
+    );
+
+    let glpi_adapter = adapter_with_endpoint(&environment, &environment.cleanup_endpoint);
+    let identity = IdentityContext::new(username.to_owned(), vec![]);
+    let envelope = DesiredStateEnvelope::new(
+        EnvelopeVersion::new(1),
+        OpaquePayload::try_from(root_permissions_payload(&[(profile, true)]))
+            .expect("valid test JSON payload"),
+    );
+    let cancellation = NeverCancelled;
+    let context = SynchronizationContext::new(
+        std::time::Instant::now() + Duration::from_secs(60),
+        &cancellation,
+    );
 
     assert_eq!(
-        reconcile(
-            &environment,
-            username,
-            &root_permissions_payload(&[(profile, true)]),
-        )
-        .await
-        .expect("V1 reconciliation must succeed"),
+        glpi_adapter
+            .reconcile(TargetAdapterRequest::new(&identity, &envelope, context))
+            .await
+            .expect("V1 reconciliation through the exclusive cleanup listener must succeed"),
         ReconciliationOutcome::Changed
     );
 
     let contents_after = fs::read_to_string(&log_path)
-        .unwrap_or_else(|error| panic!("killsession proxy log at {log_path:?} must exist and be readable after a successful reconciliation: {error}"));
-    let lines_after: Vec<&str> = contents_after.lines().collect();
+        .unwrap_or_else(|error| panic!("killsession proxy log at {log_path:?} must be readable after a successful reconciliation: {error}"));
     assert!(
-        lines_after.len() > lines_before,
-        "expected the killsession proxy log to grow after a successful reconciliation"
+        contents_after.ends_with('\n'),
+        "the exclusive killsession proxy log record must end with a newline"
     );
-    assert!(
-        lines_after[lines_before..]
-            .iter()
-            .any(|line| line.contains(" 200")),
-        "expected at least one newly appended killSession proxy log line with HTTP status 200"
+    let lines: Vec<&str> = contents_after.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "the exclusive killsession proxy log must contain exactly one record"
     );
+    let fields: Vec<&str> = lines[0].split_ascii_whitespace().collect();
+    assert_eq!(
+        fields.len(),
+        3,
+        "the killsession proxy log record must contain timestamp, method, and status"
+    );
+    assert!(!fields[0].is_empty(), "the log timestamp must not be empty");
+    assert_eq!(fields[1], "GET", "killSession must use GET");
+    assert_eq!(fields[2], "200", "killSession must return HTTP 200");
 }
