@@ -2,6 +2,8 @@
 # Bootstrap a disposable GLPI 11.0.9 environment for the ignored real suite.
 # NOTE: Docker is unavailable in the current development environment, so this
 # bootstrap and the real suite remain unexecuted locally.
+# diagnostics.sh and teardown.sh own failure diagnostics and destructive
+# cleanup, respectively.
 set -euo pipefail
 
 runtime_base="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
@@ -43,18 +45,6 @@ fi
 compose() {
   docker compose --env-file "$runtime_env" -p "$project_name" "$@"
 }
-
-cleanup_failed_bootstrap() {
-  local status=$?
-  # Deliberately does NOT run `docker compose down` and does NOT delete
-  # runtime_dir: any containers, volumes, bootstrap.stderr,
-  # compose-base.stderr, and other diagnostics must remain available for the
-  # workflow's dedicated failure-diagnostics step. teardown.sh (invoked by the
-  # workflow's `if: always()` step) is the sole owner of destructive cleanup
-  # and final directory deletion.
-  exit "$status"
-}
-trap cleanup_failed_bootstrap EXIT INT TERM
 
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
   -keyout "${tls_dir}/ca.key" -out "${tls_dir}/ca.crt" \
@@ -193,5 +183,4 @@ if [[ "$init_session_ok" != '1' ]]; then
   exit 1
 fi
 
-trap - EXIT INT TERM
 printf 'export GLPI_TEST_RUNTIME_ENV=%q\n' "$runtime_env"
