@@ -38,6 +38,7 @@ use permissionsync_core::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    sync::oneshot,
 };
 use tokio_native_tls::TlsAcceptor;
 
@@ -74,12 +75,18 @@ fn created(body: &str) -> ScriptedResponse {
     json_response("201 Created", body)
 }
 
+fn partial(body: &str) -> ScriptedResponse {
+    json_response("206 Partial Content", body)
+}
+
+fn deleted(id: u64) -> ScriptedResponse {
+    ok(&format!(r#"[{{"{id}":true,"message":"deleted"}}]"#))
+}
+
 /// Runs a scripted fake GLPI server: for each entry in `script`, in order,
-/// accepts exactly one TLS connection, reads one HTTP request, ignores its
-/// content (the adapter's own logic is exercised through its real outcome
-/// and through connection *count*, not per-request assertions in most
-/// tests), writes the scripted response, and closes. Returns the recorded
-/// request lines and header maps for callers that need them.
+/// accepts exactly one TLS connection, strictly validates one HTTP request,
+/// writes the scripted response, and closes. Returns the recorded request
+/// lines and header maps for scenario-specific value assertions.
 async fn run_scripted_server(
     listener: TcpListener,
     acceptor: TlsAcceptor,
@@ -90,6 +97,52 @@ async fn run_scripted_server(
         let (socket, _) = listener.accept().await.expect("accept connection");
         let mut stream = acceptor.accept(socket).await.expect("tls handshake");
         let request = read_request(&mut stream).await;
+        assert_outgoing_wire_contract(&request);
+        let response = format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            entry.status_line,
+            entry.body.len()
+        );
+        let mut bytes = response.into_bytes();
+        bytes.extend_from_slice(&entry.body);
+        stream.write_all(&bytes).await.expect("write response");
+        let _ = stream.shutdown().await;
+        recorded.push(request);
+    }
+    recorded
+}
+
+/// A response gate releases one already-validated request only when the test
+/// explicitly permits it. This is used for bounded deadline tests that need to
+/// consume a known portion of an operation window without a connection race.
+struct ResponseGate {
+    request_received: oneshot::Sender<RecordedRequest>,
+    release: oneshot::Receiver<()>,
+}
+
+/// Like [`run_scripted_server`], but selected responses wait for a test-owned
+/// gate after request validation and before their response is written.
+async fn run_gated_scripted_server(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    script: Vec<(ScriptedResponse, Option<ResponseGate>)>,
+) -> Vec<RecordedRequest> {
+    let mut recorded = Vec::new();
+    for (entry, gate) in script {
+        let (socket, _) = listener.accept().await.expect("accept connection");
+        let mut stream = acceptor.accept(socket).await.expect("tls handshake");
+        let request = read_request(&mut stream).await;
+        assert_outgoing_wire_contract(&request);
+        if let Some(ResponseGate {
+            request_received,
+            release,
+        }) = gate
+        {
+            request_received
+                .send(request.clone())
+                .expect("deadline test receiver remains live");
+            release.await.expect("deadline test releases response");
+        }
         let response = format!(
             "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             entry.status_line,
@@ -313,11 +366,19 @@ async fn bind_loopback_listener() -> TcpListener {
 }
 
 fn adapter_for(port: u16, trust_anchor_pem: Vec<u8>) -> GlpiAdapter {
+    adapter_for_with_timeout(port, trust_anchor_pem, Duration::from_secs(5))
+}
+
+fn adapter_for_with_timeout(
+    port: u16,
+    trust_anchor_pem: Vec<u8>,
+    operation_timeout: Duration,
+) -> GlpiAdapter {
     GlpiAdapter::new(GlpiAdapterConfig {
         endpoint: format!("https://{LOOPBACK_ADDRESS}:{port}/apirest.php"),
         app_token: GlpiAppToken::new("app-token".to_owned()),
         user_token: GlpiUserToken::new("user-token".to_owned()),
-        operation_timeout: Duration::from_secs(5),
+        operation_timeout,
         additional_trust_anchors_pem: vec![trust_anchor_pem],
         authentication_source: GlpiAuthenticationSource::default(),
     })
@@ -347,17 +408,26 @@ fn search_options_body(entries: &[(&str, &str)]) -> String {
     format!("{{{}}}", fields.join(","))
 }
 
-fn search_body(total: u64, rows: &[(u64, &str, &str)]) -> String {
+fn search_page_body(total: u64, start: u64, rows: &[(u64, &str, &str)]) -> String {
+    if total == 0 {
+        assert!(rows.is_empty(), "zero-result search cannot contain rows");
+        return r#"{"totalcount":0,"count":0,"content-range":"0--1/0"}"#.to_owned();
+    }
+
     let mut data = Vec::new();
     for (id, name, name_field) in rows {
         data.push(format!(r#"{{"1": {id}, "{name_field}": "{name}"}}"#));
     }
+    let end = start + rows.len() as u64 - 1;
     format!(
-        r#"{{"totalcount": {total}, "count": {}, "range": "0-{}", "data": [{}]}}"#,
+        r#"{{"totalcount":{total},"count":{},"content-range":"{start}-{end}/{total}","data":[{}]}}"#,
         rows.len(),
-        rows.len().saturating_sub(1),
         data.join(",")
     )
+}
+
+fn search_body(total: u64, rows: &[(u64, &str, &str)]) -> String {
+    search_page_body(total, 0, rows)
 }
 
 /// A scripted `Profile_User` candidate-discovery search response: one row
@@ -369,6 +439,14 @@ fn profile_user_search_body(total: u64, rows: &[(u64, &str)]) -> String {
         .map(|(id, username)| (*id, *username, "2"))
         .collect();
     search_body(total, &named_rows)
+}
+
+fn profile_user_search_page_body(total: u64, start: u64, rows: &[(u64, &str)]) -> String {
+    let named_rows: Vec<(u64, &str, &str)> = rows
+        .iter()
+        .map(|(id, username)| (*id, *username, "2"))
+        .collect();
+    search_page_body(total, start, &named_rows)
 }
 
 /// A scripted `GET /apirest.php/Profile_User/:id` item-read response
@@ -494,6 +572,155 @@ fn assert_json_body(recorded: &RecordedRequest, expected: serde_json::Value) {
     assert_eq!(actual, expected, "body for request line {}", recorded.0);
 }
 
+/// Enforce the selected V1 wire grammar for every fixture request before its
+/// response is released. Scenario-specific assertions below then verify exact
+/// selector and mutation values for the behavior under test.
+fn assert_outgoing_wire_contract(recorded: &RecordedRequest) {
+    let (method, path, query) = parsed_request_line(&recorded.0);
+    assert!(header_value(recorded, "host").is_some_and(|value| !value.is_empty()));
+
+    if path.ends_with("/initSession") {
+        assert!(
+            header_value(recorded, "authorization")
+                .is_some_and(|value| value.starts_with("user_token "))
+        );
+        assert!(header_value(recorded, "app-token").is_some_and(|value| !value.is_empty()));
+        assert_no_header(recorded, "session-token");
+    } else {
+        assert!(header_value(recorded, "session-token").is_some_and(|value| !value.is_empty()));
+        assert!(header_value(recorded, "app-token").is_some_and(|value| !value.is_empty()));
+        assert_no_header(recorded, "authorization");
+    }
+
+    match (method.as_str(), path.as_str()) {
+        ("GET", "/apirest.php/initSession")
+        | ("GET", "/apirest.php/getFullSession")
+        | ("GET", "/apirest.php/killSession") => {
+            assert!(query.is_empty(), "lifecycle GET has no query");
+            assert_empty_body(recorded);
+        }
+        ("GET", path) if path.starts_with("/apirest.php/listSearchOptions/") => {
+            assert!(query.is_empty(), "search-option lookup has no query");
+            assert_empty_body(recorded);
+        }
+        ("GET", path) if path.starts_with("/apirest.php/search/") => {
+            assert_empty_body(recorded);
+            assert_eq!(
+                query.len(),
+                8,
+                "search has no unrecognized query parameters"
+            );
+            for key in [
+                "range",
+                "criteria[0][field]",
+                "criteria[0][searchtype]",
+                "criteria[0][value]",
+                "sort",
+                "order",
+                "forcedisplay[0]",
+                "forcedisplay[1]",
+            ] {
+                assert!(
+                    query.iter().any(|(actual, _)| actual == key),
+                    "missing {key}"
+                );
+            }
+            assert_eq!(
+                query_value(recorded, "criteria[0][searchtype]"),
+                Some("equals".to_owned())
+            );
+            assert_eq!(query_value(recorded, "order"), Some("ASC".to_owned()));
+            for key in [
+                "criteria[0][field]",
+                "sort",
+                "forcedisplay[0]",
+                "forcedisplay[1]",
+            ] {
+                assert!(query_value(recorded, key).unwrap().parse::<u64>().is_ok());
+            }
+            assert!(
+                query_value(recorded, "criteria[0][value]").is_some_and(|value| !value.is_empty())
+            );
+            let range = query_value(recorded, "range").unwrap();
+            let (start, end) = range.split_once('-').expect("inclusive range");
+            assert!(start.parse::<u64>().is_ok() && end.parse::<u64>().is_ok());
+        }
+        ("GET", path) if path.starts_with("/apirest.php/Profile_User/") => {
+            assert!(query.is_empty(), "item read has no query");
+            assert_empty_body(recorded);
+            assert!(path.rsplit('/').next().unwrap().parse::<u64>().is_ok());
+        }
+        ("POST", "/apirest.php/changeActiveEntities") => {
+            assert!(query.is_empty());
+            assert_json_body(
+                recorded,
+                serde_json::json!({"entities_id":"all","is_recursive":true}),
+            );
+        }
+        ("POST", "/apirest.php/User") => {
+            assert!(query.is_empty());
+            assert_header(recorded, "content-type", "application/json");
+            let body: serde_json::Value = serde_json::from_slice(&recorded.2).unwrap();
+            let input = body
+                .get("input")
+                .and_then(serde_json::Value::as_object)
+                .unwrap();
+            assert_eq!(body.as_object().unwrap().len(), 1);
+            assert!(
+                input
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| !name.is_empty())
+            );
+            assert!(
+                input
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "name" | "authtype" | "auths_id"))
+            );
+        }
+        ("POST", "/apirest.php/Profile_User") => {
+            assert!(query.is_empty());
+            assert_header(recorded, "content-type", "application/json");
+            let body: serde_json::Value = serde_json::from_slice(&recorded.2).unwrap();
+            let input = body
+                .get("input")
+                .and_then(serde_json::Value::as_object)
+                .unwrap();
+            assert_eq!(body.as_object().unwrap().len(), 1);
+            assert_eq!(input.len(), 4);
+            // `users_id`/`profiles_id` are always positive database ids;
+            // `entities_id` alone may legitimately be `0` for GLPI's root
+            // entity.
+            for key in ["users_id", "profiles_id"] {
+                assert!(
+                    input
+                        .get(key)
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some_and(|id| id > 0)
+                );
+            }
+            assert!(
+                input
+                    .get("entities_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some()
+            );
+            assert!(
+                input
+                    .get("is_recursive")
+                    .and_then(serde_json::Value::as_bool)
+                    .is_some()
+            );
+        }
+        ("DELETE", path) if path.starts_with("/apirest.php/Profile_User/") => {
+            assert!(query.is_empty());
+            assert_empty_body(recorded);
+            assert!(path.rsplit('/').next().unwrap().parse::<u64>().is_ok());
+        }
+        _ => panic!("unexpected GLPI wire operation: {}", recorded.0),
+    }
+}
+
 /// A [`CancellationSignal`] that reports cancelled only once at least
 /// `threshold` scripted requests have already been fully answered by the
 /// fake server. Used to prove cancellation is observed at a specific point
@@ -530,6 +757,7 @@ async fn run_counted_scripted_server(
         let (socket, _) = listener.accept().await.expect("accept connection");
         let mut stream = acceptor.accept(socket).await.expect("tls handshake");
         let request = read_request(&mut stream).await;
+        assert_outgoing_wire_contract(&request);
         completed.fetch_add(1, Ordering::SeqCst);
         let response = format!(
             "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -543,6 +771,24 @@ async fn run_counted_scripted_server(
         recorded.push(request);
     }
     recorded
+}
+
+/// Accepts exactly one fully formed request then deliberately withholds its
+/// response. The notification makes deadline tests race-free: they advance
+/// only after the adapter has actually started the bounded operation.
+async fn hold_one_response(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    started: oneshot::Sender<RecordedRequest>,
+) {
+    let (socket, _) = listener.accept().await.expect("accept connection");
+    let mut stream = acceptor.accept(socket).await.expect("tls handshake");
+    let request = read_request(&mut stream).await;
+    assert_outgoing_wire_contract(&request);
+    started
+        .send(request)
+        .expect("deadline test receiver remains live");
+    std::future::pending::<()>().await;
 }
 
 async fn reconcile_with_cancellation(
@@ -586,8 +832,8 @@ fn oversized_script() -> Vec<ScriptedResponse> {
         ok(&search_body(1, &[(30, "jdoe", "2")])), // 10: search User
         ok(&profile_user_search_body(1, &[(99, "jdoe")])), // 11: search Profile_User candidates
         ok(&profile_user_item_body(99, 30, 40, 50, 0)), // 12: item read (not canonical -> plan has work: 1 removal + 1 addition)
-        ok("true"),                                     // 13: DELETE Profile_User/99 (removal)
-        created(r#"{"id": 100}"#),                      // 14: POST Profile_User (addition)
+        deleted(99),                                    // 13: DELETE Profile_User/99 (removal)
+        created(r#"{"id":100,"message":"created"}"#),   // 14: POST Profile_User (addition)
         ok("true"),                                     // 15: killSession
     ];
     // Extra trailing entries that must never be consumed in tests that
@@ -633,7 +879,7 @@ async fn full_reconciliation_creates_the_missing_assignment_and_returns_changed(
         ok(&search_body(1, &[(20, "Technician", "2")])), // search Profile
         ok(&search_body(1, &[(30, "jdoe", "2")])), // search User
         ok(&profile_user_search_body(0, &[])), // search Profile_User (candidate discovery: none)
-        created(r#"{"id": 99}"#),             // POST Profile_User
+        created(r#"{"id":99,"message":"created"}"#), // POST Profile_User
         ok("true"),                           // killSession
     ];
 
@@ -641,6 +887,59 @@ async fn full_reconciliation_creates_the_missing_assignment_and_returns_changed(
     let outcome = reconcile(&adapter, &one_permission_envelope())
         .await
         .unwrap();
+    server.await.expect("scripted server completed");
+
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
+}
+
+/// GLPI's root entity is physically id `0` (see GLPI's own
+/// `install/empty_data.php` seed data). A desired `entity` selector that
+/// exactly names the bare root entity must resolve successfully rather than
+/// being rejected merely because its resolved id is `0` -- unlike
+/// `Profile.id`/`User.id`/`Profile_User.id`, which are never legitimately
+/// zero.
+#[tokio::test]
+async fn desired_entity_selector_resolving_to_root_entity_id_zero_succeeds() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let envelope = envelope_json(
+        r#"{"permissions": [{"entity": "Root entity", "profile": "Technician", "recursive": true}]}"#,
+    );
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#), // initSession
+        ok("true"),                           // changeActiveEntities
+        ok(&full_session_body(1)),            // getFullSession
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])), // listSearchOptions/Entity
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])), // listSearchOptions/Profile
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])), // listSearchOptions/User
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])), // listSearchOptions/Profile_User
+        ok(&search_body(1, &[(0, "Root entity", "2")])), // search Entity: id 0
+        ok(&search_body(1, &[(20, "Technician", "2")])), // search Profile
+        ok(&search_body(1, &[(30, "jdoe", "2")])), // search User
+        ok(&profile_user_search_body(0, &[])), // search Profile_User (candidate discovery: none)
+        created(r#"{"id":99,"message":"created"}"#), // POST Profile_User
+        ok("true"),                           // killSession
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &envelope)
+        .await
+        .expect("bare 'Root entity' must resolve to the root entity's real id 0");
     server.await.expect("scripted server completed");
 
     assert_eq!(outcome, ReconciliationOutcome::Changed);
@@ -1106,7 +1405,7 @@ async fn missing_user_is_created_with_only_the_configured_provisioning_fields() 
             ("2", "User.name"),
         ])),
         ok(&search_body(0, &[])), // search User: zero exact matches
-        created(r#"{"id": 55}"#), // POST User
+        created(r#"{"id":55,"message":"created"}"#), // POST User
         ok(&profile_user_search_body(0, &[])), // read_current_assignments: none
         ok("true"),               // killSession
     ];
@@ -1203,7 +1502,7 @@ async fn case_sensitive_lookalike_does_not_count_as_an_exact_user_match() {
         // GLPI search "equals" can return a fuzzy/lookalike row; only a
         // case-sensitive exact match counts.
         ok(&search_body(1, &[(30, "JDOE", "2")])),
-        created(r#"{"id": 61}"#), // POST User: created because "JDOE" != "jdoe"
+        created(r#"{"id":61,"message":"created"}"#), // POST User: created because "JDOE" != "jdoe"
         ok(&profile_user_search_body(0, &[])),
         ok("true"),
     ];
@@ -1232,8 +1531,8 @@ async fn user_lookup_reads_every_page_before_deciding() {
     for index in 0..50 {
         page_one_rows.push((1000 + index, "someone-else", "2"));
     }
-    let page_one = search_body(51, &page_one_rows);
-    let page_two = search_body(51, &[(30, "jdoe", "2")]);
+    let page_one = search_page_body(51, 0, &page_one_rows);
+    let page_two = search_page_body(51, 50, &[(30, "jdoe", "2")]);
 
     let script = vec![
         ok(r#"{"session_token": "sess-1"}"#),
@@ -1247,8 +1546,8 @@ async fn user_lookup_reads_every_page_before_deciding() {
             ("1", "Profile_User.id"),
             ("2", "User.name"),
         ])),
-        ok(&page_one),
-        ok(&page_two),
+        partial(&page_one),
+        partial(&page_two),
         ok(&profile_user_search_body(0, &[])),
         ok("true"),
     ];
@@ -1322,7 +1621,7 @@ async fn missing_user_creation_with_empty_desired_state_is_still_changed() {
             ("2", "User.name"),
         ])),
         ok(&search_body(0, &[])),
-        created(r#"{"id": 70}"#),
+        created(r#"{"id":70,"message":"created"}"#),
         ok(&profile_user_search_body(0, &[])),
         ok("true"),
     ];
@@ -1511,8 +1810,8 @@ async fn current_assignment_discovery_reads_every_page_before_planning() {
     for index in 0..50 {
         page_one_rows.push((2000 + index, "jdoe"));
     }
-    let page_one = profile_user_search_body(51, &page_one_rows);
-    let page_two = profile_user_search_body(51, &[(99, "jdoe")]);
+    let page_one = profile_user_search_page_body(51, 0, &page_one_rows);
+    let page_two = profile_user_search_page_body(51, 50, &[(99, "jdoe")]);
 
     let script = vec![
         ok(r#"{"session_token": "sess-1"}"#),
@@ -1527,8 +1826,8 @@ async fn current_assignment_discovery_reads_every_page_before_planning() {
             ("2", "User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
-        ok(&page_one),
-        ok(&page_two),
+        partial(&page_one),
+        partial(&page_two),
     ];
     // 50 item reads for page one's candidates, plus 1 for page two's.
     let mut full_script = script;
@@ -1537,9 +1836,11 @@ async fn current_assignment_discovery_reads_every_page_before_planning() {
     }
     full_script.push(ok(&profile_user_item_body(99, 30, 999, 999, 0)));
     // Every one of the 51 rows is an undesired pair (empty desired state):
-    // all 51 physical rows are removed via one `DELETE` request each.
-    for _ in 0..51 {
-        full_script.push(ok("true"));
+    // all 51 physical rows are removed via one exact GLPI 11.0.9 deletion
+    // response. The planner emits physical ids in ascending order.
+    full_script.push(deleted(99));
+    for index in 0..50 {
+        full_script.push(deleted(2000 + index));
     }
     full_script.push(ok("true")); // killSession
 
@@ -1645,6 +1946,259 @@ async fn malformed_is_recursive_representations_fail_closed() {
     }
 }
 
+/// Unlike `Profile`/`User`/`Profile_User`, `Entity.id` may legitimately be
+/// `0` (GLPI's own root entity). This is intentionally NOT a "zero id fails
+/// closed" test: see
+/// `desired_entity_selector_resolving_to_root_entity_id_zero_succeeds` for
+/// the corresponding bare-"Root entity" success case. `Entity.id` is a
+/// unique primary key, so a real GLPI instance can never return id `0` for
+/// any `Entity.completename` other than its actual root entity; there is no
+/// wire-distinguishable "impossible" zero-id Entity row to reject.
+#[tokio::test]
+async fn zero_entity_search_id_resolves_successfully_as_the_root_entity() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let script = vec![
+        ok(r#"{"session_token":"sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(0, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(0, &[])),
+        created(r#"{"id":99,"message":"created"}"#),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope())
+        .await
+        .expect("an exact Entity.completename match with id 0 must resolve, not fail");
+    server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
+}
+
+/// Zero is not a usable resolved Profile id: User lookup and mutation never
+/// start after the invalid exact Profile row.
+#[tokio::test]
+async fn zero_profile_search_id_is_rejected_before_user_lookup_or_mutation() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let script = vec![
+        ok(r#"{"session_token":"sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(0, "Technician", "2")])),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert!(outcome.is_err(), "zero Profile id must fail closed");
+    assert_eq!(
+        recorded.len(),
+        10,
+        "only cleanup follows the Profile search"
+    );
+    assert_request(&recorded[8], "GET", "/apirest.php/search/Profile");
+    assert_request(&recorded[9], "GET", "/apirest.php/killSession");
+}
+
+/// Zero is not a usable resolved User id: no candidate discovery or assignment
+/// mutation starts after the invalid exact User row.
+#[tokio::test]
+async fn zero_user_search_id_is_rejected_before_assignment_discovery_or_mutation() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let script = vec![
+        ok(r#"{"session_token":"sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(0, "jdoe", "2")])),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert!(outcome.is_err(), "zero User id must fail closed");
+    assert_eq!(recorded.len(), 7, "only cleanup follows the User search");
+    assert_request(&recorded[5], "GET", "/apirest.php/search/User");
+    assert_request(&recorded[6], "GET", "/apirest.php/killSession");
+}
+
+/// A zero Profile_User search candidate is not an item id: the adapter neither
+/// reads `/Profile_User/0` nor begins deletion before cleanup.
+#[tokio::test]
+async fn zero_profile_user_candidate_id_is_rejected_before_item_read_or_mutation() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let script = vec![
+        ok(r#"{"session_token":"sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(1, &[(0, "jdoe")])),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert!(outcome.is_err(), "zero candidate id must fail closed");
+    assert_eq!(
+        recorded.len(),
+        8,
+        "no Profile_User item read or deletion starts"
+    );
+    assert_request(&recorded[6], "GET", "/apirest.php/search/Profile_User");
+    assert_request(&recorded[7], "GET", "/apirest.php/killSession");
+}
+
+/// Item `id`, `users_id`, and `profiles_id` are positive GLPI database ids.
+/// A zero in any one raw field fails closed before the candidate can be
+/// reconciled or deleted.
+#[tokio::test]
+async fn zero_required_profile_user_raw_ids_are_rejected_before_mutation() {
+    for (field, item_body) in [
+        ("id", profile_user_item_body(0, 30, 20, 10, 0)),
+        ("users_id", profile_user_item_body(99, 0, 20, 10, 0)),
+        ("profiles_id", profile_user_item_body(99, 30, 0, 10, 0)),
+    ] {
+        let listener = bind_loopback_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+        let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+        let script = vec![
+            ok(r#"{"session_token":"sess-1"}"#),
+            ok("true"),
+            ok(&full_session_body(1)),
+            ok(&search_options_body(&[
+                ("1", "User.id"),
+                ("2", "User.name"),
+            ])),
+            ok(&search_options_body(&[
+                ("1", "Profile_User.id"),
+                ("2", "User.name"),
+            ])),
+            ok(&search_body(1, &[(30, "jdoe", "2")])),
+            ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+            ok(&item_body),
+            ok("true"),
+        ];
+
+        let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+        let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+        let recorded = server.await.expect("scripted server completed its script");
+
+        assert!(outcome.is_err(), "zero raw {field} must fail closed");
+        assert_eq!(recorded.len(), 9, "zero raw {field} cannot start deletion");
+        assert_request(&recorded[7], "GET", "/apirest.php/Profile_User/99");
+        assert_request(&recorded[8], "GET", "/apirest.php/killSession");
+    }
+}
+
+/// GLPI's root entity is raw `entities_id: 0`, so unlike the other raw ids it
+/// remains valid and its current row is authoritatively removed for an empty
+/// desired state.
+#[tokio::test]
+async fn zero_profile_user_raw_entity_id_is_accepted_as_the_glpi_root_entity() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let script = vec![
+        ok(r#"{"session_token":"sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 0, 0)),
+        deleted(99),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope())
+        .await
+        .expect("root-entity assignment is a valid current row");
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
+    assert_request(&recorded[8], "DELETE", "/apirest.php/Profile_User/99");
+    assert_request(&recorded[9], "GET", "/apirest.php/killSession");
+}
+
 /// Malformed pagination metadata (an empty page while rows remain
 /// outstanding against the declared `totalcount`) fails rather than
 /// silently accepting a gap.
@@ -1668,7 +2222,7 @@ async fn malformed_pagination_with_a_short_empty_page_fails_closed() {
             ("2", "User.name"),
         ])),
         // Declares a total of 5 rows but returns zero: a gap, not progress.
-        ok(&search_body(5, &[])),
+        ok(r#"{"totalcount":5,"count":0,"content-range":"0--1/5","data":[]}"#),
         ok("true"),
     ];
 
@@ -1694,9 +2248,9 @@ async fn inconsistent_totalcount_across_pages_fails_closed() {
     for index in 0..50 {
         page_one_rows.push((3000 + index, "jdoe"));
     }
-    let page_one = profile_user_search_body(50, &page_one_rows);
+    let page_one = profile_user_search_page_body(51, 0, &page_one_rows);
     // Second page reports a different totalcount than the first.
-    let page_two = profile_user_search_body(51, &[(99, "jdoe")]);
+    let page_two = profile_user_search_page_body(52, 50, &[(99, "jdoe")]);
 
     let script = vec![
         ok(r#"{"session_token": "sess-1"}"#),
@@ -1711,8 +2265,8 @@ async fn inconsistent_totalcount_across_pages_fails_closed() {
             ("2", "User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
-        ok(&page_one),
-        ok(&page_two),
+        partial(&page_one),
+        partial(&page_two),
         ok("true"),
     ];
 
@@ -1774,7 +2328,7 @@ async fn desired_true_with_true_and_false_current_rows_removes_only_the_false_ro
         ok(&profile_user_search_body(2, &[(99, "jdoe"), (100, "jdoe")])),
         ok(&profile_user_item_body(99, 30, 20, 10, 1)), // canonical: true
         ok(&profile_user_item_body(100, 30, 20, 10, 0)), // opposite: false
-        ok("true"),                                     // DELETE Profile_User/100
+        deleted(100),                                   // DELETE Profile_User/100
         ok("true"),                                     // killSession
     ];
 
@@ -1823,9 +2377,9 @@ async fn undesired_pair_with_mixed_recursive_rows_is_fully_removed() {
         ok(&profile_user_search_body(2, &[(99, "jdoe"), (100, "jdoe")])),
         ok(&profile_user_item_body(99, 30, 20, 10, 1)),
         ok(&profile_user_item_body(100, 30, 20, 10, 0)),
-        ok("true"), // DELETE Profile_User/99
-        ok("true"), // DELETE Profile_User/100
-        ok("true"), // killSession
+        deleted(99),  // DELETE Profile_User/99
+        deleted(100), // DELETE Profile_User/100
+        ok("true"),   // killSession
     ];
 
     let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
@@ -1892,11 +2446,11 @@ async fn all_removals_precede_all_additions_one_mutation_per_request() {
         // are pure additions.
         ok(&profile_user_item_body(1, 50, 999, 998, 0)),
         ok(&profile_user_item_body(2, 50, 997, 996, 1)),
-        ok("true"),                // DELETE Profile_User/1
-        ok("true"),                // DELETE Profile_User/2
-        created(r#"{"id": 200}"#), // POST addition (10,20)
-        created(r#"{"id": 201}"#), // POST addition (30,40)
-        ok("true"),                // killSession
+        deleted(1),                                   // DELETE Profile_User/1
+        deleted(2),                                   // DELETE Profile_User/2
+        created(r#"{"id":200,"message":"created"}"#), // POST addition (10,20)
+        created(r#"{"id":201,"message":"created"}"#), // POST addition (30,40)
+        ok("true"),                                   // killSession
     ];
 
     let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
@@ -1986,10 +2540,9 @@ async fn delete_failure_blocks_every_subsequent_removal_and_addition() {
     assert!(outcome.is_err());
 }
 
-/// A `DELETE` response with `200 OK` status but a body that is not the bare
-/// JSON literal `true` is rejected, mirroring `force_all_entities` and
-/// `kill_session`'s status-plus-body verification: an HTTP status alone is
-/// never sufficient to consider a mutation successful.
+/// A `DELETE` response with `200 OK` status but an unsuccessful structured
+/// GLPI 11.0.9 deletion result is rejected: an HTTP status alone is never
+/// sufficient to consider a mutation successful.
 #[tokio::test]
 async fn delete_with_200_status_but_non_true_body_is_rejected() {
     let listener = bind_loopback_listener().await;
@@ -2012,7 +2565,7 @@ async fn delete_with_200_status_but_non_true_body_is_rejected() {
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         ok(&profile_user_search_body(1, &[(99, "jdoe")])),
         ok(&profile_user_item_body(99, 30, 20, 10, 0)),
-        ok("false"), // DELETE Profile_User/99: 200 OK but not bare `true`
+        ok("false"), // DELETE Profile_User/99: not a structured success result
         ok("true"),  // killSession still attempted
     ];
 
@@ -2024,7 +2577,7 @@ async fn delete_with_200_status_but_non_true_body_is_rejected() {
 
     assert!(
         outcome.is_err(),
-        "a 200 OK DELETE response body that is not bare `true` must be rejected"
+        "a 200 OK DELETE response body that is not a structured success result must be rejected"
     );
 }
 
@@ -2065,7 +2618,7 @@ async fn a_later_reconciliation_converges_and_becomes_unchanged() {
         ok(&profile_user_search_body(2, &[(99, "jdoe"), (100, "jdoe")])),
         ok(&profile_user_item_body(99, 30, 20, 10, 1)),
         ok(&profile_user_item_body(100, 30, 20, 10, 1)), // exact duplicate
-        ok("true"),                                      // DELETE the duplicate
+        deleted(100),                                    // DELETE the duplicate
         ok("true"),                                      // killSession
     ];
     let server_one = tokio::spawn(run_scripted_server(listener, identity.acceptor, script_one));
@@ -2165,7 +2718,7 @@ async fn malformed_success_looking_creation_response_is_rejected() {
         ok(&profile_user_search_body(0, &[])),
         // Hypothetical response shape, not asserted as GLPI's actual wire
         // behavior: an extra unexpected field alongside "id".
-        created(r#"{"id": 99, "message": "ok"}"#),
+        created(r#"{"id":99,"message":"ok","unexpected":true}"#),
         ok("true"),
     ];
 
@@ -2202,7 +2755,7 @@ async fn zero_id_in_creation_response_is_rejected() {
         ok(&search_body(0, &[])),
         // Hypothetical response shape, not asserted as GLPI's actual wire
         // behavior; see `tests/real_glpi.rs`.
-        created(r#"{"id": 0}"#),
+        created(r#"{"id":0,"message":"created"}"#),
         ok("true"),
     ];
 
@@ -2278,7 +2831,7 @@ async fn correct_body_with_wrong_status_code_is_rejected() {
         // Hypothetical response shape, not asserted as GLPI's actual wire
         // behavior: a valid-looking `{"id": N}` body but with status `200
         // OK` where the adapter requires `201 Created` for a creation.
-        ok(r#"{"id": 42}"#),
+        ok(r#"{"id":42,"message":"created"}"#),
         ok("true"),
     ];
 
@@ -2587,7 +3140,15 @@ async fn malformed_json_response_body_is_rejected() {
 /// `3xx` redirect status: the adapter never follows redirects.
 #[tokio::test]
 async fn unexpected_and_redirect_statuses_for_init_session_are_rejected() {
-    for status_line in ["302 Found", "418 I'm a Teapot", "500 Internal Server Error"] {
+    for status_line in [
+        "301 Moved Permanently",
+        "302 Found",
+        "303 See Other",
+        "307 Temporary Redirect",
+        "308 Permanent Redirect",
+        "418 I'm a Teapot",
+        "500 Internal Server Error",
+    ] {
         let listener = bind_loopback_listener().await;
         let port = listener.local_addr().unwrap().port();
         let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
@@ -2938,11 +3499,11 @@ async fn cancellation_between_search_pages_stops_before_next_page() {
     for index in 0..50 {
         page_one_rows.push((3000 + index, "other-user"));
     }
-    let page_one = profile_user_search_body(51, &page_one_rows);
+    let page_one = profile_user_search_page_body(51, 0, &page_one_rows);
     // A second page that must never be requested: if cancellation were only
     // checked before the overall search started (not between pages), the
     // adapter would fetch this page too.
-    let page_two = profile_user_search_body(51, &[(99, "jdoe")]);
+    let page_two = profile_user_search_page_body(51, 50, &[(99, "jdoe")]);
 
     let script = vec![
         ok(r#"{"session_token": "sess-1"}"#),
@@ -2957,7 +3518,7 @@ async fn cancellation_between_search_pages_stops_before_next_page() {
             ("2", "User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
-        ok(&page_one),
+        partial(&page_one),
         ok(&page_two),
         ok("true"),
     ];
@@ -2974,6 +3535,229 @@ async fn cancellation_between_search_pages_stops_before_next_page() {
 
     assert!(outcome.is_err());
     assert_eq!(completed.load(Ordering::SeqCst), 7);
+}
+
+/// Cancellation observed after the first authoritative raw item read stops
+/// before the second `Profile_User/:id` request starts. This is distinct from
+/// cancelling between candidate-search pages: the item reads are individual
+/// outbound operations with their own context gate.
+#[tokio::test]
+async fn cancellation_between_profile_user_item_reads_stops_before_second_read() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let cancellation = CancelAfterRequests {
+        completed: Arc::clone(&completed),
+        // init, active entities, full session, User/Profile_User options,
+        // User search, Profile_User candidate search, first raw item read.
+        threshold: 8,
+    };
+    let script = vec![
+        ok(r#"{"session_token":"sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(2, &[(99, "jdoe"), (100, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 0)),
+        ok(&profile_user_item_body(100, 30, 20, 10, 0)),
+    ];
+    let server = tokio::spawn(run_counted_scripted_server(
+        listener,
+        identity.acceptor,
+        script,
+        Arc::clone(&completed),
+    ));
+
+    let outcome =
+        reconcile_with_cancellation(&adapter, &empty_desired_envelope(), &cancellation).await;
+    server.abort();
+
+    assert!(outcome.is_err());
+    assert_eq!(completed.load(Ordering::SeqCst), 8);
+}
+
+/// Consecutive search pages each receive their own operation window. The fake
+/// server signals that each page request has arrived before withholding its
+/// response. This necessarily uses real time because production calculates
+/// deadlines with `std::time::Instant`; virtual-time proof would require an
+/// invasive production clock seam. Each 450 ms hold is materially below the
+/// 750 ms operation timeout, while their 900 ms total exceeds any stale page-1
+/// deadline. The three-second readiness and completion bounds only detect a
+/// stalled test/server interaction; the only real-time waits deliberately hold
+/// already-received server responses for the stated operation-window portions.
+#[tokio::test]
+async fn second_search_page_succeeds_with_a_fresh_operation_timeout() {
+    const OPERATION_TIMEOUT: Duration = Duration::from_millis(750);
+    const HELD_RESPONSE_DURATION: Duration = Duration::from_millis(450);
+    const TEST_BOUND: Duration = Duration::from_secs(3);
+
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter =
+        adapter_for_with_timeout(port, identity.trust_anchor_pem.clone(), OPERATION_TIMEOUT);
+    let mut first_page_rows = Vec::new();
+    for id in 1..=50 {
+        first_page_rows.push((id, "not-jdoe", "2"));
+    }
+    let first_page = search_page_body(51, 0, &first_page_rows);
+    let second_page = search_page_body(51, 50, &[(51, "jdoe", "2")]);
+
+    let (first_started_tx, mut first_started_rx) = oneshot::channel();
+    let (first_release_tx, first_release_rx) = oneshot::channel();
+    let (second_started_tx, mut second_started_rx) = oneshot::channel();
+    let (second_release_tx, second_release_rx) = oneshot::channel();
+    let script = vec![
+        (ok(r#"{"session_token":"sess-1"}"#), None),
+        (ok("true"), None),
+        (ok(&full_session_body(1)), None),
+        (
+            ok(&search_options_body(&[
+                ("1", "User.id"),
+                ("2", "User.name"),
+            ])),
+            None,
+        ),
+        (
+            ok(&search_options_body(&[
+                ("1", "Profile_User.id"),
+                ("2", "User.name"),
+            ])),
+            None,
+        ),
+        (
+            partial(&first_page),
+            Some(ResponseGate {
+                request_received: first_started_tx,
+                release: first_release_rx,
+            }),
+        ),
+        (
+            partial(&second_page),
+            Some(ResponseGate {
+                request_received: second_started_tx,
+                release: second_release_rx,
+            }),
+        ),
+        (ok(&profile_user_search_body(0, &[])), None),
+        (ok("true"), None),
+    ];
+    let server = tokio::spawn(run_gated_scripted_server(
+        listener,
+        identity.acceptor,
+        script,
+    ));
+
+    let envelope = empty_desired_envelope();
+    let reconciliation = reconcile(&adapter, &envelope);
+    tokio::pin!(reconciliation);
+
+    let first_request = tokio::select! {
+        request = tokio::time::timeout(TEST_BOUND, &mut first_started_rx) => request
+            .expect("page 1 readiness within test bound")
+            .expect("first page readiness signal"),
+        outcome = &mut reconciliation => panic!("reconciliation ended before page 1: {outcome:?}"),
+    };
+    assert_request(&first_request, "GET", "/apirest.php/search/User");
+    assert_eq!(
+        query_value(&first_request, "range"),
+        Some("0-49".to_owned())
+    );
+    tokio::time::sleep(HELD_RESPONSE_DURATION).await;
+    first_release_tx
+        .send(())
+        .expect("server awaits page 1 release");
+
+    let second_request = tokio::select! {
+        request = tokio::time::timeout(TEST_BOUND, &mut second_started_rx) => request
+            .expect("page 2 readiness within test bound")
+            .expect("second page readiness signal"),
+        outcome = &mut reconciliation => panic!("reconciliation ended before page 2: {outcome:?}"),
+    };
+    assert_request(&second_request, "GET", "/apirest.php/search/User");
+    assert_eq!(
+        query_value(&second_request, "range"),
+        Some("50-99".to_owned())
+    );
+    tokio::time::sleep(HELD_RESPONSE_DURATION).await;
+    second_release_tx
+        .send(())
+        .expect("server awaits page 2 release");
+
+    let outcome = tokio::time::timeout(TEST_BOUND, &mut reconciliation)
+        .await
+        .expect("reconciliation finishes within test bound")
+        .expect("fresh page-2 operation timeout permits the response");
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Unchanged);
+    assert_eq!(recorded.len(), 9, "both pages and cleanup completed");
+}
+
+/// A held response consumes the per-operation budget, not the entire
+/// synchronization budget. The server signals request receipt before it
+/// withholds the response, so no sleep or connection race is involved.
+#[tokio::test]
+async fn held_response_is_bounded_by_the_fresh_operation_timeout() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for_with_timeout(
+        port,
+        identity.trust_anchor_pem.clone(),
+        Duration::from_millis(25),
+    );
+    let (started_tx, started_rx) = oneshot::channel();
+    let server = tokio::spawn(hold_one_response(listener, identity.acceptor, started_tx));
+
+    let envelope = empty_desired_envelope();
+    let outcome = tokio::time::timeout(Duration::from_secs(1), reconcile(&adapter, &envelope))
+        .await
+        .expect("operation timeout returns within the test bound");
+    let request = started_rx.await.expect("held server reports the request");
+    assert_request(&request, "GET", "/apirest.php/initSession");
+    server.abort();
+    assert!(outcome.is_err());
+}
+
+/// An earlier overall deadline wins over a longer operation timeout while a
+/// response is held. No second request can start after that observation.
+#[tokio::test]
+async fn held_response_is_bounded_by_the_earlier_overall_deadline() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for_with_timeout(
+        port,
+        identity.trust_anchor_pem.clone(),
+        Duration::from_secs(1),
+    );
+    let (started_tx, started_rx) = oneshot::channel();
+    let server = tokio::spawn(hold_one_response(listener, identity.acceptor, started_tx));
+    let cancellation = NeverCancelled;
+    let identity_context = IdentityContext::new("jdoe".to_owned(), vec![]);
+    let envelope = empty_desired_envelope();
+    let context =
+        SynchronizationContext::new(Instant::now() + Duration::from_millis(25), &cancellation);
+    let request = TargetAdapterRequest::new(&identity_context, &envelope, context);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(1), adapter.reconcile(request))
+        .await
+        .expect("overall deadline returns within the test bound");
+    let request = started_rx.await.expect("held server reports the request");
+    assert_request(&request, "GET", "/apirest.php/initSession");
+    server.abort();
+    assert!(outcome.is_err());
 }
 
 /// A synchronization deadline that has already elapsed before the adapter
