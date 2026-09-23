@@ -1,26 +1,21 @@
 #!/usr/bin/env bash
-# Tears down the disposable GLPI environment left running by bootstrap.sh
-# after a successful run. Safe to call multiple times.
+# Tear down the disposable environment created by bootstrap.sh.
 set -euo pipefail
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$script_dir"
-
-env_file="${script_dir}/.real-glpi-run-env"
-if [[ ! -f "$env_file" ]]; then
-  echo "No recorded disposable GLPI environment to tear down (${env_file} not found)." >&2
-  exit 0
+runtime_env="${GLPI_TEST_RUNTIME_ENV:-${1:-}}"
+if [[ -z "$runtime_env" || ! -f "$runtime_env" ]]; then
+  printf '%s\n' 'GLPI teardown requires GLPI_TEST_RUNTIME_ENV from bootstrap.sh.' >&2
+  exit 1
 fi
 
 # shellcheck disable=SC1090
-source "$env_file"
+source "$runtime_env"
+: "${PERMISSIONSYNC_GLPI_PROJECT_NAME:?runtime environment lacks project name}"
+: "${GLPI_TEST_RUNTIME_DIR:?runtime environment lacks runtime directory}"
 
-if [[ -n "${PERMISSIONSYNC_GLPI_PROJECT_NAME:-}" ]]; then
-  docker compose -p "$PERMISSIONSYNC_GLPI_PROJECT_NAME" down --volumes --remove-orphans || true
+if ! docker compose --env-file "$runtime_env" -p "$PERMISSIONSYNC_GLPI_PROJECT_NAME" down --volumes --remove-orphans; then
+  printf '%s\n' 'GLPI teardown failed: docker compose down did not complete.' >&2
+  exit 1
 fi
 
-if [[ -n "${PERMISSIONSYNC_GLPI_TLS_DIR:-}" ]]; then
-  rm -rf "$PERMISSIONSYNC_GLPI_TLS_DIR"
-fi
-
-rm -f "$env_file"
+rm -rf "$GLPI_TEST_RUNTIME_DIR"

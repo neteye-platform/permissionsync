@@ -1,58 +1,14 @@
 <?php
 /**
- * Disposable, ephemeral GLPI bootstrap for the permissionsync real-GLPI
- * integration suite (ADR 0009 "Two-layer test policy").
+ * Provision the disposable GLPI instance used by the real adapter suite.
  *
- * This script runs INSIDE the disposable GLPI container (via
- * `docker compose exec glpi php bootstrap.php`) after GLPI's base
- * install/HTTP readiness is proven, and BEFORE the V1 apirest.php API is
- * exercised by any adapter test. It provisions everything the real suite
- * needs using GLPI's own PHP object API rather than raw SQL, so that
- * token storage goes through the same encryption GLPI performs for any
- * real deployment:
- *
- *   - GLPIKey::encrypt() is invoked transparently by
- *     User::prepareInputForAdd()/prepareInputForUpdate() and by
- *     APIClient's own input preparation whenever a token field is present
- *     in the array passed to add()/update(). A raw `INSERT ... app_token =
- *     '<plaintext>'` (as this repository's prior bootstrap did) stores a
- *     value GLPI never encrypted itself, which GLPI's own decryption path
- *     cannot be trusted to accept.
- *
- * It provisions:
- *
- *   1. the V1 REST API configuration (enable_api,
- *      enable_api_login_external_token) via Config, not raw SQL;
- *   2. a dedicated, least-privilege service-account Profile granting only
- *      the rights ADR 0009 requires (find/create users, read/create/delete
- *      Profile_User) -- not Super-Admin;
- *   3. a dedicated ephemeral service-account User with an encrypted
- *      api_token, complete Profile_User visibility over the root entity
- *      (recursive), and login-with-password left disabled;
- *   4. a dedicated APIClient application token restricted to that
- *      account's usage.
- *
- * The generated PLAINTEXT App-Token and User-Token are printed to stdout
- * (as `APP_TOKEN=...` / `USER_TOKEN=...` lines) for the calling shell
- * script to capture -- this is the only place the plaintext value ever
- * exists outside GLPI's own encrypted storage.
- *
- * NOTE: this script has NOT been executed against a real GLPI 11.0.9
- * container in this environment (Docker is unavailable here). The exact
- * bootstrap entrypoint (`inc/includes.php`), the exact `Profile` rights
- * bitmask constants used below, and the exact `User`/`APIClient` field
- * names are derived from GLPI 11.0.x upstream source
- * (src/User.php, src/GLPIKey.php, src/APIClient.php, src/Profile.php) but
- * MUST be verified against an actual running container before this is
- * relied upon in CI. If GLPI 11.0.9's bootstrap entrypoint or field names
- * differ from what is used here, this script will fail loudly (GLPI class
- * autoloading/instantiation errors), not silently produce wrong output.
+ * This is deliberately run through GLPI's normal CLI bootstrap and a real
+ * administrative Auth login. It does not manufacture a PHP session. The
+ * installed GLPI dataset creates the temporary ``glpi``/``glpi`` administrator
+ * (install/empty_data.php); Auth::login() establishes its complete session.
+ * Docker is unavailable locally, so the real suite has not been executed here.
  */
 
-// GLPI's own front controllers (public/index.php, public/apirest.php) all
-// bootstrap through this legacy-compatible include. GLPI 10/11 still ship
-// it for CLI scripts and plugins even though most first-party code moved
-// to src/ with Composer autoloading.
 define('GLPI_ROOT', '/var/www/html');
 chdir(GLPI_ROOT);
 require_once GLPI_ROOT . '/inc/includes.php';
@@ -63,114 +19,112 @@ function bootstrap_fail(string $message): void
     exit(1);
 }
 
-// A CLI/administrative session is required for User::add()/Profile::add()
-// authorization checks. GLPI's own `bin/console` commands establish an
-// internal privileged session the same way.
-Session::start();
-if (!Session::loadGroups()) {
-    // loadGroups() is harmless if it fails before a real session exists;
-    // the actual privilege escalation below is what matters.
+function add_profile_or_fail(string $name, array $rights = []): int
+{
+    $profile = new Profile();
+    $profile_id = $profile->add(array_merge([
+        'name'       => $name,
+        'interface'  => 'central',
+        'is_default' => 0,
+    ], $rights));
+    if (!$profile_id) {
+        bootstrap_fail("failed to create profile {$name}");
+    }
+    return (int) $profile_id;
 }
-$_SESSION['glpi_use_mode'] = Session::NORMAL_MODE;
-$_SESSION['glpiactive_entity'] = 0;
-$_SESSION['glpiactive_entity_recursive'] = true;
-$_SESSION['glpiactiveentities'] = [0];
-$_SESSION['glpiactiveentities_string'] = '0';
-$_SESSION['glpiname'] = 'permissionsync-bootstrap';
-$_SESSION['glpiID'] = 2; // GLPI's seeded super-admin user id, CLI-only, never used by the adapter itself.
-$_SESSION['glpiactiveprofile'] = Profile_User::getForUser(2, true)[0] ?? null;
-if (!$_SESSION['glpiactiveprofile']) {
-    bootstrap_fail('could not establish an administrative bootstrap session');
-}
-$_SESSION['glpiactiveprofile'] = Profile::getProfileWithRights($_SESSION['glpiactiveprofile']['profiles_id'] ?? 4);
 
-// 1. Enable the V1 REST API surface through Config, matching what the
-//    GLPI setup UI itself would write.
+Session::destroy();
+Session::start();
+$auth = new Auth();
+if (!$auth->login('glpi', 'glpi', true)) {
+    bootstrap_fail('the disposable GLPI administrator login failed');
+}
+if (!Session::haveRight('profile', UPDATE) || !Session::haveRight('config', UPDATE)) {
+    bootstrap_fail('the disposable GLPI administrator lacks the required rights');
+}
+
 Config::setConfigurationValues('core', [
-    'enable_api' => 1,
+    'enable_api'                      => 1,
     'enable_api_login_external_token' => 1,
 ]);
 
-// 2. Dedicated, least-privilege profile: only User read/create and
-//    Profile_User (assign_user) read/create/delete, per ADR 0009
-//    ("only the GLPI rights needed to find/create users and manage their
-//    Profile_User assignments").
-$profile = new Profile();
-$profile_id = $profile->add([
-    'name'              => 'permissionsync-service-account',
-    'interface'         => 'central',
-    'is_default'        => 0,
-]);
-if (!$profile_id) {
-    bootstrap_fail('failed to create the dedicated service-account profile');
+// Blank target profiles are strictly below the service profile: GLPI 11.0.9
+// Profile::currentUserHaveMoreRightThan() compares every profile right, so the
+// service-only grants below make each zero-right target legitimately assignable.
+$target_profiles = [];
+foreach (['a', 'b', 'c'] as $suffix) {
+    $target_profiles[$suffix] = add_profile_or_fail("permissionsync-target-{$suffix}");
 }
-$profile->update([
-    'id'                       => $profile_id,
-    'user'                     => READ | CREATE,
-    'user_authtype'            => READ,
-    'assign_user'              => READ | CREATE | DELETE | PURGE,
-    'entity'                   => READ,
-    'profile'                  => READ,
+// Keep a deterministic pool large enough for the deferred >50-row pagination
+// scenario without giving adapter payloads any built-in GLPI profile.
+for ($index = 1; $index <= 60; ++$index) {
+    add_profile_or_fail(sprintf('permissionsync-pagination-target-%02d', $index));
+}
+
+// Profile_User has no independent "assign_user" right in GLPI 11.0.9. Its
+// canCreateItem() requires User READ, entity visibility, and a strictly lower
+// target profile. These are the only service grants needed by this suite.
+$service_profile_id = add_profile_or_fail('permissionsync-service-account', [
+    'user'    => READ | CREATE | UPDATE | DELETE | PURGE,
+    'entity'  => READ,
+    'profile' => READ,
 ]);
 
-// 3. Dedicated ephemeral service-account user. `password` is intentionally
-//    omitted (no login-with-password); `api_token` is generated through
-//    User::add()'s own token-preparation path so GLPIKey encrypts it
-//    exactly the way a real deployment's token would be encrypted.
-$user = new User();
 $service_username = 'permissionsync-service-' . bin2hex(random_bytes(6));
-$user_id = $user->add([
+$service_user = new User();
+$service_user_id = $service_user->add([
     'name'          => $service_username,
-    '_useremails'   => [],
     'is_active'     => 1,
-    'api_token'     => User::getUniqueToken('api_token'),
+    'profiles_id'   => $service_profile_id,
+    '_profiles_id'  => $service_profile_id,
+    '_entities_id'  => 0,
+    '_is_recursive' => 1,
+    '_useremails'   => [],
 ]);
-if (!$user_id) {
+if (!$service_user_id) {
     bootstrap_fail('failed to create the dedicated service-account user');
 }
-// Reload to obtain the plaintext token GLPI generated/encrypted for us:
-// GLPI exposes the plaintext value transiently via getFromDB()+getAuthToken()
-// immediately after creation, before any additional round trip.
-$user->getFromDB($user_id);
-$user_token_plaintext = $user->getAuthToken('api_token');
-if (!$user_token_plaintext) {
-    bootstrap_fail('failed to read back the generated user api_token');
+
+// User::getToken() is GLPI's supported API-token generation path. It saves via
+// User::update(), which encrypts api_token; read the stored field through the
+// same GLPIKey::decrypt() path used by User::getFromDBbyToken() (11.0.9
+// src/User.php and src/GLPIKey.php), never by raw SQL.
+$generated_user_token = User::getToken((int) $service_user_id, 'api_token');
+if (!is_string($generated_user_token) || $generated_user_token === '') {
+    bootstrap_fail('failed to generate the service-account API token');
+}
+if (!$service_user->getFromDB((int) $service_user_id)) {
+    bootstrap_fail('failed to reload the dedicated service-account user');
+}
+$user_token_plaintext = (new GLPIKey())->decrypt($service_user->fields['api_token'] ?? null);
+if (!is_string($user_token_plaintext) || $user_token_plaintext === '' || $user_token_plaintext !== $generated_user_token) {
+    bootstrap_fail('failed to decrypt the stored service-account API token');
 }
 
-// Complete Profile_User visibility over the root entity, recursive, using
-// the dedicated least-privilege profile (not Super-Admin).
-$profile_user = new Profile_User();
-$profile_user_id = $profile_user->add([
-    'users_id'      => $user_id,
-    'profiles_id'   => $profile_id,
-    'entities_id'   => 0,
-    'is_recursive'  => 1,
-]);
-if (!$profile_user_id) {
-    bootstrap_fail('failed to grant the dedicated service-account its Profile_User assignment');
-}
-
-// 4. Dedicated APIClient application token, generated the same way
-//    (App::getUniqueToken triggers GLPIKey encryption on add()).
+// APIClient::prepareInputForUpdate() creates and encrypts app_token only when
+// _reset_app_token is set. This is the GLPI 11.0.9 supported creation flow;
+// getUniqueAppToken() is deliberately left to that method rather than copied.
 $api_client = new APIClient();
 $api_client_id = $api_client->add([
-    'name'          => 'permissionsync-real-integration',
-    'is_active'     => 1,
-    'entities_id'   => 0,
-    'is_recursive'  => 1,
+    'name'             => 'permissionsync-real-integration',
+    'is_active'        => 1,
+    'entities_id'      => 0,
+    'is_recursive'     => 1,
     'ipv4_range_start' => null,
     'ipv4_range_end'   => null,
-    'app_token'     => APIClient::getUniqueToken('app_token'),
+    '_reset_app_token' => 1,
 ]);
-if (!$api_client_id) {
+if (!$api_client_id || !$api_client->getFromDB((int) $api_client_id)) {
     bootstrap_fail('failed to create the dedicated API client');
 }
-$api_client->getFromDB($api_client_id);
-$app_token_plaintext = $api_client->getAuthToken();
-if (!$app_token_plaintext) {
-    bootstrap_fail('failed to read back the generated app_token');
+$app_token_plaintext = (new GLPIKey())->decrypt($api_client->fields['app_token'] ?? null);
+if (!is_string($app_token_plaintext) || $app_token_plaintext === '') {
+    bootstrap_fail('failed to decrypt the stored application token');
 }
 
 echo "APP_TOKEN={$app_token_plaintext}\n";
 echo "USER_TOKEN={$user_token_plaintext}\n";
 echo "SERVICE_USERNAME={$service_username}\n";
+echo "TARGET_PROFILE_A=permissionsync-target-a\n";
+echo "TARGET_PROFILE_B=permissionsync-target-b\n";
+echo "TARGET_PROFILE_C=permissionsync-target-c\n";

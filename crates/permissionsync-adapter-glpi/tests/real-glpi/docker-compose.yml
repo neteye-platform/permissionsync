@@ -1,6 +1,6 @@
 services:
   db:
-    image: mariadb:11.4@sha256:70cc072b29b4a89ae07abb2d4da2c64678a7f2dfe092751bb51c87d67dc1338b
+    image: mariadb:11.4.13@sha256:70cc072b29b4a89ae07abb2d4da2c64678a7f2dfe092751bb51c87d67dc1338b
     environment:
       MARIADB_ROOT_PASSWORD: ${GLPI_TEST_DB_ROOT_PASSWORD:?db root password required}
       MARIADB_DATABASE: glpi
@@ -34,11 +34,13 @@ services:
       interval: 3s
       timeout: 3s
       retries: 60
+    volumes:
+      - ./bootstrap.php:/var/www/html/bootstrap.php:ro
     ports:
       - "${GLPI_TEST_HTTP_PORT:?http port required}:80"
 
   tls-proxy:
-    image: nginx:1.27@sha256:6784fb0834aa7dbbe12e3d7471e69c290df3e6ba810dc38b34ae33d3c1c05f7d
+    image: nginx:1.27.5@sha256:6784fb0834aa7dbbe12e3d7471e69c290df3e6ba810dc38b34ae33d3c1c05f7d
     depends_on:
       glpi:
         condition: service_healthy
