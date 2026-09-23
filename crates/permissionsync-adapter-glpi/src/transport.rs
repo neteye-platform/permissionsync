@@ -37,7 +37,7 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use tokio::{net::TcpStream, time::timeout_at};
-use url::Url;
+use url::{Host, Url};
 
 use crate::error::GlpiFailure;
 
@@ -97,18 +97,14 @@ async fn run(
 ) -> Result<RawResponse, GlpiFailure> {
     check_deadline(effective_deadline)?;
 
-    let host = url.host_str().ok_or(GlpiFailure::Transport)?;
+    let host = normalize_host(url.host().ok_or(GlpiFailure::Transport)?);
     let port = url.port_or_known_default().ok_or(GlpiFailure::Transport)?;
     let uri: Uri = url.as_str().parse().map_err(|_| GlpiFailure::Transport)?;
     let path_and_query = uri.path_and_query().ok_or(GlpiFailure::Transport)?.clone();
 
     // The Host header must include an explicit non-default port so the
     // request authority is unambiguous; `https` default is 443.
-    let host_header_value = if port == 443 {
-        host.to_owned()
-    } else {
-        format!("{host}:{port}")
-    };
+    let host_header_value = host_header_authority(&host, port);
 
     let has_body = body.is_some();
     let body_bytes = body.unwrap_or_default();
@@ -127,13 +123,13 @@ async fn run(
         .map_err(|_| GlpiFailure::Transport)?;
 
     check_deadline(effective_deadline)?;
-    let address = resolve_one_address(host, port, effective_deadline).await?;
+    let address = resolve_one_address(&host.connection_host, port, effective_deadline).await?;
     check_deadline(effective_deadline)?;
     let tcp_stream = connect_to_address(&TcpConnector, address).await?;
 
     check_deadline(effective_deadline)?;
     let tls_stream = tls_connector
-        .connect(host, tcp_stream)
+        .connect(&host.tls_server_name, tcp_stream)
         .await
         .map_err(|_| GlpiFailure::Transport)?;
 
@@ -231,6 +227,66 @@ fn accumulate_within_limit(
     Ok(next_total)
 }
 
+/// A parsed endpoint host, with representations appropriate for connection,
+/// TLS verification, and HTTP authority serialization.
+struct NormalizedHost {
+    connection_host: ConnectionHost,
+    tls_server_name: String,
+    authority: String,
+}
+
+/// A host represented for address resolution. Literal IP addresses remain
+/// parsed so they cannot be mistaken for DNS names.
+#[derive(Debug, Eq, PartialEq)]
+enum ConnectionHost {
+    Domain(String),
+    Ip(IpAddr),
+}
+
+/// Converts [`Url::host`] into the representations required by each transport
+/// layer. In particular, `url` serializes IPv6 literals with brackets for an
+/// authority, but TCP and TLS require the bare address.
+fn normalize_host(host: Host<&str>) -> NormalizedHost {
+    match host {
+        Host::Domain(domain) => {
+            let domain = domain.to_owned();
+            NormalizedHost {
+                connection_host: ConnectionHost::Domain(domain.clone()),
+                tls_server_name: domain.clone(),
+                authority: domain,
+            }
+        }
+        Host::Ipv4(address) => {
+            let address = IpAddr::V4(address);
+            let address_text = address.to_string();
+            NormalizedHost {
+                connection_host: ConnectionHost::Ip(address),
+                tls_server_name: address_text.clone(),
+                authority: address_text,
+            }
+        }
+        Host::Ipv6(address) => {
+            let address = IpAddr::V6(address);
+            let address_text = address.to_string();
+            NormalizedHost {
+                connection_host: ConnectionHost::Ip(address),
+                tls_server_name: address_text.clone(),
+                authority: format!("[{address_text}]"),
+            }
+        }
+    }
+}
+
+/// Formats the HTTP `Host` authority, retaining brackets only where RFC
+/// authority syntax requires them for IPv6 literals.
+fn host_header_authority(host: &NormalizedHost, port: u16) -> String {
+    if port == 443 {
+        host.authority.clone()
+    } else {
+        format!("{}:{port}", host.authority)
+    }
+}
+
 /// Resolves `host` to exactly one [`SocketAddr`], mirroring
 /// `permissionsync-provider-generic-rest`'s single-attempt resolution
 /// (`crates/permissionsync-provider-generic-rest/src/client.rs`,
@@ -246,13 +302,14 @@ fn accumulate_within_limit(
 /// IPv4 is preferred; otherwise the first usable family supplies the one
 /// connection address.
 async fn resolve_one_address(
-    host: &str,
+    host: &ConnectionHost,
     port: u16,
     effective_deadline: Instant,
 ) -> Result<SocketAddr, GlpiFailure> {
-    if let Ok(address) = host.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(address, port));
-    }
+    let host = match host {
+        ConnectionHost::Domain(host) => host,
+        ConnectionHost::Ip(address) => return Ok(SocketAddr::new(*address, port)),
+    };
 
     let mut name = Name::from_str(host).map_err(|_| GlpiFailure::Transport)?;
     name.set_fqdn(true);
@@ -526,10 +583,12 @@ mod tests {
     use std::{cell::Cell, net::SocketAddr};
 
     use super::{
-        Connector, RESPONSE_BODY_LIMIT_BYTES, accumulate_within_limit, connect_to_address,
-        resolve_one_address, selected_socket_address,
+        ConnectionHost, Connector, RESPONSE_BODY_LIMIT_BYTES, accumulate_within_limit,
+        connect_to_address, host_header_authority, normalize_host, resolve_one_address,
+        selected_socket_address,
     };
     use crate::error::GlpiFailure;
+    use url::{Host, Url};
 
     #[test]
     fn production_response_body_limit_is_exactly_two_mebibytes() {
@@ -570,14 +629,57 @@ mod tests {
 
     #[tokio::test]
     async fn literal_ip_host_resolves_without_dns_state_or_query() {
-        let address = resolve_one_address("192.0.2.44", 8443, std::time::Instant::now())
-            .await
-            .expect("literal address must resolve directly");
+        let address = resolve_one_address(
+            &ConnectionHost::Ip("192.0.2.44".parse().expect("IPv4 address")),
+            8443,
+            std::time::Instant::now(),
+        )
+        .await
+        .expect("literal address must resolve directly");
 
         assert_eq!(
             address,
             "192.0.2.44:8443".parse::<SocketAddr>().expect("address")
         );
+    }
+
+    #[test]
+    fn url_2_5_8_brackets_ipv6_host_str_but_exposes_an_ipv6_host() {
+        let url = Url::parse("https://[2001:db8::44]:8443/apirest.php").expect("IPv6 URL");
+
+        assert_eq!(url.host_str(), Some("[2001:db8::44]"));
+        assert!(matches!(url.host(), Some(Host::Ipv6(_))));
+    }
+
+    #[tokio::test]
+    async fn ipv6_host_normalization_uses_bare_tls_name_and_literal_connection_address() {
+        let url = Url::parse("https://[2001:db8::44]:8443/apirest.php").expect("IPv6 URL");
+        let host = normalize_host(url.host().expect("host"));
+
+        assert_eq!(host.tls_server_name, "2001:db8::44");
+        assert_eq!(
+            host.connection_host,
+            ConnectionHost::Ip("2001:db8::44".parse().expect("IPv6 address"))
+        );
+
+        let address = resolve_one_address(&host.connection_host, 8443, std::time::Instant::now())
+            .await
+            .expect("IPv6 literal must not be sent to DNS");
+        assert_eq!(
+            address,
+            "[2001:db8::44]:8443"
+                .parse::<SocketAddr>()
+                .expect("socket address")
+        );
+    }
+
+    #[test]
+    fn host_header_authority_brackets_ipv6_and_retains_explicit_port() {
+        let url = Url::parse("https://[::1]:8443/apirest.php").expect("IPv6 URL");
+        let host = normalize_host(url.host().expect("host"));
+
+        assert_eq!(host_header_authority(&host, 8443), "[::1]:8443");
+        assert_eq!(host_header_authority(&host, 443), "[::1]");
     }
 
     /// A hermetic resolver integration test cannot provide multiple DNS
