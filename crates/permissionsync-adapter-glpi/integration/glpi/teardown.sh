@@ -9,8 +9,8 @@ if [[ -z "$runtime_env" ]]; then
 fi
 
 if [[ ! -f "$runtime_env" ]]; then
-  printf '%s\n' 'GLPI runtime environment is missing; nothing to tear down.'
-  exit 0
+  printf '%s\n' 'GLPI_TEST_RUNTIME_ENV is set but its runtime env file no longer exists; cleanup state has been unexpectedly lost.' >&2
+  exit 1
 fi
 
 safe_runtime_dir=''
