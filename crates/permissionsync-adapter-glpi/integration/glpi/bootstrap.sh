@@ -3,7 +3,9 @@
 # NOTE: Docker is unavailable in the current development environment, so this
 # bootstrap and the real suite remain unexecuted locally.
 # diagnostics.sh and teardown.sh own failure diagnostics and destructive
-# cleanup, respectively.
+# cleanup, respectively. On a local failure after the runtime directory is
+# created, this script reports the safe runtime-env locator (never its
+# contents) on stderr so diagnostics/teardown can still be run manually.
 set -euo pipefail
 
 runtime_base="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
@@ -26,6 +28,37 @@ env_put() {
   escaped="${value//\'/\'\\\'}"
   printf "%s='%s'\n" "$name" "$escaped" >> "$runtime_env"
 }
+
+# GitHub `::add-mask::` workflow commands only make sense (and are only safe)
+# inside GitHub Actions: outside of it they are ordinary stdout, and the
+# documented local usage is `source <(bootstrap.sh)`, where a local shell
+# would otherwise try to execute `::add-mask::<secret>` as a command and could
+# echo the secret in the resulting error. Gate masking on GITHUB_ACTIONS so
+# local stdout never contains it.
+mask_secret() {
+  if [[ "${GITHUB_ACTIONS:-}" == 'true' ]]; then
+    printf '::add-mask::%s\n' "$1"
+  fi
+}
+
+# If bootstrap fails after the runtime directory (and possibly containers)
+# already exist, print only the safe runtime-env locator plus the follow-up
+# commands, never runtime.env contents or credentials, and never delete
+# anything here: diagnostics.sh/teardown.sh own that. The original bootstrap
+# exit status is preserved.
+report_recovery_on_failure() {
+  local status=$?
+  if ((status != 0)); then
+    {
+      printf '%s\n' 'Bootstrap failed after creating a disposable runtime directory.'
+      printf 'Runtime env locator: %s\n' "$runtime_env"
+      printf 'Diagnostics: GLPI_TEST_RUNTIME_ENV=%q ./diagnostics.sh\n' "$runtime_env"
+      printf 'Teardown:   GLPI_TEST_RUNTIME_ENV=%q ./teardown.sh\n' "$runtime_env"
+    } >&2
+  fi
+  exit "$status"
+}
+trap report_recovery_on_failure EXIT
 
 env_put GLPI_TEST_DB_ROOT_PASSWORD "$(openssl rand -hex 24)"
 env_put GLPI_TEST_DB_PASSWORD "$(openssl rand -hex 24)"
@@ -120,9 +153,9 @@ PY
 
 # shellcheck disable=SC1090
 source "$runtime_env"
-printf '::add-mask::%s\n' "$GLPI_TEST_APP_TOKEN"
-printf '::add-mask::%s\n' "$GLPI_TEST_USER_TOKEN"
-printf '::add-mask::%s\n' "$GLPI_TEST_TOPOLOGY_USER_TOKEN"
+mask_secret "$GLPI_TEST_APP_TOKEN"
+mask_secret "$GLPI_TEST_USER_TOKEN"
+mask_secret "$GLPI_TEST_TOPOLOGY_USER_TOKEN"
 
 if ! compose up -d --wait --wait-timeout 60 tls-proxy >/dev/null; then
   printf '%s\n' 'GLPI tls-proxy did not start.' >&2
@@ -165,7 +198,7 @@ print(value)
 PY
 )" || session_token=''
     if [[ -n "$session_token" ]]; then
-      printf '::add-mask::%s\n' "$session_token"
+      mask_secret "$session_token"
       curl --cacert "${tls_dir}/ca.crt" --silent --show-error --output /dev/null \
         -H "Session-Token: ${session_token}" \
         -H "App-Token: ${GLPI_TEST_APP_TOKEN}" \
