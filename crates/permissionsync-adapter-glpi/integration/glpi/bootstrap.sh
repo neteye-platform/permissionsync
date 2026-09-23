@@ -191,6 +191,23 @@ env_put GLPI_TEST_CLEANUP_HTTPS_PORT "$cleanup_https_port"
 # shellcheck disable=SC1090
 source "$runtime_env"
 
+# `cleanup-proxy` has no Docker healthcheck, so `compose up --wait` only
+# proves the container is running, not that its dedicated 8444 HTTPS listener
+# already accepts connections. Probe a non-mutating, unauthenticated path
+# proxied to real GLPI to prove TLS (via the generated CA), the 8444 listener,
+# and reachability to the real GLPI container all work. This deliberately
+# never requests `/apirest.php/killSession`, so it cannot write to the
+# dedicated `killsession.log` before the cleanup test runs.
+cleanup_proxy_deadline=$((SECONDS + 60))
+until curl --cacert "${tls_dir}/ca.crt" --fail --silent --show-error --output /dev/null \
+  "https://127.0.0.1:${GLPI_TEST_CLEANUP_HTTPS_PORT}/status.php"; do
+  if ((SECONDS > cleanup_proxy_deadline)); then
+    printf '%s\n' 'cleanup-proxy HTTPS readiness timed out.' >&2
+    exit 1
+  fi
+  sleep 2
+done
+
 # GLPI_TEST_ENDPOINT depends on the real (not preselected) HTTPS port, so it
 # is computed only now that port is known.
 env_put GLPI_TEST_ENDPOINT "https://127.0.0.1:${GLPI_TEST_HTTPS_PORT}/apirest.php"
