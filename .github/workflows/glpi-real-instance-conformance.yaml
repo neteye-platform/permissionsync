@@ -1,4 +1,4 @@
-name: GLPI Real Integration
+name: GLPI Adapter Conformance (Real Instance)
 
 on:
   pull_request:
@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  glpi-real-integration:
-    name: GLPI Real Integration
+  real-glpi-conformance:
+    name: Real GLPI Conformance
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -39,9 +39,16 @@ jobs:
       - name: Collect GLPI container logs on failure
         if: failure()
         working-directory: crates/permissionsync-adapter-glpi/tests/real-glpi
-        run: docker compose logs --no-color glpi db tls-proxy || true
+        run: |
+          if [[ -f .real-glpi-run-env ]]; then
+            # shellcheck disable=SC1091
+            source .real-glpi-run-env
+          fi
+          if [[ -n "${PERMISSIONSYNC_GLPI_PROJECT_NAME:-}" ]]; then
+            docker compose -p "$PERMISSIONSYNC_GLPI_PROJECT_NAME" logs --no-color glpi db tls-proxy || true
+          fi
 
       - name: Tear down the disposable environment
         if: always()
         working-directory: crates/permissionsync-adapter-glpi/tests/real-glpi
-        run: docker compose down --volumes --remove-orphans
+        run: ./teardown.sh
