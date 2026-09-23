@@ -9,10 +9,12 @@ deterministic runtime target routing, a concrete Generic REST Permission
 Provider, selected-target synchronization orchestration, and an internal
 `permissionsync-auth` boundary for technical-caller JWT verification and scope
 target selection, plus framework-neutral inbound HTTP request processing with
-authentication/authorization integration. Actual HTTP server/listener/routing,
-runtime configuration/composition, health/readiness, concrete Target Adapters,
-supported-Keycloak deployment contract tests, and OCI/runtime integration remain
-future work; the internal auth-crate tests are not a deployment claim.
+authentication/authorization integration and a concrete GLPI Target Adapter
+implementing the selected GLPI V1 reconciliation contract. Actual HTTP
+server/listener/routing, runtime configuration/composition, composition-root
+adapter wiring, health/readiness, supported-Keycloak deployment contract tests,
+and OCI/runtime integration remain future work; the internal auth-crate tests
+are not a deployment claim.
 
 ## Development
 
@@ -33,6 +35,12 @@ cargo build --workspace --all-features --locked
 cargo check --workspace --all-targets --all-features --locked
 cargo test --workspace --all-features --locked
 ```
+
+Normal Cargo tests remain hermetic and require neither Docker nor GLPI. The GLPI
+adapter additionally has a dedicated disposable
+[real-GLPI integration layer](crates/permissionsync-adapter-glpi/integration/glpi/)
+that CI executes through the
+[GLPI adapter test workflow](.github/workflows/glpi-adapter-tests.yaml).
 
 The dependency-policy check requires the exact, Renovate-managed
 `CARGO_DENY_VERSION` in
