@@ -9,7 +9,13 @@
 //! the adapter's single-attempt-per-operation transport), so this server
 //! accepts one connection per scripted request/response pair, in order.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use openssl::{
     asn1::Asn1Time,
@@ -293,6 +299,13 @@ fn one_permission_envelope() -> DesiredStateEnvelope {
     )
 }
 
+fn envelope_json(json: &str) -> DesiredStateEnvelope {
+    DesiredStateEnvelope::new(
+        EnvelopeVersion::new(1),
+        OpaquePayload::try_from(json.to_owned()).unwrap(),
+    )
+}
+
 async fn bind_loopback_listener() -> TcpListener {
     TcpListener::bind((LOOPBACK_ADDRESS, 0))
         .await
@@ -347,6 +360,243 @@ fn search_body(total: u64, rows: &[(u64, &str, &str)]) -> String {
     )
 }
 
+/// A scripted `Profile_User` candidate-discovery search response: one row
+/// per `(row_id, username)` pair, keyed by the "Profile_User.id" (`"1"`) and
+/// joined "User.name" (`"2"`) search-option ids.
+fn profile_user_search_body(total: u64, rows: &[(u64, &str)]) -> String {
+    let named_rows: Vec<(u64, &str, &str)> = rows
+        .iter()
+        .map(|(id, username)| (*id, *username, "2"))
+        .collect();
+    search_body(total, &named_rows)
+}
+
+/// A scripted `GET /apirest.php/Profile_User/:id` item-read response
+/// carrying the item's raw fields, as the generic V1 item endpoint returns
+/// them (never through any search-option id).
+fn profile_user_item_body(
+    id: u64,
+    users_id: u64,
+    profiles_id: u64,
+    entities_id: u64,
+    is_recursive: u64,
+) -> String {
+    format!(
+        r#"{{"id": {id}, "users_id": {users_id}, "profiles_id": {profiles_id}, "entities_id": {entities_id}, "is_recursive": {is_recursive}}}"#
+    )
+}
+
+// --- Request-inspection assertion support ------------------------------------
+//
+// The scripted fake server above already records the exact request line,
+// headers, and body for every accepted connection, in order. The helpers
+// below turn those raw recordings into structural assertions (method, path,
+// percent-decoded query parameters, header presence/absence/value, and
+// exact/structural JSON body) so tests fail if the adapter sends an
+// unexpected request, not merely when a connection count differs.
+
+type RecordedRequest = (String, Vec<(String, String)>, Vec<u8>);
+
+/// Splits one recorded HTTP/1.1 request line into its method, path, and
+/// percent-decoded query parameters. Percent-encoded characters (spaces,
+/// `>`, etc.) are decoded exactly once by `url::Url`'s standard query-pair
+/// decoding, proving the raw wire request really was percent-encoded in the
+/// first place (a request line containing a literal, unencoded space or `>`
+/// would not parse as one HTTP request line at all).
+fn parsed_request_line(line: &str) -> (String, String, Vec<(String, String)>) {
+    let mut parts = line.split(' ');
+    let method = parts.next().expect("request line has a method").to_owned();
+    let target = parts.next().expect("request line has a target").to_owned();
+    assert_eq!(
+        parts.next(),
+        Some("HTTP/1.1"),
+        "request line must be HTTP/1.1: {line}"
+    );
+    let placeholder = url::Url::parse("https://placeholder.example.test").unwrap();
+    let full_url = placeholder.join(&target).expect("valid request target");
+    let path = full_url.path().to_owned();
+    let query = full_url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    (method, path, query)
+}
+
+/// Asserts one recorded request's exact HTTP method and operation path.
+fn assert_request(recorded: &RecordedRequest, method: &str, path: &str) {
+    let (actual_method, actual_path, _) = parsed_request_line(&recorded.0);
+    assert_eq!(
+        actual_method, method,
+        "method for request line {}",
+        recorded.0
+    );
+    assert_eq!(actual_path, path, "path for request line {}", recorded.0);
+}
+
+/// Returns the percent-decoded value of one query parameter on a recorded
+/// request, if present.
+fn query_value(recorded: &RecordedRequest, key: &str) -> Option<String> {
+    let (_, _, query) = parsed_request_line(&recorded.0);
+    query
+        .into_iter()
+        .find(|(actual_key, _)| actual_key == key)
+        .map(|(_, value)| value)
+}
+
+/// Returns the exact header value (case-insensitive name lookup) recorded
+/// on a request, if present.
+fn header_value<'a>(recorded: &'a RecordedRequest, name: &str) -> Option<&'a str> {
+    recorded
+        .1
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn assert_header(recorded: &RecordedRequest, name: &str, expected_value: &str) {
+    assert_eq!(
+        header_value(recorded, name),
+        Some(expected_value),
+        "header {name} on request line {}",
+        recorded.0
+    );
+}
+
+fn assert_no_header(recorded: &RecordedRequest, name: &str) {
+    assert_eq!(
+        header_value(recorded, name),
+        None,
+        "unexpected header {name} on request line {}",
+        recorded.0
+    );
+}
+
+/// GET requests used by this adapter MUST be explicitly proven to have
+/// empty request bodies (see the module doc comment): every parameter is
+/// carried in the URL/query, never in a request body.
+fn assert_empty_body(recorded: &RecordedRequest) {
+    assert!(
+        recorded.2.is_empty(),
+        "expected an empty body for {}, got {:?}",
+        recorded.0,
+        recorded.2
+    );
+    assert_no_header(recorded, "content-type");
+}
+
+/// Asserts a mutation request's body is exactly the given structurally
+/// decoded JSON value, and that `Content-Type: application/json` was sent
+/// (JSON mutation requests MUST be proven to use `application/json`).
+fn assert_json_body(recorded: &RecordedRequest, expected: serde_json::Value) {
+    assert_header(recorded, "content-type", "application/json");
+    let actual: serde_json::Value =
+        serde_json::from_slice(&recorded.2).expect("request body is valid JSON");
+    assert_eq!(actual, expected, "body for request line {}", recorded.0);
+}
+
+/// A [`CancellationSignal`] that reports cancelled only once at least
+/// `threshold` scripted requests have already been fully answered by the
+/// fake server. Used to prove cancellation is observed at a specific point
+/// mid-reconciliation without any sleep or wall-clock race: the counter is
+/// incremented by the fake server strictly before it writes each scripted
+/// response, and the adapter always awaits a response before its next
+/// cancellation check, so the ordering is deterministic.
+struct CancelAfterRequests {
+    completed: Arc<AtomicUsize>,
+    threshold: usize,
+}
+
+impl CancellationSignal for CancelAfterRequests {
+    fn is_cancelled(&self) -> bool {
+        self.completed.load(Ordering::SeqCst) >= self.threshold
+    }
+}
+
+/// Like [`run_scripted_server`], but increments `completed` immediately
+/// after reading (and before responding to) each request, and stops after
+/// the script is exhausted rather than requiring every entry to be
+/// consumed. Callers that expect early cancellation must `abort()` the
+/// spawned task once the adapter's outcome is available, since a shorter
+/// script is intentionally passed and the task would otherwise wait
+/// forever for a connection that will never come.
+async fn run_counted_scripted_server(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    script: Vec<ScriptedResponse>,
+    completed: Arc<AtomicUsize>,
+) -> Vec<RecordedRequest> {
+    let mut recorded = Vec::new();
+    for entry in script {
+        let (socket, _) = listener.accept().await.expect("accept connection");
+        let mut stream = acceptor.accept(socket).await.expect("tls handshake");
+        let request = read_request(&mut stream).await;
+        completed.fetch_add(1, Ordering::SeqCst);
+        let response = format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            entry.status_line,
+            entry.body.len()
+        );
+        let mut bytes = response.into_bytes();
+        bytes.extend_from_slice(&entry.body);
+        stream.write_all(&bytes).await.expect("write response");
+        let _ = stream.shutdown().await;
+        recorded.push(request);
+    }
+    recorded
+}
+
+async fn reconcile_with_cancellation(
+    adapter: &GlpiAdapter,
+    envelope: &DesiredStateEnvelope,
+    cancellation: &CancelAfterRequests,
+) -> Result<ReconciliationOutcome, permissionsync_core::TargetAdapterError> {
+    let identity = IdentityContext::new("jdoe".to_owned(), vec![]);
+    let context = SynchronizationContext::new(far_future_deadline(), cancellation);
+    let request = TargetAdapterRequest::new(&identity, envelope, context);
+    adapter.reconcile(request).await
+}
+
+/// A generous over-long script for cancellation tests: cancellation must
+/// stop the adapter well before the script is exhausted, so any entries
+/// beyond the expected cut point exist only to prove (by never being
+/// consumed) that no further request was sent.
+fn oversized_script() -> Vec<ScriptedResponse> {
+    let mut script = vec![
+        ok(r#"{"session_token": "sess-1"}"#), // 1: initSession
+        ok("true"),                           // 2: changeActiveEntities
+        ok(&full_session_body(1)),            // 3: getFullSession
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])), // 4: listSearchOptions/Entity
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])), // 5: listSearchOptions/Profile
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])), // 6: listSearchOptions/User
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])), // 7: listSearchOptions/Profile_User
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])), // 8: search Entity
+        ok(&search_body(1, &[(20, "Technician", "2")])), // 9: search Profile
+        ok(&search_body(1, &[(30, "jdoe", "2")])), // 10: search User
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])), // 11: search Profile_User candidates
+        ok(&profile_user_item_body(99, 30, 40, 50, 0)), // 12: item read (not canonical -> plan has work: 1 removal + 1 addition)
+        ok("true"),                                     // 13: DELETE Profile_User/99 (removal)
+        created(r#"{"id": 100}"#),                      // 14: POST Profile_User (addition)
+        ok("true"),                                     // 15: killSession
+    ];
+    // Extra trailing entries that must never be consumed in tests that
+    // cancel earlier than this point.
+    script.push(ok("true"));
+    script.push(ok("true"));
+    script
+}
+
 // --- Conformance tests --------------------------------------------------------
 
 /// End-to-end happy path: existing user, no current assignments, one
@@ -377,17 +627,14 @@ async fn full_reconciliation_creates_the_missing_assignment_and_returns_changed(
         ])), // listSearchOptions/User
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "Profile_User.users_id"),
-            ("3", "Profile_User.profiles_id"),
-            ("4", "Profile_User.entities_id"),
-            ("5", "Profile_User.is_recursive"),
+            ("2", "User.name"),
         ])), // listSearchOptions/Profile_User
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])), // search Entity
         ok(&search_body(1, &[(20, "Technician", "2")])), // search Profile
         ok(&search_body(1, &[(30, "jdoe", "2")])), // search User
-        ok(r#"{"totalcount": 0, "count": 0, "range": "0-0", "data": []}"#), // search Profile_User (current)
-        created(r#"{"id": 99}"#),                                           // POST Profile_User
-        ok("true"),                                                         // killSession
+        ok(&profile_user_search_body(0, &[])), // search Profile_User (candidate discovery: none)
+        created(r#"{"id": 99}"#),             // POST Profile_User
+        ok("true"),                           // killSession
     ];
 
     let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
@@ -438,24 +685,16 @@ async fn ambiguous_user_lookup_is_a_failure() {
         ok(r#"{"session_token": "sess-1"}"#),
         ok("true"),
         ok(&full_session_body(1)),
-        ok(&search_options_body(&[
-            ("1", "Entity.id"),
-            ("2", "Entity.completename"),
-        ])),
-        ok(&search_options_body(&[
-            ("1", "Profile.id"),
-            ("2", "Profile.name"),
-        ])),
+        // No `permissions` entries are desired, so Entity/Profile
+        // resolution is never performed and their listSearchOptions
+        // requests never happen.
         ok(&search_options_body(&[
             ("1", "User.id"),
             ("2", "User.name"),
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "Profile_User.users_id"),
-            ("3", "Profile_User.profiles_id"),
-            ("4", "Profile_User.entities_id"),
-            ("5", "Profile_User.is_recursive"),
+            ("2", "User.name"),
         ])),
         ok(&search_body(2, &[(30, "jdoe", "2"), (31, "jdoe", "2")])), // two exact User matches
         ok("true"),                                                   // killSession
@@ -550,28 +789,20 @@ async fn cleanup_failure_after_success_becomes_the_returned_failure() {
         ok(r#"{"session_token": "sess-1"}"#),
         ok("true"),
         ok(&full_session_body(1)),
-        ok(&search_options_body(&[
-            ("1", "Entity.id"),
-            ("2", "Entity.completename"),
-        ])),
-        ok(&search_options_body(&[
-            ("1", "Profile.id"),
-            ("2", "Profile.name"),
-        ])),
+        // No `permissions` entries are desired, so Entity/Profile
+        // resolution is never performed and their listSearchOptions
+        // requests never happen.
         ok(&search_options_body(&[
             ("1", "User.id"),
             ("2", "User.name"),
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "Profile_User.users_id"),
-            ("3", "Profile_User.profiles_id"),
-            ("4", "Profile_User.entities_id"),
-            ("5", "Profile_User.is_recursive"),
+            ("2", "User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])), // search User: existing
-        ok(r#"{"totalcount": 0, "count": 0, "range": "0-0", "data": []}"#), // current assignments empty
-        json_response("500 Internal Server Error", "{}"),                   // killSession fails
+        ok(&profile_user_search_body(0, &[])), // search Profile_User (candidate discovery: none)
+        json_response("500 Internal Server Error", "{}"), // killSession fails
     ];
 
     let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
@@ -613,18 +844,16 @@ async fn idempotent_second_reconciliation_of_an_already_canonical_state_is_uncha
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "Profile_User.users_id"),
-            ("3", "Profile_User.profiles_id"),
-            ("4", "Profile_User.entities_id"),
-            ("5", "Profile_User.is_recursive"),
+            ("2", "User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
-        // Current state already has exactly the canonical row.
-        ok(
-            r#"{"totalcount": 1, "count": 1, "range": "0-0", "data": [{"1": 99, "2": 30, "3": 20, "4": 10, "5": true}]}"#,
-        ),
+        // Candidate discovery: one Profile_User row belongs to "jdoe".
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        // Item read of that candidate row's raw fields; already the
+        // canonical row.
+        ok(&profile_user_item_body(99, 30, 20, 10, 1)),
         ok("true"), // killSession
     ];
 
@@ -666,6 +895,2109 @@ async fn pre_cancelled_context_makes_zero_requests() {
     match listener.try_accept_nonblocking() {
         Err(kind) => assert_eq!(kind, std::io::ErrorKind::WouldBlock),
         Ok(()) => panic!("adapter unexpectedly connected to GLPI while already cancelled"),
+    }
+}
+
+// =============================================================================
+// PAYLOAD / ZERO-I/O VALIDATION
+// =============================================================================
+
+/// Every structurally invalid v1 payload is rejected before any GLPI
+/// request, regardless of which structural rule it violates.
+#[tokio::test]
+async fn every_structurally_invalid_payload_makes_zero_glpi_requests() {
+    let invalid_payloads = [
+        "null",
+        "42",
+        "[]",
+        "\"permissions\"",
+        "{}",
+        r#"{"permissions": [], "unexpected": true}"#,
+        r#"{"permissions": {}}"#,
+        r#"{"permissions": "x"}"#,
+        r#"{"permissions": [{"entity": "e", "profile": "p"}]}"#,
+        r#"{"permissions": [{"entity": "e", "recursive": true}]}"#,
+        r#"{"permissions": [{"profile": "p", "recursive": true}]}"#,
+        r#"{"permissions": [{"entity": 1, "profile": "p", "recursive": true}]}"#,
+        r#"{"permissions": [{"entity": "e", "profile": "p", "recursive": "true"}]}"#,
+        r#"{"permissions": [{"entity": "e", "profile": "p", "recursive": true, "extra": 1}]}"#,
+        r#"{"permissions": [{"entity": "", "profile": "p", "recursive": true}]}"#,
+        r#"{"permissions": [{"entity": "e", "profile": "", "recursive": true}]}"#,
+        r#"{"permissions": [], "permissions": []}"#,
+        r#"{"permissions": [{"entity": "e", "entity": "e", "profile": "p", "recursive": true}]}"#,
+        r#"{"permissions": [{"entity": "e", "profile": "p", "profile": "p", "recursive": true}]}"#,
+        r#"{"permissions": [{"entity": "e", "profile": "p", "recursive": true, "recursive": false}]}"#,
+        // An invalid repeated permission entry (wrong type on the second
+        // occurrence) must not be hidden by normalization deduplicating the
+        // first, otherwise-valid, occurrence.
+        r#"{"permissions": [
+            {"entity": "e", "profile": "p", "recursive": true},
+            {"entity": "e", "profile": "p", "recursive": "true"}
+        ]}"#,
+    ];
+
+    for payload in invalid_payloads {
+        let listener = bind_loopback_listener().await;
+        let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+        let port = listener.local_addr().unwrap().port();
+        let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+        let envelope = envelope_json(payload);
+
+        let outcome = reconcile(&adapter, &envelope).await;
+
+        assert!(
+            outcome.is_err(),
+            "expected rejection for payload: {payload}"
+        );
+        match listener.try_accept_nonblocking() {
+            Err(kind) => assert_eq!(kind, std::io::ErrorKind::WouldBlock),
+            Ok(()) => panic!("adapter unexpectedly connected to GLPI for payload: {payload}"),
+        }
+    }
+}
+
+// =============================================================================
+// DESIRED NORMALIZATION
+// =============================================================================
+
+/// Duplicate desired permission entries for the same `(entity, profile)`
+/// pair, with mixed `recursive` values, canonicalize to one `true` entry;
+/// when the current state is already exactly that canonical row, the
+/// outcome is `Unchanged` (proving normalization happens before planning,
+/// not merely at the payload-parsing layer in isolation).
+#[tokio::test]
+async fn duplicate_desired_permissions_with_already_canonical_current_state_is_unchanged() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let envelope = envelope_json(
+        r#"{"permissions": [
+            {"entity": "Root Entity > IT", "profile": "Technician", "recursive": true},
+            {"entity": "Root Entity > IT", "profile": "Technician", "recursive": false}
+        ]}"#,
+    );
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 1)),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &envelope).await.unwrap();
+    server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Unchanged);
+}
+
+/// Selector strings reach the outbound GLPI search request exactly as
+/// given: never trimmed and never case-folded.
+#[tokio::test]
+async fn selector_strings_reach_glpi_search_untrimmed_and_uncasefolded() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let envelope = envelope_json(
+        r#"{"permissions": [{"entity": "  Root Entity > IT ", "profile": "TECH", "recursive": true}]}"#,
+    );
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        // Zero exact matches for the untrimmed selector: the adapter fails
+        // closed, but the request that carried the untrimmed selector is
+        // still captured below.
+        ok(&search_body(0, &[])),
+        ok("true"), // killSession
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &envelope).await;
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert!(outcome.is_err());
+    assert_request(&recorded[7], "GET", "/apirest.php/search/Entity");
+    assert_empty_body(&recorded[7]);
+    assert_eq!(
+        query_value(&recorded[7], "criteria[0][value]"),
+        Some("  Root Entity > IT ".to_owned()),
+        "the entity selector must reach GLPI untrimmed"
+    );
+}
+
+// =============================================================================
+// USER LOOKUP / CREATION
+// =============================================================================
+
+/// Zero exact `User.name` matches across the complete result set creates a
+/// new user whose `input.name` is exactly `IdentityContext.username`, using
+/// only the configured authentication-source fields, no password, and no
+/// Provider-payload-derived fields; the request is `POST User` with
+/// `application/json`.
+#[tokio::test]
+async fn missing_user_is_created_with_only_the_configured_provisioning_fields() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = GlpiAdapter::new(GlpiAdapterConfig {
+        endpoint: format!("https://{LOOPBACK_ADDRESS}:{port}/apirest.php"),
+        app_token: GlpiAppToken::new("app-token".to_owned()),
+        user_token: GlpiUserToken::new("user-token".to_owned()),
+        operation_timeout: Duration::from_secs(5),
+        additional_trust_anchors_pem: vec![identity.trust_anchor_pem.clone()],
+        authentication_source: GlpiAuthenticationSource {
+            authtype: Some(1),
+            auths_id: Some(2),
+        },
+    })
+    .expect("valid GLPI adapter configuration");
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(0, &[])), // search User: zero exact matches
+        created(r#"{"id": 55}"#), // POST User
+        ok(&profile_user_search_body(0, &[])), // read_current_assignments: none
+        ok("true"),               // killSession
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope())
+        .await
+        .unwrap();
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
+    assert_request(&recorded[6], "POST", "/apirest.php/User");
+    assert_json_body(
+        &recorded[6],
+        serde_json::json!({
+            "input": { "name": "jdoe", "authtype": 1, "auths_id": 2 }
+        }),
+    );
+}
+
+/// More than one exact `User.name` match is an adapter failure, and no
+/// mutation of any kind is ever attempted afterward.
+#[tokio::test]
+async fn ambiguous_user_lookup_makes_zero_mutation_requests() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(2, &[(30, "jdoe", "2"), (31, "jdoe", "2")])),
+        ok("true"), // killSession
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    let recorded = server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+    for entry in &recorded {
+        let (method, path, _) = parsed_request_line(&entry.0);
+        // `changeActiveEntities` is a legitimate `POST` unrelated to
+        // mutation; only `User`/`Profile_User` mutation methods are
+        // disallowed here.
+        if path == "/apirest.php/changeActiveEntities" {
+            continue;
+        }
+        assert_ne!(
+            method, "POST",
+            "no mutation may be attempted after ambiguity"
+        );
+        assert_ne!(
+            method, "DELETE",
+            "no mutation may be attempted after ambiguity"
+        );
+    }
+}
+
+/// A search row whose `User.name` differs only by case from the requested
+/// username is not an exact match: it is filtered out adapter-side, so the
+/// (case-sensitive) result set is empty and a new user is created.
+#[tokio::test]
+async fn case_sensitive_lookalike_does_not_count_as_an_exact_user_match() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        // GLPI search "equals" can return a fuzzy/lookalike row; only a
+        // case-sensitive exact match counts.
+        ok(&search_body(1, &[(30, "JDOE", "2")])),
+        created(r#"{"id": 61}"#), // POST User: created because "JDOE" != "jdoe"
+        ok(&profile_user_search_body(0, &[])),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope())
+        .await
+        .unwrap();
+    server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
+}
+
+/// User search results spanning more than one page are all read before the
+/// adapter decides whether an exact match exists.
+#[tokio::test]
+async fn user_lookup_reads_every_page_before_deciding() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    // Two pages: page one is full of unrelated rows (declared total forces
+    // a second page); page two contains the exact row.
+    let mut page_one_rows = Vec::new();
+    for index in 0..50 {
+        page_one_rows.push((1000 + index, "someone-else", "2"));
+    }
+    let page_one = search_body(51, &page_one_rows);
+    let page_two = search_body(51, &[(30, "jdoe", "2")]);
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&page_one),
+        ok(&page_two),
+        ok(&profile_user_search_body(0, &[])),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope())
+        .await
+        .unwrap();
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Unchanged);
+    assert_eq!(query_value(&recorded[5], "range"), Some("0-49".to_owned()));
+    assert_eq!(query_value(&recorded[6], "range"), Some("50-99".to_owned()));
+}
+
+/// User creation failure makes zero further `Profile_User` mutation
+/// requests: the adapter never retries and never falls back to reusing a
+/// fuzzy match.
+#[tokio::test]
+async fn user_creation_failure_makes_zero_profile_user_mutation_requests() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(0, &[])),
+        json_response("500 Internal Server Error", "{}"), // POST User fails
+        ok("true"),                                       // killSession still attempted
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+}
+
+/// Missing user plus an empty desired state still creates the user and
+/// returns `Changed`, even though the reconciliation plan itself is empty.
+#[tokio::test]
+async fn missing_user_creation_with_empty_desired_state_is_still_changed() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(0, &[])),
+        created(r#"{"id": 70}"#),
+        ok(&profile_user_search_body(0, &[])),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope())
+        .await
+        .unwrap();
+    server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
+}
+
+// =============================================================================
+// ENTITY RESOLUTION / PROFILE RESOLUTION
+// =============================================================================
+
+/// Entity and Profile selectors containing spaces and URL/query
+/// metacharacters (`>`, `&`, `=`) are percent-encoded on the wire and
+/// decoded back to the exact original string; ambiguous exact matches for
+/// either fail before any user lookup or mutation.
+#[tokio::test]
+async fn entity_and_profile_selectors_with_metacharacters_are_percent_encoded() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let entity_selector = "R&D > Team=1";
+    let envelope = envelope_json(&format!(
+        r#"{{"permissions": [{{"entity": "{entity_selector}", "profile": "Technician", "recursive": true}}]}}"#
+    ));
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        // Two exact matches: ambiguous entity resolution.
+        ok(&search_body(
+            2,
+            &[(10, entity_selector, "2"), (11, entity_selector, "2")],
+        )),
+        ok("true"), // killSession
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &envelope).await;
+    let recorded = server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err(), "ambiguous entity resolution must fail");
+    // The raw wire request line must not contain the selector's literal
+    // metacharacters unencoded (proving percent-encoding actually
+    // happened), while the decoded query value equals the exact selector.
+    assert!(!recorded[7].0.contains("R&D > Team=1"));
+    assert_eq!(
+        query_value(&recorded[7], "criteria[0][value]"),
+        Some(entity_selector.to_owned())
+    );
+}
+
+/// A missing entity fails before any user lookup or creation request.
+#[tokio::test]
+async fn missing_entity_fails_before_any_user_lookup() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(0, &[])), // zero exact Entity matches
+        ok("true"),               // killSession
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    let recorded = server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+    assert_eq!(
+        recorded.len(),
+        9,
+        "no request after the failed Entity search except cleanup"
+    );
+}
+
+/// A fuzzy (non-exact) Profile search result is ignored: it does not count
+/// toward ambiguity and does not count as a match, so zero exact matches is
+/// treated as a missing profile.
+#[tokio::test]
+async fn fuzzy_profile_search_results_are_ignored() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        // "Technician II" is a fuzzy, non-exact result for "Technician".
+        ok(&search_body(1, &[(21, "Technician II", "2")])),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(
+        outcome.is_err(),
+        "a fuzzy-only profile result must not resolve"
+    );
+}
+
+// =============================================================================
+// CURRENT PROFILE_USER READING
+// =============================================================================
+
+/// All `Profile_User` candidate-discovery pages are read, and every
+/// candidate's raw fields are read via the item endpoint, before planning.
+#[tokio::test]
+async fn current_assignment_discovery_reads_every_page_before_planning() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let mut page_one_rows = Vec::new();
+    for index in 0..50 {
+        page_one_rows.push((2000 + index, "jdoe"));
+    }
+    let page_one = profile_user_search_body(51, &page_one_rows);
+    let page_two = profile_user_search_body(51, &[(99, "jdoe")]);
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&page_one),
+        ok(&page_two),
+    ];
+    // 50 item reads for page one's candidates, plus 1 for page two's.
+    let mut full_script = script;
+    for index in 0..50 {
+        full_script.push(ok(&profile_user_item_body(2000 + index, 30, 999, 999, 0)));
+    }
+    full_script.push(ok(&profile_user_item_body(99, 30, 999, 999, 0)));
+    // Every one of the 51 rows is an undesired pair (empty desired state):
+    // all 51 physical rows are removed via one `DELETE` request each.
+    for _ in 0..51 {
+        full_script.push(ok("true"));
+    }
+    full_script.push(ok("true")); // killSession
+
+    let server = tokio::spawn(run_scripted_server(
+        listener,
+        identity.acceptor,
+        full_script,
+    ));
+    let outcome = reconcile(&adapter, &empty_desired_envelope())
+        .await
+        .unwrap();
+    server.await.expect("scripted server completed its script");
+
+    // Every one of the 51 rows is an undesired pair (empty desired state):
+    // all 51 physical rows are removed, so the outcome is `Changed`.
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
+}
+
+/// A current `Profile_User` row whose item-read `users_id` differs from the
+/// resolved synchronized user id fails closed rather than being silently
+/// dropped or reconciled.
+#[tokio::test]
+async fn current_row_with_mismatched_users_id_fails_closed() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        // The item read's own `users_id` (31) does not equal the resolved
+        // user id (30): must fail closed, not silently drop the row.
+        ok(&profile_user_item_body(99, 31, 20, 10, 1)),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+}
+
+/// Only the raw wire integers `0`/`1` are accepted for `is_recursive`; every
+/// other representation (`2`, a string, a bool, null) fails closed rather
+/// than silently becoming `false`.
+#[tokio::test]
+async fn malformed_is_recursive_representations_fail_closed() {
+    for malformed_body in [
+        r#"{"id": 99, "users_id": 30, "profiles_id": 20, "entities_id": 10, "is_recursive": 2}"#,
+        r#"{"id": 99, "users_id": 30, "profiles_id": 20, "entities_id": 10, "is_recursive": "0"}"#,
+        r#"{"id": 99, "users_id": 30, "profiles_id": 20, "entities_id": 10, "is_recursive": true}"#,
+        r#"{"id": 99, "users_id": 30, "profiles_id": 20, "entities_id": 10, "is_recursive": null}"#,
+        r#"{"id": 99, "users_id": 30, "profiles_id": 20, "entities_id": 10}"#,
+    ] {
+        let listener = bind_loopback_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+        let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+        let script = vec![
+            ok(r#"{"session_token": "sess-1"}"#),
+            ok("true"),
+            ok(&full_session_body(1)),
+            ok(&search_options_body(&[
+                ("1", "User.id"),
+                ("2", "User.name"),
+            ])),
+            ok(&search_options_body(&[
+                ("1", "Profile_User.id"),
+                ("2", "User.name"),
+            ])),
+            ok(&search_body(1, &[(30, "jdoe", "2")])),
+            ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+            ok(malformed_body),
+            ok("true"),
+        ];
+
+        let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+        let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+        server
+            .await
+            .expect("scripted server completed exactly its script");
+
+        assert!(
+            outcome.is_err(),
+            "malformed is_recursive body must fail closed: {malformed_body}"
+        );
+    }
+}
+
+/// Malformed pagination metadata (an empty page while rows remain
+/// outstanding against the declared `totalcount`) fails rather than
+/// silently accepting a gap.
+#[tokio::test]
+async fn malformed_pagination_with_a_short_empty_page_fails_closed() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        // Declares a total of 5 rows but returns zero: a gap, not progress.
+        ok(&search_body(5, &[])),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+}
+
+/// Inconsistent `totalcount` between successive pages of the same search
+/// fails rather than silently trusting the later value.
+#[tokio::test]
+async fn inconsistent_totalcount_across_pages_fails_closed() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let mut page_one_rows = Vec::new();
+    for index in 0..50 {
+        page_one_rows.push((3000 + index, "jdoe"));
+    }
+    let page_one = profile_user_search_body(50, &page_one_rows);
+    // Second page reports a different totalcount than the first.
+    let page_two = profile_user_search_body(51, &[(99, "jdoe")]);
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&page_one),
+        ok(&page_two),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+}
+
+// =============================================================================
+// AUTHORITATIVE PLAN: DESIRED FALSE / DESIRED TRUE / UNDESIRED PAIR
+// =============================================================================
+//
+// The pure planning combinatorics (one/duplicate/opposite/mixed current
+// rows against a desired `false` or `true`, and undesired pairs) are
+// exhaustively covered as fast unit tests directly against `plan::compute`
+// in `src/plan.rs`, which is the right layer for pure combinatorial
+// coverage with no I/O. The integration tests below prove the *same*
+// authoritative-plan behavior end to end through real scripted GLPI
+// requests, so the wiring between search, resolution, and planning is also
+// exercised, not just the pure function.
+
+/// Desired `true` with current rows `[true, false]` for the same pair keeps
+/// the canonical `true` row and removes only the opposite-recursive row,
+/// issuing exactly one `DELETE` and no `POST`.
+#[tokio::test]
+async fn desired_true_with_true_and_false_current_rows_removes_only_the_false_row() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(2, &[(99, "jdoe"), (100, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 1)), // canonical: true
+        ok(&profile_user_item_body(100, 30, 20, 10, 0)), // opposite: false
+        ok("true"),                                     // DELETE Profile_User/100
+        ok("true"),                                     // killSession
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope())
+        .await
+        .unwrap();
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
+    assert_request(&recorded[13], "DELETE", "/apirest.php/Profile_User/100");
+    for entry in &recorded {
+        let (method, path, _) = parsed_request_line(&entry.0);
+        if path == "/apirest.php/changeActiveEntities" {
+            continue;
+        }
+        assert_ne!(
+            method, "POST",
+            "no addition is needed when the true row already exists"
+        );
+    }
+}
+
+/// An undesired pair with mixed recursive current rows is fully removed
+/// regardless of either row's `is_recursive` value.
+#[tokio::test]
+async fn undesired_pair_with_mixed_recursive_rows_is_fully_removed() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(2, &[(99, "jdoe"), (100, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 1)),
+        ok(&profile_user_item_body(100, 30, 20, 10, 0)),
+        ok("true"), // DELETE Profile_User/99
+        ok("true"), // DELETE Profile_User/100
+        ok("true"), // killSession
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope())
+        .await
+        .unwrap();
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
+    assert_request(&recorded[9], "DELETE", "/apirest.php/Profile_User/99");
+    assert_request(&recorded[10], "DELETE", "/apirest.php/Profile_User/100");
+}
+
+// =============================================================================
+// PLAN / EXECUTION INVARIANTS
+// =============================================================================
+
+/// A plan with removals for two independent undesired pairs and additions
+/// for two independent missing pairs performs every removal (in ascending
+/// physical id order) before any addition (in ascending `(entities_id,
+/// profiles_id)` order): one mutation per request, never batched, never an
+/// in-place update.
+#[tokio::test]
+async fn all_removals_precede_all_additions_one_mutation_per_request() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let envelope = envelope_json(
+        r#"{"permissions": [
+            {"entity": "Entity One", "profile": "Profile One", "recursive": true},
+            {"entity": "Entity Two", "profile": "Profile Two", "recursive": false}
+        ]}"#,
+    );
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Entity One", "2")])),
+        ok(&search_body(1, &[(20, "Profile One", "2")])),
+        ok(&search_body(1, &[(30, "Entity Two", "2")])),
+        ok(&search_body(1, &[(40, "Profile Two", "2")])),
+        ok(&search_body(1, &[(50, "jdoe", "2")])),
+        ok(&profile_user_search_body(2, &[(1, "jdoe"), (2, "jdoe")])),
+        // Two current rows, both undesired pairs (neither matches
+        // (10,20) nor (30,40)): both are removed, and both desired pairs
+        // are pure additions.
+        ok(&profile_user_item_body(1, 50, 999, 998, 0)),
+        ok(&profile_user_item_body(2, 50, 997, 996, 1)),
+        ok("true"),                // DELETE Profile_User/1
+        ok("true"),                // DELETE Profile_User/2
+        created(r#"{"id": 200}"#), // POST addition (10,20)
+        created(r#"{"id": 201}"#), // POST addition (30,40)
+        ok("true"),                // killSession
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &envelope).await.unwrap();
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
+    assert_request(&recorded[15], "DELETE", "/apirest.php/Profile_User/1");
+    assert_request(&recorded[16], "DELETE", "/apirest.php/Profile_User/2");
+    assert_request(&recorded[17], "POST", "/apirest.php/Profile_User");
+    assert_json_body(
+        &recorded[17],
+        serde_json::json!({
+            "input": {
+                "users_id": 50,
+                "profiles_id": 20,
+                "entities_id": 10,
+                "is_recursive": true,
+            }
+        }),
+    );
+    assert_request(&recorded[18], "POST", "/apirest.php/Profile_User");
+    assert_json_body(
+        &recorded[18],
+        serde_json::json!({
+            "input": {
+                "users_id": 50,
+                "profiles_id": 40,
+                "entities_id": 30,
+                "is_recursive": false,
+            }
+        }),
+    );
+    // Never an in-place update: no PATCH/PUT method appears anywhere.
+    for entry in &recorded {
+        let (method, _, _) = parsed_request_line(&entry.0);
+        assert_ne!(method, "PATCH");
+        assert_ne!(method, "PUT");
+    }
+}
+
+/// A `DELETE` failure stops immediately: no further removal and no
+/// addition is ever attempted, even though the plan required both.
+#[tokio::test]
+async fn delete_failure_blocks_every_subsequent_removal_and_addition() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(2, &[(1, "jdoe"), (2, "jdoe")])),
+        ok(&profile_user_item_body(1, 30, 998, 997, 0)),
+        ok(&profile_user_item_body(2, 30, 996, 995, 0)),
+        json_response("500 Internal Server Error", "{}"), // first DELETE fails
+        ok("true"),                                       // killSession still attempted
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+}
+
+/// A `DELETE` response with `200 OK` status but a body that is not the bare
+/// JSON literal `true` is rejected, mirroring `force_all_entities` and
+/// `kill_session`'s status-plus-body verification: an HTTP status alone is
+/// never sufficient to consider a mutation successful.
+#[tokio::test]
+async fn delete_with_200_status_but_non_true_body_is_rejected() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 0)),
+        ok("false"), // DELETE Profile_User/99: 200 OK but not bare `true`
+        ok("true"),  // killSession still attempted
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(
+        outcome.is_err(),
+        "a 200 OK DELETE response body that is not bare `true` must be rejected"
+    );
+}
+
+/// Repeating a reconciliation after cleaning up duplicate rows converges to
+/// `Unchanged` on the next run: partial state from a prior run is never
+/// rolled back, and a later run converges from wherever the state is.
+#[tokio::test]
+async fn a_later_reconciliation_converges_and_becomes_unchanged() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    // First run: a duplicate canonical row exists; cleanup returns Changed.
+    let script_one = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(2, &[(99, "jdoe"), (100, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 1)),
+        ok(&profile_user_item_body(100, 30, 20, 10, 1)), // exact duplicate
+        ok("true"),                                      // DELETE the duplicate
+        ok("true"),                                      // killSession
+    ];
+    let server_one = tokio::spawn(run_scripted_server(listener, identity.acceptor, script_one));
+    let outcome_one = reconcile(&adapter, &one_permission_envelope())
+        .await
+        .unwrap();
+    server_one.await.expect("first scripted server completed");
+    assert_eq!(outcome_one, ReconciliationOutcome::Changed);
+
+    // Second run: only the canonical row remains; converges to Unchanged.
+    let listener_two = bind_loopback_listener().await;
+    let port_two = listener_two.local_addr().unwrap().port();
+    let identity_two = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter_two = adapter_for(port_two, identity_two.trust_anchor_pem.clone());
+    let script_two = vec![
+        ok(r#"{"session_token": "sess-2"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 1)),
+        ok("true"),
+    ];
+    let server_two = tokio::spawn(run_scripted_server(
+        listener_two,
+        identity_two.acceptor,
+        script_two,
+    ));
+    let outcome_two = reconcile(&adapter_two, &one_permission_envelope())
+        .await
+        .unwrap();
+    server_two.await.expect("second scripted server completed");
+    assert_eq!(outcome_two, ReconciliationOutcome::Unchanged);
+}
+
+// =============================================================================
+// MUTATION RESPONSE VALIDATION
+// =============================================================================
+//
+// Every test in this section is a hypothetical response shape used only to
+// exercise the adapter's own decision logic (accept/reject); none of these
+// bodies or status codes are asserted as "this is what real GLPI actually
+// sends" — see `tests/real_glpi.rs` for wire-shape verification against a
+// real GLPI 11.0.9 instance.
+
+/// A malformed success-looking `User`/`Profile_User` creation response
+/// (an extra field alongside `id`) is rejected rather than accepted merely
+/// because an `id` field happens to be present.
+#[tokio::test]
+async fn malformed_success_looking_creation_response_is_rejected() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(0, &[])),
+        // Hypothetical response shape, not asserted as GLPI's actual wire
+        // behavior: an extra unexpected field alongside "id".
+        created(r#"{"id": 99, "message": "ok"}"#),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+}
+
+/// A creation response with `"id": 0` is rejected: zero is never a valid
+/// created id.
+#[tokio::test]
+async fn zero_id_in_creation_response_is_rejected() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(0, &[])),
+        // Hypothetical response shape, not asserted as GLPI's actual wire
+        // behavior; see `tests/real_glpi.rs`.
+        created(r#"{"id": 0}"#),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+}
+
+/// A bare `false` result body for a creation request is rejected: it is not
+/// a valid `{"id": ...}` shape regardless of the HTTP status used.
+#[tokio::test]
+async fn bare_false_creation_result_is_rejected() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(0, &[])),
+        // Hypothetical response shape, not asserted as GLPI's actual wire
+        // behavior; see `tests/real_glpi.rs`.
+        created("false"),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+}
+
+/// A semantically successful-looking body is still rejected when the HTTP
+/// status is not the expected one for that operation: 2xx status alone is
+/// never sufficient.
+#[tokio::test]
+async fn correct_body_with_wrong_status_code_is_rejected() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(0, &[])),
+        // Hypothetical response shape, not asserted as GLPI's actual wire
+        // behavior: a valid-looking `{"id": N}` body but with status `200
+        // OK` where the adapter requires `201 Created` for a creation.
+        ok(r#"{"id": 42}"#),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+}
+
+/// A `Profile_User` deletion response with an unexpected (non-`200`)
+/// status is rejected, including a plausible `204 No Content`.
+#[tokio::test]
+async fn delete_response_with_unexpected_status_is_rejected() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 1)),
+        // Hypothetical response shape, not asserted as GLPI's actual wire
+        // behavior; see `tests/real_glpi.rs`.
+        json_response("204 No Content", ""),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+}
+
+/// A `killSession` response with `200 OK` but a body other than the bare
+/// JSON literal `true` is rejected: a `2xx` status alone is not sufficient
+/// for cleanup verification either.
+#[tokio::test]
+async fn kill_session_with_non_true_body_is_rejected() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(0, &[])),
+        // Hypothetical response shape, not asserted as GLPI's actual wire
+        // behavior; see `tests/real_glpi.rs`: a `200 OK` killSession with an
+        // unexpected body.
+        ok(r#"{"message": "ok"}"#),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+}
+
+// =============================================================================
+// SESSION AUTHENTICATION / CLEANUP
+// =============================================================================
+
+/// `initSession` authenticates with `Authorization: user_token <token>` and
+/// `App-Token` headers (never a `Session-Token` header, since none exists
+/// yet), with an empty GET body; every subsequent call instead uses
+/// `Session-Token` + `App-Token` and never repeats the user-token
+/// `Authorization` header.
+#[tokio::test]
+async fn init_session_and_subsequent_calls_use_the_correct_distinct_headers() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(0, &[])),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope())
+        .await
+        .unwrap();
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Unchanged);
+
+    // initSession (request 0): GET, Authorization + App-Token, no
+    // Session-Token, empty body.
+    assert_request(&recorded[0], "GET", "/apirest.php/initSession");
+    assert_empty_body(&recorded[0]);
+    assert_header(&recorded[0], "authorization", "user_token user-token");
+    assert_header(&recorded[0], "app-token", "app-token");
+    assert_no_header(&recorded[0], "session-token");
+
+    // Every subsequent request: Session-Token + App-Token, never
+    // Authorization.
+    for entry in &recorded[1..] {
+        assert_header(entry, "session-token", "sess-1");
+        assert_header(entry, "app-token", "app-token");
+        assert_no_header(entry, "authorization");
+    }
+
+    // killSession (the last request): GET, empty body.
+    let last = recorded.last().unwrap();
+    assert_request(last, "GET", "/apirest.php/killSession");
+    assert_empty_body(last);
+}
+
+/// Two independent reconciliations each start and use their own distinct
+/// session token; the second reconciliation never reuses the first's
+/// token.
+#[tokio::test]
+async fn separate_reconciliations_use_separate_session_tokens() {
+    for session_token in ["sess-alpha", "sess-beta"] {
+        let listener = bind_loopback_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+        let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+        let script = vec![
+            ok(&format!(r#"{{"session_token": "{session_token}"}}"#)),
+            ok("true"),
+            ok(&full_session_body(1)),
+            ok(&search_options_body(&[
+                ("1", "User.id"),
+                ("2", "User.name"),
+            ])),
+            ok(&search_options_body(&[
+                ("1", "Profile_User.id"),
+                ("2", "User.name"),
+            ])),
+            ok(&search_body(1, &[(30, "jdoe", "2")])),
+            ok(&profile_user_search_body(0, &[])),
+            ok("true"),
+        ];
+
+        let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+        let outcome = reconcile(&adapter, &empty_desired_envelope())
+            .await
+            .unwrap();
+        let recorded = server.await.expect("scripted server completed its script");
+
+        assert_eq!(outcome, ReconciliationOutcome::Unchanged);
+        for entry in &recorded[1..] {
+            assert_header(entry, "session-token", session_token);
+        }
+    }
+}
+
+/// A `killSession` failure that occurs after the primary reconciliation
+/// already failed (ambiguous user) still results in an overall adapter
+/// failure (cleanup failure never turns a failed reconciliation into a
+/// reported success).
+#[tokio::test]
+async fn cleanup_failure_after_primary_failure_is_still_a_failure() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(2, &[(30, "jdoe", "2"), (31, "jdoe", "2")])), // ambiguous
+        json_response("500 Internal Server Error", "{}"),             // killSession also fails
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(
+        outcome.is_err(),
+        "a primary failure followed by a cleanup failure must still be reported as failure"
+    );
+}
+
+// =============================================================================
+// TRANSPORT / SECURITY
+// =============================================================================
+
+/// A server certificate valid for a different address than the one dialed
+/// (hostname/SAN mismatch) is rejected even though it chains to the same
+/// trusted root.
+#[tokio::test]
+async fn rejects_a_hostname_mismatched_server_certificate() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    // The presented certificate's SAN covers a different loopback address
+    // than the one the adapter actually dials.
+    let mismatched_identity = build_test_identity("127.0.0.2", ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, mismatched_identity.trust_anchor_pem.clone());
+
+    let accept_task = tokio::spawn(async move {
+        if let Ok((socket, _)) = listener.accept().await {
+            let _ = mismatched_identity.acceptor.accept(socket).await;
+        }
+    });
+
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    accept_task.await.expect("accept task completed");
+
+    assert!(outcome.is_err());
+}
+
+/// A response body beyond the private response-size bound is rejected
+/// rather than buffered without limit.
+#[tokio::test]
+async fn oversized_response_body_is_rejected() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let oversized_body = vec![b'a'; 2 * 1_048_576 + 1];
+    let script = vec![ScriptedResponse {
+        status_line: "200 OK",
+        body: oversized_body,
+    }];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+}
+
+/// A malformed (non-JSON) `initSession` response body is rejected.
+#[tokio::test]
+async fn malformed_json_response_body_is_rejected() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![ok("not json at all")];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+}
+
+/// An unexpected HTTP status for `initSession` (neither documented success
+/// nor a status the adapter otherwise handles) is rejected, including a
+/// `3xx` redirect status: the adapter never follows redirects.
+#[tokio::test]
+async fn unexpected_and_redirect_statuses_for_init_session_are_rejected() {
+    for status_line in ["302 Found", "418 I'm a Teapot", "500 Internal Server Error"] {
+        let listener = bind_loopback_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+        let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+        let script = vec![json_response(status_line, r#"{"session_token": "sess-1"}"#)];
+
+        let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+        let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+        server
+            .await
+            .expect("scripted server completed exactly its script");
+
+        assert!(outcome.is_err(), "status {status_line} must be rejected");
+    }
+}
+
+/// The `Host` header always carries the explicit non-default loopback port
+/// the adapter actually dialed, proving unambiguous query/path composition
+/// against that exact authority.
+#[tokio::test]
+async fn host_header_includes_the_explicit_non_default_port() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![ok(r#"{"session_token": "sess-1"}"#), ok("true")];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let _ = reconcile(&adapter, &empty_desired_envelope()).await;
+    let recorded = server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert_header(&recorded[0], "host", &format!("{LOOPBACK_ADDRESS}:{port}"));
+}
+
+/// No sentinel App-Token, User-Token, session token, username, entity, or
+/// profile value ever appears in the adapter's public `Debug`/`Display`
+/// error output.
+#[tokio::test]
+async fn no_sentinel_secret_or_selector_value_appears_in_public_errors() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let sentinel_app_token = "sentinel-app-token-zzz";
+    let sentinel_user_token = "sentinel-user-token-zzz";
+    let adapter = GlpiAdapter::new(GlpiAdapterConfig {
+        endpoint: format!("https://{LOOPBACK_ADDRESS}:{port}/apirest.php"),
+        app_token: GlpiAppToken::new(sentinel_app_token.to_owned()),
+        user_token: GlpiUserToken::new(sentinel_user_token.to_owned()),
+        operation_timeout: Duration::from_secs(5),
+        additional_trust_anchors_pem: vec![identity.trust_anchor_pem.clone()],
+        authentication_source: GlpiAuthenticationSource::default(),
+    })
+    .expect("valid GLPI adapter configuration");
+    let sentinel_entity = "sentinel-entity-zzz";
+    let sentinel_profile = "sentinel-profile-zzz";
+    let envelope = envelope_json(&format!(
+        r#"{{"permissions": [{{"entity": "{sentinel_entity}", "profile": "{sentinel_profile}", "recursive": true}}]}}"#
+    ));
+
+    let script = vec![json_response("500 Internal Server Error", "{}")];
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &envelope).await;
+    server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    let error = outcome.expect_err("initSession failure must be reported");
+    let debug_text = format!("{error:?}");
+    let display_text = error.to_string();
+    for sentinel in [
+        sentinel_app_token,
+        sentinel_user_token,
+        sentinel_entity,
+        sentinel_profile,
+        "sess-1",
+        "jdoe",
+    ] {
+        assert!(!debug_text.contains(sentinel), "Debug leaked {sentinel}");
+        assert!(
+            !display_text.contains(sentinel),
+            "Display leaked {sentinel}"
+        );
+    }
+}
+
+// =============================================================================
+// CANCELLATION / DEADLINES
+// =============================================================================
+
+/// Cancellation observed immediately after `initSession` completes stops
+/// the adapter before `changeActiveEntities` is ever sent.
+#[tokio::test]
+async fn cancellation_after_init_session_stops_before_visibility_change() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let cancellation = CancelAfterRequests {
+        completed: Arc::clone(&completed),
+        threshold: 1,
+    };
+
+    let server = tokio::spawn(run_counted_scripted_server(
+        listener,
+        identity.acceptor,
+        oversized_script(),
+        Arc::clone(&completed),
+    ));
+    let outcome =
+        reconcile_with_cancellation(&adapter, &one_permission_envelope(), &cancellation).await;
+    server.abort();
+
+    assert!(outcome.is_err());
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+}
+
+/// Cancellation observed after `changeActiveEntities` completes stops the
+/// adapter before `getFullSession` is ever sent.
+#[tokio::test]
+async fn cancellation_during_visibility_establishment_stops_before_verification() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let cancellation = CancelAfterRequests {
+        completed: Arc::clone(&completed),
+        threshold: 2,
+    };
+
+    let server = tokio::spawn(run_counted_scripted_server(
+        listener,
+        identity.acceptor,
+        oversized_script(),
+        Arc::clone(&completed),
+    ));
+    let outcome =
+        reconcile_with_cancellation(&adapter, &one_permission_envelope(), &cancellation).await;
+    server.abort();
+
+    assert!(outcome.is_err());
+    assert_eq!(completed.load(Ordering::SeqCst), 2);
+}
+
+/// Cancellation observed between semantic-resolution search-option lookups
+/// (after `Entity`, before `Profile`) stops immediately.
+#[tokio::test]
+async fn cancellation_between_semantic_resolution_stages_stops_immediately() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let cancellation = CancelAfterRequests {
+        completed: Arc::clone(&completed),
+        threshold: 4,
+    };
+
+    let server = tokio::spawn(run_counted_scripted_server(
+        listener,
+        identity.acceptor,
+        oversized_script(),
+        Arc::clone(&completed),
+    ));
+    let outcome =
+        reconcile_with_cancellation(&adapter, &one_permission_envelope(), &cancellation).await;
+    server.abort();
+
+    assert!(outcome.is_err());
+    assert_eq!(completed.load(Ordering::SeqCst), 4);
+}
+
+/// Cancellation observed right after entity and profile resolution
+/// complete stops the adapter before the user lookup is ever sent.
+#[tokio::test]
+async fn cancellation_before_user_lookup_stops_immediately() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let cancellation = CancelAfterRequests {
+        completed: Arc::clone(&completed),
+        threshold: 9,
+    };
+
+    let server = tokio::spawn(run_counted_scripted_server(
+        listener,
+        identity.acceptor,
+        oversized_script(),
+        Arc::clone(&completed),
+    ));
+    let outcome =
+        reconcile_with_cancellation(&adapter, &one_permission_envelope(), &cancellation).await;
+    server.abort();
+
+    assert!(outcome.is_err());
+    assert_eq!(completed.load(Ordering::SeqCst), 9);
+}
+
+/// Cancellation observed right after the user lookup completes (an
+/// existing user) stops the adapter before user creation would ever be
+/// considered and before the current-state read is ever sent.
+#[tokio::test]
+async fn cancellation_before_current_state_read_stops_immediately() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let cancellation = CancelAfterRequests {
+        completed: Arc::clone(&completed),
+        threshold: 10,
+    };
+
+    let server = tokio::spawn(run_counted_scripted_server(
+        listener,
+        identity.acceptor,
+        oversized_script(),
+        Arc::clone(&completed),
+    ));
+    let outcome =
+        reconcile_with_cancellation(&adapter, &one_permission_envelope(), &cancellation).await;
+    server.abort();
+
+    assert!(outcome.is_err());
+    assert_eq!(completed.load(Ordering::SeqCst), 10);
+}
+
+/// Cancellation observed right after the current-state read completes
+/// stops the adapter before the first removal is ever sent.
+#[tokio::test]
+async fn cancellation_before_first_delete_stops_immediately() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let cancellation = CancelAfterRequests {
+        completed: Arc::clone(&completed),
+        threshold: 12,
+    };
+
+    let server = tokio::spawn(run_counted_scripted_server(
+        listener,
+        identity.acceptor,
+        oversized_script(),
+        Arc::clone(&completed),
+    ));
+    let outcome =
+        reconcile_with_cancellation(&adapter, &one_permission_envelope(), &cancellation).await;
+    server.abort();
+
+    assert!(outcome.is_err());
+    assert_eq!(completed.load(Ordering::SeqCst), 12);
+}
+
+/// Cancellation observed right after the (only) removal completes stops
+/// the adapter before the addition phase is ever entered.
+#[tokio::test]
+async fn cancellation_between_delete_and_add_phases_stops_immediately() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let cancellation = CancelAfterRequests {
+        completed: Arc::clone(&completed),
+        threshold: 13,
+    };
+
+    let server = tokio::spawn(run_counted_scripted_server(
+        listener,
+        identity.acceptor,
+        oversized_script(),
+        Arc::clone(&completed),
+    ));
+    let outcome =
+        reconcile_with_cancellation(&adapter, &one_permission_envelope(), &cancellation).await;
+    server.abort();
+
+    assert!(outcome.is_err());
+    assert_eq!(completed.load(Ordering::SeqCst), 13);
+}
+
+/// Cancellation observed right after every mutation completes suppresses
+/// `killSession` cleanup entirely, per ADR 0009, without turning an
+/// otherwise-successful reconciliation into a reported failure.
+#[tokio::test]
+async fn cancellation_before_cleanup_suppresses_kill_session_without_failing() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let cancellation = CancelAfterRequests {
+        completed: Arc::clone(&completed),
+        threshold: 14,
+    };
+
+    let server = tokio::spawn(run_counted_scripted_server(
+        listener,
+        identity.acceptor,
+        oversized_script(),
+        Arc::clone(&completed),
+    ));
+    let outcome =
+        reconcile_with_cancellation(&adapter, &one_permission_envelope(), &cancellation).await;
+    server.abort();
+
+    assert_eq!(
+        outcome.unwrap(),
+        ReconciliationOutcome::Changed,
+        "cancellation must suppress cleanup without failing an already-successful reconciliation"
+    );
+    assert_eq!(completed.load(Ordering::SeqCst), 14);
+}
+
+/// Cancellation observed between pages of one paginated `Profile_User`
+/// search stops before the next page is ever requested, rather than only
+/// being checked once before the overall search starts.
+#[tokio::test]
+async fn cancellation_between_search_pages_stops_before_next_page() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let completed = Arc::new(AtomicUsize::new(0));
+    // Completed after: initSession(1), changeActiveEntities(2),
+    // getFullSession(3), User search-options(4), Profile_User
+    // search-options(5), resolve_user_id search(6), and the first
+    // `Profile_User` search page(7). Cancellation must be observed here,
+    // before the second page is ever requested.
+    let cancellation = CancelAfterRequests {
+        completed: Arc::clone(&completed),
+        threshold: 7,
+    };
+
+    // None of page one's rows match "jdoe": this page exists only to
+    // establish (via `totalcount`) that a second page is required, without
+    // triggering any per-candidate item read as a side effect.
+    let mut page_one_rows = Vec::new();
+    for index in 0..50 {
+        page_one_rows.push((3000 + index, "other-user"));
+    }
+    let page_one = profile_user_search_body(51, &page_one_rows);
+    // A second page that must never be requested: if cancellation were only
+    // checked before the overall search started (not between pages), the
+    // adapter would fetch this page too.
+    let page_two = profile_user_search_body(51, &[(99, "jdoe")]);
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&page_one),
+        ok(&page_two),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_counted_scripted_server(
+        listener,
+        identity.acceptor,
+        script,
+        Arc::clone(&completed),
+    ));
+    let outcome =
+        reconcile_with_cancellation(&adapter, &empty_desired_envelope(), &cancellation).await;
+    server.abort();
+
+    assert!(outcome.is_err());
+    assert_eq!(completed.load(Ordering::SeqCst), 7);
+}
+
+/// A synchronization deadline that has already elapsed before the adapter
+/// starts makes zero GLPI requests.
+#[tokio::test]
+async fn deadline_already_elapsed_before_start_makes_zero_requests() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let cancellation = NeverCancelled;
+    let elapsed_deadline = Instant::now() - Duration::from_secs(1);
+    let context = SynchronizationContext::new(elapsed_deadline, &cancellation);
+    let identity_ctx = IdentityContext::new("jdoe".to_owned(), vec![]);
+    let envelope = empty_desired_envelope();
+    let request = TargetAdapterRequest::new(&identity_ctx, &envelope, context);
+
+    let outcome = adapter.reconcile(request).await;
+
+    assert!(outcome.is_err());
+    match listener.try_accept_nonblocking() {
+        Err(kind) => assert_eq!(kind, std::io::ErrorKind::WouldBlock),
+        Ok(()) => panic!("adapter unexpectedly connected to GLPI past an elapsed deadline"),
     }
 }
 
