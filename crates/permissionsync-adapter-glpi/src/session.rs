@@ -90,6 +90,26 @@ pub(crate) async fn init_session(
 /// active profile grants, as the input to the `glpishowallentities`
 /// visibility precondition. `POST changeActiveEntities` with a JSON body;
 /// GLPI returns the bare JSON literal `true` on success.
+///
+/// The `entities_id` field is deliberately omitted from the request body.
+/// GLPI 11.0.9's `API::changeActiveEntities()`
+/// (`src/Glpi/Api/API.php`) only preserves its internal `"all"` sentinel
+/// when `entities_id` is entirely absent from the request:
+///
+/// ```php
+/// if (!isset($params['entities_id'])) {
+///     $entities_id = 'all';
+/// } else {
+///     $entities_id = intval($params['entities_id']);
+/// }
+/// ```
+///
+/// If this adapter instead sent the literal string `"all"`, the `isset()`
+/// branch above would be true and `intval("all")` (which is `0` in PHP)
+/// would be used instead, selecting entity ID `0` rather than GLPI's
+/// full-visibility mode (`Session::changeActiveEntities()` only enables
+/// `glpientity_fullstructure` when `$ID === 'all'` with strict-string
+/// identity, not after any `intval()` coercion).
 pub(crate) async fn force_all_entities(
     config: &ValidatedConfig,
     session: &GlpiSession,
@@ -100,7 +120,7 @@ pub(crate) async fn force_all_entities(
         .join("changeActiveEntities")
         .map_err(|_| GlpiFailure::Transport)?;
     let headers = [session_token_header(session)?, app_token_header(config)?];
-    let body = br#"{"entities_id":"all","is_recursive":true}"#.to_vec();
+    let body = br#"{"is_recursive":true}"#.to_vec();
 
     let response = transport::request(
         &config.tls_connector,
