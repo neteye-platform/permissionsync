@@ -6,7 +6,6 @@
  * administrative Auth login. It does not manufacture a PHP session. The
  * installed GLPI dataset creates the temporary ``glpi``/``glpi`` administrator
  * (install/empty_data.php); Auth::login() establishes its complete session.
- * Docker is unavailable locally, so the real suite has not been executed here.
  *
  * GLPI 11.x bootstrap note: unlike pre-11 releases, `inc/includes.php` no
  * longer boots the framework. As of 11.0.9 that file (verified against
@@ -89,8 +88,10 @@ $target_profiles = [];
 foreach (['a', 'b', 'c'] as $suffix) {
     $target_profiles[$suffix] = add_profile_or_fail("permissionsync-target-{$suffix}");
 }
-// Keep a deterministic pool large enough for the deferred >50-row pagination
-// scenario without giving adapter payloads any built-in GLPI profile.
+// Keep a deterministic pool large enough for the real >50-row pagination
+// scenario (tests/real_glpi.rs
+// current_assignment_pagination_removes_a_stale_row_from_a_later_page) without
+// giving adapter payloads any built-in GLPI profile.
 for ($index = 1; $index <= 60; ++$index) {
     add_profile_or_fail(sprintf('permissionsync-pagination-target-%02d', $index));
 }
@@ -99,12 +100,16 @@ for ($index = 1; $index <= 60; ++$index) {
 // canCreateItem() requires User READ, entity visibility, and a strictly lower
 // target profile. READ/CREATE/UPDATE on "user" cover: looking up existing
 // users, creating a missing user via POST /apirest.php/User/, and removing a
-// stale Profile_User row. Profile_User deletion is not gated by its own
-// canPurgeItem() (which adds no user-right requirement); it inherits
-// CommonDBRelation::canDeleteItem(), which checks canUpdateItem on the
-// related User side, i.e. User UPDATE. DELETE and PURGE on "user" are not
-// checked anywhere in this path and are intentionally omitted; the adapter
-// never deletes or purges User objects directly.
+// stale Profile_User row via V1 API::deleteItems(). Profile_User has no
+// soft-delete field, so maybeDeleted() is false and the API forces purge
+// semantics, checking $item->can($id, PURGE). CommonDBTM::can(..., PURGE)
+// covers both static canPurge() and instance canPurgeItem(); Profile_User
+// inherits static canPurge() from CommonDBRelation, whose canPurge() checks
+// relation *update* capability on the relation's "related" side, i.e. User
+// UPDATE, not User PURGE. Profile_User::canPurgeItem() additionally blocks
+// deleting the last super-admin authorization but adds no User PURGE
+// requirement. DELETE and PURGE on "user" are therefore intentionally
+// omitted; the adapter never deletes or purges User objects directly.
 $service_profile_id = add_profile_or_fail('permissionsync-service-account', [
     'user'    => READ | CREATE | UPDATE,
     'entity'  => READ,

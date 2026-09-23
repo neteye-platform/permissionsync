@@ -22,7 +22,7 @@
 //! `integration/glpi/teardown.sh` can still be run manually against it. Do not
 //! leave a bootstrapped environment running once diagnostics/teardown are done.
 
-use std::{env, fs, process::Command, time::Duration};
+use std::{env, fs, path::Path, process::Command, time::Duration};
 
 use permissionsync_adapter_glpi::{
     GlpiAdapter, GlpiAdapterConfig, GlpiAppToken, GlpiAuthenticationSource, GlpiUserToken,
@@ -62,6 +62,11 @@ struct RealGlpiEnvironment {
     /// Full `Entity.completename` of the second sibling branch granted to the
     /// topology service account above.
     topology_branch_two: String,
+    /// Host directory bind-mounted into the `tls-proxy` container at
+    /// `/var/log/nginx/killsession`, containing only the non-secret
+    /// `killsession.log` (timestamp, method, status) written by the dedicated
+    /// `nginx.conf` `location = /apirest.php/killSession` block.
+    proxy_log_dir: String,
 }
 
 /// Loads the credentials emitted by the disposable bootstrap. This deliberately
@@ -93,6 +98,7 @@ fn real_environment() -> RealGlpiEnvironment {
         target_profile_c: required("GLPI_TEST_TARGET_PROFILE_C"),
         topology_user_token: required("GLPI_TEST_TOPOLOGY_USER_TOKEN"),
         topology_branch_two: required("GLPI_TEST_TOPOLOGY_BRANCH_TWO"),
+        proxy_log_dir: required("GLPI_TEST_PROXY_LOG_DIR"),
     }
 }
 
@@ -360,10 +366,13 @@ fn insert_fixture_recursive_variant(
 /// user-token, Session-Token authenticated V1 requests, and `Profile_User`
 /// REST CRUD. The adapter intentionally does not expose its session token, and
 /// GLPI exposes no V1 endpoint to query a particular opaque session after it is
-/// killed, so a test cannot identify and inspect that session without adding a
-/// production hook or relying on GLPI's non-portable session storage. The fake
-/// conformance suite retains the request-level `killSession` proof; this real
-/// suite does not falsely claim that final assignment state proves cleanup.
+/// killed, so a test cannot identify and inspect that specific session without
+/// adding a production hook or relying on GLPI's non-portable session storage.
+/// Cleanup itself (`killSession` actually reaching the real endpoint) is
+/// separately proved at the TLS-proxy boundary by
+/// `production_adapter_killsession_is_observed_at_the_tls_proxy_boundary`
+/// below, which observes the dedicated `nginx.conf` access log rather than
+/// inspecting any session.
 #[tokio::test]
 #[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
 async fn missing_user_is_created_through_v1_and_gains_a_canonical_assignment() {
@@ -854,5 +863,55 @@ async fn all_entities_semantics_succeeds_with_full_non_recursive_entity_coverage
         environment.topology_branch_two.as_str(),
         profile,
         0,
+    );
+}
+
+/// Proves that the production adapter's `killSession` request really reaches
+/// the real `apirest.php` endpoint, observed independently at the TLS-proxy
+/// boundary rather than by inspecting any session. `nginx.conf` logs only
+/// non-secret facts (timestamp, method, status) for
+/// `location = /apirest.php/killSession` to an append-only file bind-mounted
+/// from `GLPI_TEST_PROXY_LOG_DIR`. Other tests in this suite run concurrently
+/// and also append to this same log, so this test asserts only that the line
+/// count strictly increases and that a `200` line is present after a
+/// successful reconciliation, never an exact delta: every appended line is
+/// still proof that a real killSession request from the production adapter
+/// reached the real endpoint through the real TLS proxy.
+#[tokio::test]
+#[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
+async fn production_adapter_killsession_is_observed_at_the_tls_proxy_boundary() {
+    let environment = real_environment();
+    let username = "permissionsync-real-killsession-proxy-observed";
+    let profile = environment.target_profile_b.as_str();
+    let log_path = Path::new(&environment.proxy_log_dir).join("killsession.log");
+
+    let lines_before = fs::read_to_string(&log_path)
+        .unwrap_or_default()
+        .lines()
+        .count();
+
+    assert_eq!(
+        reconcile(
+            &environment,
+            username,
+            &root_permissions_payload(&[(profile, true)]),
+        )
+        .await
+        .expect("V1 reconciliation must succeed"),
+        ReconciliationOutcome::Changed
+    );
+
+    let contents_after = fs::read_to_string(&log_path)
+        .unwrap_or_else(|error| panic!("killsession proxy log at {log_path:?} must exist and be readable after a successful reconciliation: {error}"));
+    let lines_after: Vec<&str> = contents_after.lines().collect();
+    assert!(
+        lines_after.len() > lines_before,
+        "expected the killsession proxy log to grow after a successful reconciliation"
+    );
+    assert!(
+        lines_after[lines_before..]
+            .iter()
+            .any(|line| line.contains(" 200")),
+        "expected at least one newly appended killSession proxy log line with HTTP status 200"
     );
 }

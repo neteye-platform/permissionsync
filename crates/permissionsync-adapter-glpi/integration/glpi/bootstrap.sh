@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 # Bootstrap a disposable GLPI 11.0.9 environment for the ignored real suite.
-# NOTE: Docker is unavailable in the current development environment, so this
-# bootstrap and the real suite remain unexecuted locally.
 # diagnostics.sh and teardown.sh own failure diagnostics and destructive
 # cleanup, respectively. On a local failure after the runtime directory is
 # created, this script reports the safe runtime-env locator (never its
@@ -17,9 +15,15 @@ compose_base_stdout="${runtime_dir}/compose-base.stdout"
 compose_base_stderr="${runtime_dir}/compose-base.stderr"
 project_name="permissionsync-glpi-real-$$-${RANDOM}"
 tls_dir="${runtime_dir}/tls"
+proxy_log_dir="${runtime_dir}/proxy-logs"
 
 umask 077
 mkdir -p "$tls_dir"
+mkdir -p "$proxy_log_dir"
+# This ephemeral test-only directory holds no secrets, only the killSession
+# proxy log's timestamp/method/status lines; the official nginx image's
+# worker process runs as an unprivileged user, so it must be writable by it.
+chmod 777 "$proxy_log_dir"
 touch "$runtime_env" "$bootstrap_stdout" "$bootstrap_stderr" "$compose_base_stdout" "$compose_base_stderr"
 chmod 600 "$runtime_env" "$bootstrap_stdout" "$bootstrap_stderr" "$compose_base_stdout" "$compose_base_stderr"
 
@@ -63,6 +67,7 @@ trap report_recovery_on_failure EXIT
 env_put GLPI_TEST_DB_ROOT_PASSWORD "$(openssl rand -hex 24)"
 env_put GLPI_TEST_DB_PASSWORD "$(openssl rand -hex 24)"
 env_put GLPI_TEST_TLS_DIR "$tls_dir"
+env_put GLPI_TEST_PROXY_LOG_DIR "$proxy_log_dir"
 env_put PERMISSIONSYNC_GLPI_PROJECT_NAME "$project_name"
 env_put GLPI_TEST_RUNTIME_DIR "$runtime_dir"
 env_put GLPI_TEST_RUNTIME_ENV "$runtime_env"
@@ -181,6 +186,7 @@ env_put GLPI_TEST_COMPOSE_PROJECT "$project_name"
 source "$runtime_env"
 
 init_response="${runtime_dir}/init-session.json"
+killsession_response="${runtime_dir}/kill-session.txt"
 init_session_deadline=$((SECONDS + 60))
 init_session_ok=0
 while ((SECONDS <= init_session_deadline)); do
@@ -199,17 +205,20 @@ PY
 )" || session_token=''
     if [[ -n "$session_token" ]]; then
       mask_secret "$session_token"
-      curl --cacert "${tls_dir}/ca.crt" --silent --show-error --output /dev/null \
+      kill_status="$(curl --cacert "${tls_dir}/ca.crt" --silent --show-error --output "$killsession_response" --write-out '%{http_code}' \
         -H "Session-Token: ${session_token}" \
         -H "App-Token: ${GLPI_TEST_APP_TOKEN}" \
-        "https://127.0.0.1:${GLPI_TEST_HTTPS_PORT}/apirest.php/killSession" >/dev/null
-      init_session_ok=1
-      break
+        "https://127.0.0.1:${GLPI_TEST_HTTPS_PORT}/apirest.php/killSession" 2>/dev/null)" || kill_status=''
+      kill_body="$(tr -d '[:space:]' < "$killsession_response" 2>/dev/null)" || kill_body=''
+      if [[ "$kill_status" == '200' && "$kill_body" == 'true' ]]; then
+        init_session_ok=1
+        break
+      fi
     fi
   fi
   sleep 2
 done
-rm -f "$init_response"
+rm -f "$init_response" "$killsession_response"
 
 if [[ "$init_session_ok" != '1' ]]; then
   printf '%s\n' 'initSession did not succeed with the generated credentials.' >&2
