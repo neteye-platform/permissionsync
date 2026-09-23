@@ -249,4 +249,35 @@ mod tests {
         assert_eq!(assignments[0].entity, "  Root Entity > IT ");
         assert_eq!(assignments[0].profile, "TECH");
     }
+
+    /// This normalization layer treats `entity` as an opaque selector string;
+    /// it must not split, parse, or otherwise interpret the `>` nested-path
+    /// separator that the resolution layer later gives meaning to (ADR 0009,
+    /// "User, entity, and profile resolution").
+    #[test]
+    fn nested_path_selectors_survive_as_one_opaque_string() {
+        let assignments = parse_and_normalize(
+            r#"{"permissions": [{"entity": "Root entity > IT > Operations", "profile": "Technician > Senior", "recursive": true}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].entity, "Root entity > IT > Operations");
+        assert_eq!(assignments[0].profile, "Technician > Senior");
+    }
+
+    /// Selector strings are opaque byte sequences to this normalization
+    /// layer; Unicode content must survive byte-for-byte with no
+    /// normalization, case-folding, or encoding change.
+    #[test]
+    fn unicode_selectors_survive_byte_for_byte() {
+        let assignments = parse_and_normalize(
+            r#"{"permissions": [{"entity": "Räume > Büro > Abteilung", "profile": "Café Técnico 日本語 🎉", "recursive": false}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].entity, "Räume > Büro > Abteilung");
+        assert_eq!(assignments[0].profile, "Café Técnico 日本語 🎉");
+    }
 }

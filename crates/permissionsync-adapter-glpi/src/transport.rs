@@ -129,9 +129,7 @@ async fn run(
     check_deadline(effective_deadline)?;
     let address = resolve_one_address(host, port, effective_deadline).await?;
     check_deadline(effective_deadline)?;
-    let tcp_stream = TcpStream::connect(address)
-        .await
-        .map_err(|_| GlpiFailure::Transport)?;
+    let tcp_stream = connect_to_address(&TcpConnector, address).await?;
 
     check_deadline(effective_deadline)?;
     let tls_stream = tls_connector
@@ -320,6 +318,41 @@ async fn resolve_one_address(
     .await
 }
 
+/// Abstracts "connect to one already-selected [`SocketAddr`]" so the
+/// single-attempt connect step can be exercised with a counting fake in
+/// tests, without making DNS resolution or address selection injectable.
+/// [`TcpConnector`] is the only production implementation.
+trait Connector {
+    type Stream;
+
+    async fn connect(&self, address: SocketAddr) -> std::io::Result<Self::Stream>;
+}
+
+/// Production [`Connector`]: a thin wrapper around `TcpStream::connect`.
+struct TcpConnector;
+
+impl Connector for TcpConnector {
+    type Stream = TcpStream;
+
+    async fn connect(&self, address: SocketAddr) -> std::io::Result<TcpStream> {
+        TcpStream::connect(address).await
+    }
+}
+
+/// Performs the one bounded connect attempt to `address` via `connector`.
+/// Kept separate from `run` so the exactly-once, exactly-this-address
+/// connect step is directly testable with a counting fake [`Connector`],
+/// without needing to fabricate a real `TcpStream`.
+async fn connect_to_address<C: Connector>(
+    connector: &C,
+    address: SocketAddr,
+) -> Result<C::Stream, GlpiFailure> {
+    connector
+        .connect(address)
+        .await
+        .map_err(|_| GlpiFailure::Transport)
+}
+
 /// Chooses the one concrete address passed to `TcpStream::connect`. Keeping
 /// selection separate makes the no-fan-out boundary directly testable without
 /// making the system-configured resolver injectable.
@@ -490,14 +523,11 @@ fn check_deadline(effective_deadline: Instant) -> Result<(), GlpiFailure> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
-
-    use hyper::Method;
-    use url::Url;
+    use std::{cell::Cell, net::SocketAddr};
 
     use super::{
-        RESPONSE_BODY_LIMIT_BYTES, accumulate_within_limit, request, resolve_one_address,
-        selected_socket_address,
+        Connector, RESPONSE_BODY_LIMIT_BYTES, accumulate_within_limit, connect_to_address,
+        resolve_one_address, selected_socket_address,
     };
     use crate::error::GlpiFailure;
 
@@ -572,53 +602,74 @@ mod tests {
         );
     }
 
-    /// Behavioral single-attempt proof for `run`'s connect step: given a
-    /// resolved address with nothing listening, the transport fails with
-    /// exactly one connection attempt rather than falling back to try a
-    /// second candidate address. `run` has exactly one
-    /// `TcpStream::connect(address)` call site and no retry/fallback loop
-    /// (see its source above `resolve_one_address`), so a resolved address
-    /// with a closed port is sufficient to observe this: if a second,
-    /// different-address fallback attempt existed, this test could not tell
-    /// the difference between "one attempt" and "more than one attempt"
-    /// without an injectable multi-candidate resolver seam. Adding such a
-    /// seam would require new production surface area purely for this test,
-    /// which this task's constraints (no new public API) rule out; this
-    /// test instead pins the single-call-site invariant so any future
-    /// fallback loop introduced at this call site becomes a visible
-    /// intentional diff here, and complements the pure
-    /// `resolver_selection_chooses_one_ipv4_socket_address_when_both_families_resolve`
-    /// selection-boundary test above.
+    /// Composes with `resolver_selection_chooses_one_ipv4_socket_address_when_both_families_resolve`
+    /// above: that test proves selection picks exactly one `SocketAddr` from
+    /// two resolved candidates; this test reuses that same selection and
+    /// proves the connect step built on top of it (a) invokes the connector
+    /// exactly once, for the selected address only, (b) never invokes the
+    /// connector for the other, non-selected candidate address, and (c)
+    /// surfaces the sole attempt's failure as `GlpiFailure::Transport`. A
+    /// counting fake `Connector` is used instead of a real `TcpStream` so
+    /// this stays hermetic and deterministic: no real network, no dropped
+    /// listener ports, no timing-dependent "connection refused" heuristic.
     #[tokio::test]
-    async fn failed_connect_to_the_one_resolved_address_is_a_single_bounded_attempt() {
-        use std::time::{Duration, Instant};
+    async fn connect_attempts_exactly_the_selected_candidate_and_never_the_other() {
+        struct CountingConnector {
+            selected_address: SocketAddr,
+            other_address: SocketAddr,
+            selected_calls: Cell<u32>,
+            other_calls: Cell<u32>,
+        }
 
-        use tokio::net::TcpListener;
+        impl Connector for CountingConnector {
+            type Stream = ();
 
-        // Bind then immediately drop the listener: its port is very likely
-        // to still refuse connections deterministically (loopback
-        // "connection refused"), giving a fast, non-flaky, non-sleeping
-        // negative TCP connect outcome.
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("bind ephemeral loopback listener");
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+            async fn connect(&self, address: SocketAddr) -> std::io::Result<()> {
+                if address == self.selected_address {
+                    self.selected_calls.set(self.selected_calls.get() + 1);
+                } else if address == self.other_address {
+                    self.other_calls.set(self.other_calls.get() + 1);
+                }
+                Err(std::io::Error::other("simulated connect refusal"))
+            }
+        }
 
-        let url: Url = format!("https://127.0.0.1:{port}/apirest.php/initSession")
-            .parse()
-            .expect("valid url");
-        let tls = native_tls::TlsConnector::builder()
-            .build()
-            .expect("tls connector");
-        let tls_connector = tokio_native_tls::TlsConnector::from(tls);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let port = 8443;
+        let ipv4_address = "192.0.2.44".parse().expect("IPv4 address");
+        let ipv6_address = "2001:db8::44".parse().expect("IPv6 address");
 
-        let result = request(&tls_connector, Method::GET, &url, &[], None, deadline).await;
+        // Two candidates exist, per `resolve_one_address`'s parallel A/AAAA
+        // queries; `selected_socket_address` chooses exactly one.
+        let selected = selected_socket_address(Some(ipv4_address), Some(ipv6_address), port)
+            .expect("selection must choose exactly one address from two candidates");
+        let other = SocketAddr::new(ipv6_address, port);
+        assert_ne!(
+            selected, other,
+            "selection must not choose the non-preferred candidate"
+        );
+
+        let connector = CountingConnector {
+            selected_address: selected,
+            other_address: other,
+            selected_calls: Cell::new(0),
+            other_calls: Cell::new(0),
+        };
+
+        let result = connect_to_address(&connector, selected).await;
 
         assert!(
             matches!(result, Err(GlpiFailure::Transport)),
-            "a refused connect to the one resolved address must fail as a transport error"
+            "the sole connect attempt's failure must surface as a transport error"
+        );
+        assert_eq!(
+            connector.selected_calls.get(),
+            1,
+            "the connector must be invoked exactly once, for the selected address"
+        );
+        assert_eq!(
+            connector.other_calls.get(),
+            0,
+            "the connector must never be invoked for the non-selected candidate"
         );
     }
 }
