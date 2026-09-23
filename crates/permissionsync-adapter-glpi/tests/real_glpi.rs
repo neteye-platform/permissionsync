@@ -2,7 +2,8 @@
 //!
 //! These ignored tests exercise the production GLPI V1 `apirest.php` contract
 //! against the disposable environment created by `integration/glpi/bootstrap.sh`.
-//! Invoke them explicitly after sourcing the runtime environment it prints:
+//! Invoke them explicitly after sourcing the runtime environment it prints,
+//! and tear the environment down afterward regardless of the test outcome:
 //!
 //! ```sh
 //! source <(crates/permissionsync-adapter-glpi/integration/glpi/bootstrap.sh)
@@ -10,10 +11,16 @@
 //! source "$GLPI_TEST_RUNTIME_ENV"
 //! set +a
 //! cargo test -p permissionsync-adapter-glpi --test real_glpi --locked -- --ignored
+//! crates/permissionsync-adapter-glpi/integration/glpi/teardown.sh
 //! ```
 //!
 //! Every test hard-fails when the bootstrap environment is absent or incomplete;
 //! an ignored test that silently returns would be indistinguishable from success.
+//! If bootstrap itself fails after creating the disposable runtime directory, it
+//! reports the safe `$GLPI_TEST_RUNTIME_ENV` locator on stderr (never its
+//! contents or any credential) so `integration/glpi/diagnostics.sh` and
+//! `integration/glpi/teardown.sh` can still be run manually against it. Do not
+//! leave a bootstrapped environment running once diagnostics/teardown are done.
 
 use std::{env, fs, process::Command, time::Duration};
 
