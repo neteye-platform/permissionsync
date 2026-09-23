@@ -1,14 +1,4 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["github>neteye-platform/repo-commons"],
-  "packageRules": [
-    {
-      "description": "GLPI real-integration test images (ADR 0009): version and digest updates must open a normally reviewed pull request and never auto-merge.",
-      "matchFileNames": [
-        "crates/permissionsync-adapter-glpi/tests/real-glpi/docker-compose.yml"
-      ],
-      "matchDatasources": ["docker"],
-      "automerge": false
-    }
-  ]
+  "extends": ["github>neteye-platform/repo-commons"]
 }

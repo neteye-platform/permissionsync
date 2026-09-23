@@ -1,7 +1,6 @@
----
 name: GLPI Adapter Tests
 
-"on":
+on:
   pull_request:
     branches:
       - "**"
@@ -16,8 +15,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout repository
-        # actions/checkout v7.0.1
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -25,7 +23,7 @@ jobs:
         run: rustup toolchain install
 
       - name: Bootstrap disposable GLPI environment
-        working-directory: crates/permissionsync-adapter-glpi/tests/real-glpi
+        working-directory: crates/permissionsync-adapter-glpi/integration/glpi
         run: ./bootstrap.sh
 
       - name: Run the real GLPI integration suite
@@ -41,23 +39,10 @@ jobs:
 
       - name: Collect GLPI container logs on failure
         if: failure()
-        working-directory: crates/permissionsync-adapter-glpi/tests/real-glpi
-        run: |
-          if [[ -z "${GLPI_TEST_RUNTIME_ENV:-}" || ! -f "${GLPI_TEST_RUNTIME_ENV:-/nonexistent}" ]]; then
-            printf '%s\n' 'bootstrap failed before runtime initialization; no docker logs available'
-            exit 0
-          fi
-          # shellcheck disable=SC1090
-          source "$GLPI_TEST_RUNTIME_ENV"
-          # Diagnostics are best-effort here: the primary failure is already
-          # recorded by the earlier step, and a missing compose project (e.g.
-          # bootstrap failed before `compose up` ever ran) must not mask it or
-          # fail this already-diagnostic-only step.
-          docker compose --env-file "$GLPI_TEST_RUNTIME_ENV" \
-            -p "$PERMISSIONSYNC_GLPI_PROJECT_NAME" \
-            logs --no-color glpi db tls-proxy || printf '%s\n' 'docker compose logs unavailable; project may not have started.'
+        working-directory: crates/permissionsync-adapter-glpi/integration/glpi
+        run: ./diagnostics.sh
 
       - name: Tear down the disposable environment
         if: always()
-        working-directory: crates/permissionsync-adapter-glpi/tests/real-glpi
+        working-directory: crates/permissionsync-adapter-glpi/integration/glpi
         run: ./teardown.sh
