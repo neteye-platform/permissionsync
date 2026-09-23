@@ -48,6 +48,15 @@ struct RealGlpiEnvironment {
     target_profile_a: String,
     target_profile_b: String,
     target_profile_c: String,
+    /// User token of a second, dedicated service account used only by the
+    /// sibling-entity visibility topology test. This account holds separate
+    /// non-recursive `Profile_User` rows on two independent sibling entities
+    /// under `Root entity` and, deliberately, none on `Root entity` itself
+    /// (see `tests/real-glpi/bootstrap.php`).
+    topology_user_token: String,
+    /// Full `Entity.completename` of the second sibling branch granted to the
+    /// topology service account above.
+    topology_branch_two: String,
 }
 
 /// Loads the credentials emitted by the disposable bootstrap. This deliberately
@@ -77,6 +86,8 @@ fn real_environment() -> RealGlpiEnvironment {
         target_profile_a: required("GLPI_TEST_TARGET_PROFILE_A"),
         target_profile_b: required("GLPI_TEST_TARGET_PROFILE_B"),
         target_profile_c: required("GLPI_TEST_TARGET_PROFILE_C"),
+        topology_user_token: required("GLPI_TEST_TOPOLOGY_USER_TOKEN"),
+        topology_branch_two: required("GLPI_TEST_TOPOLOGY_BRANCH_TWO"),
     }
 }
 
@@ -770,5 +781,87 @@ async fn current_assignment_pagination_removes_a_stale_row_from_a_later_page() {
             .await
             .expect("repeated pagination reconciliation must succeed"),
         ReconciliationOutcome::Unchanged
+    );
+}
+
+/// Proves ADR 0009's `changeActiveEntities` fix (omit `entities_id` so GLPI
+/// applies "all entities" semantics; see `src/session.rs`) against a topology
+/// where "all entities" cannot be reproduced by selecting `Root entity`
+/// recursively.
+///
+/// The dedicated topology service account provisioned by
+/// `tests/real-glpi/bootstrap.php` holds two separate non-recursive
+/// `Profile_User` rows, one on each of two independent sibling entities under
+/// `Root entity`, and deliberately none on `Root entity` itself. GLPI's
+/// `Session::changeActiveEntities()` (src/Session.php, 11.0.9) only allows
+/// selecting a specific numeric `entities_id` when the account holds a
+/// `Profile_User` row on that id or one of its ancestors; since this account
+/// has no row on `Root entity` (id 0), any request for `entities_id => 0` --
+/// recursive or not -- is structurally impossible for it. Only omitting
+/// `entities_id` ("all") succeeds, and it resolves to exactly the union of
+/// this account's own branches. A production reconciliation against the
+/// second branch below can therefore only succeed because the adapter omits
+/// `entities_id`: no root-recursive selection could ever reach it, because
+/// this account never has a `Root entity` grant to select from in the first
+/// place. This is a stronger, non-coincidental distinction than asserting
+/// `glpishowallentities == 1` after a manual `getFullSession` call, which
+/// would also be `1` for a root-recursive selection whenever the account
+/// additionally happens to hold a `Root entity` grant (as the default service
+/// account intentionally does, to keep every other test in this suite able to
+/// operate on `Root entity`).
+#[tokio::test]
+#[ignore = "requires a disposable real GLPI environment; see tests/real-glpi/bootstrap.sh"]
+async fn all_entities_semantics_reach_a_sibling_branch_with_no_root_grant() {
+    let environment = real_environment();
+    let username = "permissionsync-real-topology-branch-two";
+    let profile = environment.target_profile_a.as_str();
+
+    let topology_adapter = GlpiAdapter::new(GlpiAdapterConfig {
+        endpoint: environment.endpoint.clone(),
+        app_token: GlpiAppToken::new(environment.app_token.clone()),
+        user_token: GlpiUserToken::new(environment.topology_user_token.clone()),
+        operation_timeout: Duration::from_secs(20),
+        additional_trust_anchors_pem: vec![environment.ca_pem.clone()],
+        authentication_source: GlpiAuthenticationSource::default(),
+    })
+    .expect("valid disposable topology-account adapter configuration");
+
+    let identity = IdentityContext::new(username.to_owned(), vec![]);
+    let payload = serde_json::json!({
+        "permissions": [{
+            "entity": environment.topology_branch_two,
+            "profile": profile,
+            "recursive": false,
+        }],
+    })
+    .to_string();
+    let envelope = DesiredStateEnvelope::new(
+        EnvelopeVersion::new(1),
+        OpaquePayload::try_from(payload).expect("valid test JSON payload"),
+    );
+    let cancellation = NeverCancelled;
+    let context = SynchronizationContext::new(
+        std::time::Instant::now() + Duration::from_secs(60),
+        &cancellation,
+    );
+
+    assert_eq!(
+        topology_adapter
+            .reconcile(TargetAdapterRequest::new(&identity, &envelope, context))
+            .await
+            .expect(
+                "reconciliation against a sibling branch must succeed: it can only do so \
+                 through 'all entities' semantics, since the topology account holds no Root \
+                 entity Profile_User row from which any root-recursive selection could reach \
+                 this branch"
+            ),
+        ReconciliationOutcome::Changed
+    );
+    assert_exactly_one_physical_assignment(
+        &environment,
+        username,
+        environment.topology_branch_two.as_str(),
+        profile,
+        0,
     );
 }

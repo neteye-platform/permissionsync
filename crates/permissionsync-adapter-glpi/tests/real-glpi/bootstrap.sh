@@ -25,29 +25,20 @@ env_put() {
   printf "%s='%s'\n" "$name" "$escaped" >> "$runtime_env"
 }
 
-find_free_port() {
-  python3 - <<'PY'
-import socket
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as socket_:
-    socket_.bind(("127.0.0.1", 0))
-    print(socket_.getsockname()[1])
-PY
-}
-
 env_put GLPI_TEST_DB_ROOT_PASSWORD "$(openssl rand -hex 24)"
 env_put GLPI_TEST_DB_PASSWORD "$(openssl rand -hex 24)"
-env_put GLPI_TEST_HTTP_PORT "$(find_free_port)"
-env_put GLPI_TEST_HTTPS_PORT "$(find_free_port)"
 env_put GLPI_TEST_TLS_DIR "$tls_dir"
 env_put PERMISSIONSYNC_GLPI_PROJECT_NAME "$project_name"
 env_put GLPI_TEST_RUNTIME_DIR "$runtime_dir"
 env_put GLPI_TEST_RUNTIME_ENV "$runtime_env"
 
-# shellcheck disable=SC1090
-source "$runtime_env"
-env_put GLPI_TEST_ENDPOINT "https://127.0.0.1:${GLPI_TEST_HTTPS_PORT}/apirest.php"
-env_put GLPI_TEST_CA_PEM_PATH "${tls_dir}/ca.crt"
-env_put GLPI_TEST_COMPOSE_PROJECT "$project_name"
+# Export the runtime-env locator to $GITHUB_ENV as soon as the runtime
+# directory and its diagnostic files exist, so a later CI step can find
+# bootstrap.stderr/compose-base.stderr even if bootstrap fails below. This is
+# a filesystem path locator only; it is never a secret value.
+if [[ -n "${GITHUB_ENV:-}" ]]; then
+  printf 'GLPI_TEST_RUNTIME_ENV=%s\n' "$runtime_env" >> "$GITHUB_ENV"
+fi
 
 compose() {
   docker compose --env-file "$runtime_env" -p "$project_name" "$@"
@@ -55,10 +46,15 @@ compose() {
 
 cleanup_failed_bootstrap() {
   local status=$?
+  # Best-effort teardown of any containers/volumes that may have started.
+  # Deliberately does NOT delete runtime_dir: bootstrap.stderr,
+  # compose-base.stderr, and other diagnostics must remain available for the
+  # workflow's dedicated failure-diagnostics step. teardown.sh (invoked by the
+  # workflow's `if: always()` step) is the sole owner of final directory
+  # deletion.
   if ! compose down --volumes --remove-orphans >/dev/null 2>&1; then
     printf '%s\n' 'GLPI bootstrap cleanup failed; docker compose down diagnostics were redacted.' >&2
   fi
-  rm -rf "$runtime_dir"
   exit "$status"
 }
 trap cleanup_failed_bootstrap EXIT INT TERM
@@ -77,6 +73,19 @@ if ! compose up -d --wait --wait-timeout 180 db glpi >"$compose_base_stdout" 2>"
   printf '%s\n' 'GLPI base containers did not start; captured output was redacted.' >&2
   exit 1
 fi
+
+# Docker assigned the host port when the compose file published it with an
+# empty host-port component (`127.0.0.1::80`); discover the real bound port
+# now instead of preselecting one and racing another process for it.
+http_port_mapping="$(compose port glpi 80)"
+http_port="${http_port_mapping##*:}"
+if [[ -z "$http_port" || ! "$http_port" =~ ^[0-9]+$ ]]; then
+  printf '%s\n' 'Could not determine the Docker-assigned GLPI HTTP host port.' >&2
+  exit 1
+fi
+env_put GLPI_TEST_HTTP_PORT "$http_port"
+# shellcheck disable=SC1090
+source "$runtime_env"
 
 deadline=$((SECONDS + 120))
 until curl --fail --silent --show-error "http://127.0.0.1:${GLPI_TEST_HTTP_PORT}/status.php" >/dev/null; do
@@ -104,6 +113,8 @@ expected = {
     "TARGET_PROFILE_A": "GLPI_TEST_TARGET_PROFILE_A",
     "TARGET_PROFILE_B": "GLPI_TEST_TARGET_PROFILE_B",
     "TARGET_PROFILE_C": "GLPI_TEST_TARGET_PROFILE_C",
+    "TOPOLOGY_USER_TOKEN": "GLPI_TEST_TOPOLOGY_USER_TOKEN",
+    "TOPOLOGY_BRANCH_TWO": "GLPI_TEST_TOPOLOGY_BRANCH_TWO",
 }
 values = {}
 with open(output_path, encoding="utf-8") as output:
@@ -124,8 +135,30 @@ PY
 source "$runtime_env"
 printf '::add-mask::%s\n' "$GLPI_TEST_APP_TOKEN"
 printf '::add-mask::%s\n' "$GLPI_TEST_USER_TOKEN"
+printf '::add-mask::%s\n' "$GLPI_TEST_TOPOLOGY_USER_TOKEN"
 
-compose up -d --wait --wait-timeout 60 tls-proxy
+if ! compose up -d --wait --wait-timeout 60 tls-proxy >/dev/null; then
+  printf '%s\n' 'GLPI tls-proxy did not start.' >&2
+  exit 1
+fi
+
+https_port_mapping="$(compose port tls-proxy 8443)"
+https_port="${https_port_mapping##*:}"
+if [[ -z "$https_port" || ! "$https_port" =~ ^[0-9]+$ ]]; then
+  printf '%s\n' 'Could not determine the Docker-assigned tls-proxy HTTPS host port.' >&2
+  exit 1
+fi
+env_put GLPI_TEST_HTTPS_PORT "$https_port"
+# shellcheck disable=SC1090
+source "$runtime_env"
+
+# GLPI_TEST_ENDPOINT depends on the real (not preselected) HTTPS port, so it
+# is computed only now that port is known.
+env_put GLPI_TEST_ENDPOINT "https://127.0.0.1:${GLPI_TEST_HTTPS_PORT}/apirest.php"
+env_put GLPI_TEST_CA_PEM_PATH "${tls_dir}/ca.crt"
+env_put GLPI_TEST_COMPOSE_PROJECT "$project_name"
+# shellcheck disable=SC1090
+source "$runtime_env"
 
 init_response="${runtime_dir}/init-session.json"
 init_session_deadline=$((SECONDS + 60))
@@ -163,8 +196,5 @@ if [[ "$init_session_ok" != '1' ]]; then
   exit 1
 fi
 
-if [[ -n "${GITHUB_ENV:-}" ]]; then
-  printf 'GLPI_TEST_RUNTIME_ENV=%s\n' "$runtime_env" >> "$GITHUB_ENV"
-fi
 trap - EXIT INT TERM
 printf 'export GLPI_TEST_RUNTIME_ENV=%q\n' "$runtime_env"
