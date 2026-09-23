@@ -21,7 +21,7 @@ umask 077
 mkdir -p "$tls_dir"
 mkdir -p "$proxy_log_dir"
 # This ephemeral test-only directory holds no secrets, only the killSession
-# proxy log's timestamp/method/status lines; the official nginx image's
+# proxy log's timestamp/method/upstream-status lines; the official nginx image's
 # worker process runs as an unprivileged user, so it must be writable by it.
 chmod 777 "$proxy_log_dir"
 touch "$runtime_env" "$bootstrap_stdout" "$bootstrap_stderr" "$compose_base_stdout" "$compose_base_stderr"
@@ -163,14 +163,14 @@ mask_secret "$GLPI_TEST_USER_TOKEN"
 mask_secret "$GLPI_TEST_TOPOLOGY_USER_TOKEN"
 
 killsession_log="${proxy_log_dir}/killsession.log"
-# The private runtime directory contains only this safe timestamp/method/status
-# log. Initialize it before nginx starts so the exclusive cleanup test can
-# require exactly one record without truncating a live log.
+# The private runtime directory contains only this safe timestamp/method/
+# upstream-status log. Initialize it before nginx starts so the exclusive
+# cleanup test can require exactly one record without truncating a live log.
 : > "$killsession_log"
 chmod 666 "$killsession_log"
 
-if ! compose up -d --wait --wait-timeout 60 tls-proxy >/dev/null; then
-  printf '%s\n' 'GLPI tls-proxy did not start.' >&2
+if ! compose up -d --wait --wait-timeout 60 tls-proxy cleanup-proxy >/dev/null; then
+  printf '%s\n' 'GLPI TLS proxies did not start.' >&2
   exit 1
 fi
 
@@ -181,10 +181,10 @@ if [[ -z "$https_port" || ! "$https_port" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 env_put GLPI_TEST_HTTPS_PORT "$https_port"
-cleanup_https_port_mapping="$(compose port tls-proxy 8444)"
+cleanup_https_port_mapping="$(compose port cleanup-proxy 8444)"
 cleanup_https_port="${cleanup_https_port_mapping##*:}"
 if [[ -z "$cleanup_https_port" || ! "$cleanup_https_port" =~ ^[0-9]+$ ]]; then
-  printf '%s\n' 'Could not determine the Docker-assigned tls-proxy cleanup HTTPS host port.' >&2
+  printf '%s\n' 'Could not determine the Docker-assigned cleanup-proxy HTTPS host port.' >&2
   exit 1
 fi
 env_put GLPI_TEST_CLEANUP_HTTPS_PORT "$cleanup_https_port"

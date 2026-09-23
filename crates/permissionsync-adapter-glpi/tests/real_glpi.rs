@@ -35,6 +35,7 @@ use permissionsync_core::{
 const ROOT_ENTITY: &str = "Root entity";
 const PAGE_SIZE: u64 = 50;
 const PAGINATION_PROFILE_COUNT: u64 = 60;
+const CLEANUP_PROXY_SERVICE: &str = "cleanup-proxy";
 
 struct NeverCancelled;
 
@@ -62,10 +63,11 @@ struct RealGlpiEnvironment {
     /// Full `Entity.completename` of the second sibling branch granted to the
     /// topology service account above.
     topology_branch_two: String,
-    /// Host directory bind-mounted into the `tls-proxy` container at
+    /// Host directory bind-mounted into the `cleanup-proxy` container at
     /// `/var/log/nginx/killsession`, containing only the non-secret
-    /// `killsession.log` (timestamp, method, status) written by the dedicated
-    /// 8444 `nginx.conf` `location = /apirest.php/killSession` block.
+    /// `killsession.log` (timestamp, method, upstream status) written by the
+    /// dedicated 8444 `nginx-cleanup.conf` `location = /apirest.php/killSession`
+    /// block.
     proxy_log_dir: String,
     /// HTTPS endpoint on the dedicated 8444 TLS-proxy listener used only by
     /// the cleanup observation test.
@@ -341,6 +343,83 @@ async fn reconcile(
     glpi_adapter
         .reconcile(TargetAdapterRequest::new(&identity, &envelope, context))
         .await
+}
+
+/// Gracefully stops the dedicated cleanup proxy only after reconciliation.
+/// SIGQUIT lets nginx finish active requests, execute access logging, close
+/// the log, and exit; `docker compose stop` returning after verified clean exit
+/// is therefore the cleanup test's explicit log-visibility barrier.
+fn stop_cleanup_proxy_after_reconciliation(environment: &RealGlpiEnvironment) {
+    let ps_output = Command::new("docker")
+        .args([
+            "compose",
+            "--env-file",
+            &environment.runtime_env,
+            "-p",
+            &environment.compose_project,
+            "ps",
+            "-q",
+            CLEANUP_PROXY_SERVICE,
+        ])
+        .output()
+        .expect("docker compose ps must be invocable against the cleanup proxy");
+    assert!(
+        ps_output.status.success(),
+        "docker compose ps must find the cleanup proxy"
+    );
+    let ps_stdout = String::from_utf8_lossy(&ps_output.stdout);
+    let container_ids = ps_stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        container_ids.len(),
+        1,
+        "docker compose ps must resolve exactly one cleanup proxy container"
+    );
+    let container_id = container_ids[0];
+    assert_eq!(
+        container_id.split_ascii_whitespace().count(),
+        1,
+        "docker compose ps must resolve one cleanup proxy container ID"
+    );
+
+    let stop_output = Command::new("docker")
+        .args([
+            "compose",
+            "--env-file",
+            &environment.runtime_env,
+            "-p",
+            &environment.compose_project,
+            "stop",
+            CLEANUP_PROXY_SERVICE,
+        ])
+        .output()
+        .expect("docker compose stop must be invocable against the cleanup proxy");
+    assert!(
+        stop_output.status.success(),
+        "docker compose stop must stop the cleanup proxy"
+    );
+
+    let inspect_output = Command::new("docker")
+        .args([
+            "inspect",
+            "--format",
+            "{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}}",
+            container_id,
+        ])
+        .output()
+        .expect("docker inspect must be invocable against the cleanup proxy");
+    assert!(
+        inspect_output.status.success(),
+        "docker inspect must report the cleanup proxy state"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&inspect_output.stdout).trim(),
+        "exited 0 false",
+        "cleanup proxy must exit cleanly after graceful stop"
+    );
 }
 
 /// Inserts one fixture row by copying the known canonical row and changing only
@@ -877,9 +956,11 @@ async fn all_entities_semantics_succeeds_with_full_non_recursive_entity_coverage
 
 /// Proves that the production adapter's `killSession` request reaches the real
 /// `apirest.php` endpoint at the TLS-proxy boundary without inspecting a
-/// session token. Only the dedicated 8444 cleanup listener writes this
+/// session token. Only the dedicated `cleanup-proxy` 8444 listener writes this
 /// bind-mounted log; ordinary tests use 8443 and cannot satisfy this proof.
-/// Its sole record contains only timestamp, method, and status facts.
+/// Its graceful SIGQUIT exit drains request finalization/access logging and
+/// closes the log; `docker compose stop` plus verified `exited 0` is the
+/// explicit synchronization barrier before this test reads its sole record.
 #[tokio::test]
 #[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
 async fn production_adapter_killsession_is_observed_at_the_tls_proxy_boundary() {
@@ -916,6 +997,8 @@ async fn production_adapter_killsession_is_observed_at_the_tls_proxy_boundary() 
             .expect("V1 reconciliation through the exclusive cleanup listener must succeed"),
         ReconciliationOutcome::Changed
     );
+    drop(glpi_adapter);
+    stop_cleanup_proxy_after_reconciliation(&environment);
 
     let contents_after = fs::read_to_string(&log_path)
         .unwrap_or_else(|error| panic!("killsession proxy log at {log_path:?} must be readable after a successful reconciliation: {error}"));
@@ -933,7 +1016,7 @@ async fn production_adapter_killsession_is_observed_at_the_tls_proxy_boundary() 
     assert_eq!(
         fields.len(),
         3,
-        "the killsession proxy log record must contain timestamp, method, and status"
+        "the killsession proxy log record must contain timestamp, method, and upstream status"
     );
     assert!(!fields[0].is_empty(), "the log timestamp must not be empty");
     assert_eq!(fields[1], "GET", "killSession must use GET");

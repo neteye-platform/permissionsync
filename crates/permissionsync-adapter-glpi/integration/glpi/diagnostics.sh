@@ -47,10 +47,10 @@ for line in sys.stdin:
 }
 
 if [[ -n "${PERMISSIONSYNC_GLPI_PROJECT_NAME:-}" ]]; then
-  printf '\n=== docker compose logs (glpi db tls-proxy) ===\n'
+  printf '\n=== docker compose logs (glpi db tls-proxy cleanup-proxy) ===\n'
   if ! docker compose --env-file "$runtime_env" \
     -p "$PERMISSIONSYNC_GLPI_PROJECT_NAME" \
-    logs --no-color glpi db tls-proxy 2>&1 | redact; then
+    logs --no-color glpi db tls-proxy cleanup-proxy 2>&1 | redact; then
     printf '%s\n' 'docker compose logs unavailable; project may not have started.'
   fi
 else

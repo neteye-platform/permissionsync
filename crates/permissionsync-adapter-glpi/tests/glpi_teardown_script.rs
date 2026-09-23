@@ -61,35 +61,30 @@ fn create_fresh_test_dir(prefix: &str) -> PathBuf {
     );
 }
 
-/// Return a unique path in the system temporary directory that does not exist.
-/// This is for locators that deliberately must remain absent, so unlike
-/// `create_fresh_test_dir` it never creates or removes anything.
-fn fresh_missing_path(prefix: &str) -> PathBuf {
-    for _ in 0..FRESH_PATH_ALLOCATION_ATTEMPTS {
-        let candidate = env::temp_dir().join(format!("{prefix}{}", unique_suffix()));
-        if !candidate.exists() {
-            return candidate;
+/// RAII guard that best-effort removes exclusively created test directories on
+/// drop, so cleanup still runs even if a test assertion panics partway
+/// through.
+struct CleanupGuard {
+    paths: Vec<PathBuf>,
+}
+
+impl CleanupGuard {
+    fn new(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            paths: paths.into_iter().collect(),
         }
     }
 
-    panic!(
-        "could not allocate a missing test path with prefix {prefix:?} after \
-         {FRESH_PATH_ALLOCATION_ATTEMPTS} attempts"
-    );
-}
-
-/// RAII guard that best-effort removes the runtime directory and fake bin
-/// directory on drop, so cleanup still runs even if a test assertion panics
-/// partway through.
-struct CleanupGuard {
-    runtime_dir: PathBuf,
-    fake_bin_dir: PathBuf,
+    fn add_path(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
 }
 
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.runtime_dir);
-        let _ = fs::remove_dir_all(&self.fake_bin_dir);
+        for path in &self.paths {
+            let _ = fs::remove_dir_all(path);
+        }
     }
 }
 
@@ -159,12 +154,9 @@ fn teardown_succeeds_when_runtime_env_was_never_set() {
 /// tear down": teardown must fail closed with a non-zero exit status.
 #[test]
 fn teardown_fails_when_runtime_env_locator_is_set_but_file_is_missing() {
-    let missing_dir = fresh_missing_path("permissionsync-glpi.teardown-test-missing-");
-    let missing_runtime_env = missing_dir.join("runtime.env");
-    assert!(
-        !missing_runtime_env.exists(),
-        "test precondition: locator must not exist on disk"
-    );
+    let missing_parent = create_fresh_test_dir("permissionsync-glpi-teardown-missing-");
+    let _guard = CleanupGuard::new([missing_parent.clone()]);
+    let missing_runtime_env = missing_parent.join("missing-runtime").join("runtime.env");
 
     let output = Command::new("bash")
         .arg(teardown_script_path())
@@ -192,10 +184,7 @@ fn teardown_preserves_runtime_dir_when_docker_compose_down_fails() {
     let secret_marker = "SECRET-MARKER-DOWN-FAILS-DO-NOT-LEAK";
     let (runtime_dir, runtime_env, fake_bin_dir) =
         setup_runtime_env_and_fake_docker("down-fails", 1, secret_marker);
-    let _guard = CleanupGuard {
-        runtime_dir: runtime_dir.clone(),
-        fake_bin_dir: fake_bin_dir.clone(),
-    };
+    let _guard = CleanupGuard::new([runtime_dir.clone(), fake_bin_dir.clone()]);
 
     let path_var = format!(
         "{}:{}",
@@ -238,10 +227,7 @@ fn teardown_removes_runtime_dir_when_docker_compose_down_succeeds() {
     let secret_marker = "SECRET-MARKER-DOWN-SUCCEEDS";
     let (runtime_dir, runtime_env, fake_bin_dir) =
         setup_runtime_env_and_fake_docker("down-succeeds", 0, secret_marker);
-    let _guard = CleanupGuard {
-        runtime_dir: runtime_dir.clone(),
-        fake_bin_dir: fake_bin_dir.clone(),
-    };
+    let _guard = CleanupGuard::new([runtime_dir.clone(), fake_bin_dir.clone()]);
 
     let path_var = format!(
         "{}:{}",
@@ -275,16 +261,15 @@ fn teardown_fails_when_runtime_env_declares_mismatched_runtime_dir() {
     let secret_marker = "SECRET-MARKER-MISMATCH";
     let (runtime_dir, runtime_env, fake_bin_dir) =
         setup_runtime_env_and_fake_docker("mismatched-dir", 0, secret_marker);
-    let _guard = CleanupGuard {
-        runtime_dir: runtime_dir.clone(),
-        fake_bin_dir: fake_bin_dir.clone(),
-    };
+    let mut guard = CleanupGuard::new([runtime_dir.clone(), fake_bin_dir.clone()]);
 
     // Overwrite runtime.env so it declares a different (bogus) runtime
     // directory than the one it physically resides in. This must trigger
     // teardown.sh's "declares an unexpected runtime directory" fail-closed
     // check, which runs before any `docker compose down` invocation.
-    let bogus_target_dir = fresh_missing_path("permissionsync-glpi.");
+    let bogus_target_parent = create_fresh_test_dir("permissionsync-glpi-mismatch-target-");
+    guard.add_path(bogus_target_parent.clone());
+    let bogus_target_dir = bogus_target_parent.join("missing-runtime");
     assert_ne!(
         bogus_target_dir, runtime_dir,
         "bogus target must differ from the real runtime dir"
