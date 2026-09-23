@@ -208,18 +208,29 @@ async fn read_body(
         let frame = frame.map_err(|_| GlpiFailure::ResponseBody)?;
 
         if let Ok(data) = frame.into_data() {
-            let next_total = bytes
-                .len()
-                .checked_add(data.len())
-                .ok_or(GlpiFailure::ResponseTooLarge)?;
-            if next_total > RESPONSE_BODY_LIMIT_BYTES {
-                return Err(GlpiFailure::ResponseTooLarge);
-            }
+            accumulate_within_limit(bytes.len(), data.len(), RESPONSE_BODY_LIMIT_BYTES)?;
             bytes.extend_from_slice(&data);
         }
     }
 
     Ok(bytes)
+}
+
+/// Adds one received frame length to a running total without allocating from
+/// an untrusted declared content length. Kept separate so the exact boundary
+/// can be tested without buffering oversized response bodies.
+fn accumulate_within_limit(
+    total: usize,
+    chunk_len: usize,
+    limit: usize,
+) -> Result<usize, GlpiFailure> {
+    let next_total = total
+        .checked_add(chunk_len)
+        .ok_or(GlpiFailure::ResponseTooLarge)?;
+    if next_total > limit {
+        return Err(GlpiFailure::ResponseTooLarge);
+    }
+    Ok(next_total)
 }
 
 /// Resolves `host` to exactly one [`SocketAddr`], mirroring
@@ -296,7 +307,7 @@ async fn resolve_one_address(
             }
         }
 
-        if let Some(address) = ipv4_address.or(ipv6_address) {
+        if let Some(address) = selected_socket_address(ipv4_address, ipv6_address, port) {
             return Poll::Ready(Ok(address));
         }
 
@@ -307,7 +318,19 @@ async fn resolve_one_address(
         }
     })
     .await
-    .map(|address| SocketAddr::new(address, port))
+}
+
+/// Chooses the one concrete address passed to `TcpStream::connect`. Keeping
+/// selection separate makes the no-fan-out boundary directly testable without
+/// making the system-configured resolver injectable.
+fn selected_socket_address(
+    ipv4_address: Option<IpAddr>,
+    ipv6_address: Option<IpAddr>,
+    port: u16,
+) -> Option<SocketAddr> {
+    ipv4_address
+        .or(ipv6_address)
+        .map(|address| SocketAddr::new(address, port))
 }
 
 #[derive(Clone, Copy)]
@@ -363,8 +386,9 @@ async fn resolve_record(
     let mut stream = UdpClientStream::builder(name_server.address, TokioRuntimeProvider::new())
         .with_bind_addr(name_server.bind_addr)
         .with_timeout(Some(timeout))
-        // Hickory counts the immediately-started request as task one, so
-        // one is exactly one datagram and no retransmission.
+        // In pinned hickory-net 0.26.3 this value is passed as `max_tasks` to
+        // its retry loop, which starts one task immediately. One therefore
+        // permits the initial datagram only and no retransmission.
         .with_max_retries(1)
         .build();
     let request = DnsRequest::from_query(
@@ -468,11 +492,46 @@ fn check_deadline(effective_deadline: Instant) -> Result<(), GlpiFailure> {
 mod tests {
     use std::net::SocketAddr;
 
-    use super::{RESPONSE_BODY_LIMIT_BYTES, resolve_one_address};
+    use super::{
+        RESPONSE_BODY_LIMIT_BYTES, accumulate_within_limit, resolve_one_address,
+        selected_socket_address,
+    };
 
     #[test]
     fn production_response_body_limit_is_exactly_two_mebibytes() {
         assert_eq!(RESPONSE_BODY_LIMIT_BYTES, 2 * 1_048_576);
+    }
+
+    #[test]
+    fn response_body_limit_accepts_limit_minus_one_and_limit_but_not_limit_plus_one() {
+        assert!(
+            accumulate_within_limit(0, RESPONSE_BODY_LIMIT_BYTES - 1, RESPONSE_BODY_LIMIT_BYTES)
+                .is_ok()
+        );
+        assert!(
+            accumulate_within_limit(0, RESPONSE_BODY_LIMIT_BYTES, RESPONSE_BODY_LIMIT_BYTES)
+                .is_ok()
+        );
+        assert!(
+            accumulate_within_limit(0, RESPONSE_BODY_LIMIT_BYTES + 1, RESPONSE_BODY_LIMIT_BYTES)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn response_body_limit_is_enforced_across_frames() {
+        let total =
+            accumulate_within_limit(0, RESPONSE_BODY_LIMIT_BYTES - 1, RESPONSE_BODY_LIMIT_BYTES)
+                .expect("first frame is within the limit");
+        assert_eq!(total, RESPONSE_BODY_LIMIT_BYTES - 1);
+        assert!(
+            accumulate_within_limit(total, 1, RESPONSE_BODY_LIMIT_BYTES).is_ok(),
+            "a final byte reaches the exact boundary"
+        );
+        assert!(
+            accumulate_within_limit(total, 2, RESPONSE_BODY_LIMIT_BYTES).is_err(),
+            "two more bytes exceed the boundary"
+        );
     }
 
     #[tokio::test]
@@ -484,6 +543,28 @@ mod tests {
         assert_eq!(
             address,
             "192.0.2.44:8443".parse::<SocketAddr>().expect("address")
+        );
+    }
+
+    /// A hermetic resolver integration test cannot provide multiple DNS
+    /// answers: production deliberately reads the host's system resolver
+    /// configuration and sends its UDP queries to that configured server. This
+    /// pure selection seam proves the transport still gives `TcpStream` one
+    /// concrete address, rather than a resolver-owned multi-address target.
+    #[test]
+    fn resolver_selection_chooses_one_ipv4_socket_address_when_both_families_resolve() {
+        let selected = selected_socket_address(
+            Some("192.0.2.44".parse().expect("IPv4 address")),
+            Some("2001:db8::44".parse().expect("IPv6 address")),
+            8443,
+        )
+        .expect("one address is selected");
+
+        assert_eq!(
+            selected,
+            "192.0.2.44:8443"
+                .parse::<SocketAddr>()
+                .expect("socket address")
         );
     }
 }

@@ -6,10 +6,11 @@ use std::{collections::HashMap, time::Instant};
 
 use hyper::Method;
 use permissionsync_core::SynchronizationContext;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    adapter::check_context, config::ValidatedConfig, error::GlpiFailure, session::GlpiSession,
+    adapter::effective_deadline, config::ValidatedConfig, error::GlpiFailure, session::GlpiSession,
     session::session_headers, transport,
 };
 
@@ -115,19 +116,15 @@ async fn search_all_pages(
     forcedisplay: &[u64],
     sort_field: u64,
     context: &SynchronizationContext<'_>,
-    effective_deadline: Instant,
 ) -> Result<Vec<Row>, GlpiFailure> {
     let mut rows = Vec::new();
     let mut start: u64 = 0;
     let mut expected_total: Option<u64> = None;
 
     loop {
-        // Cancellation/deadline must be re-checked at the top of every page
-        // iteration, not only once before the overall paginated search
-        // starts: a large result set can span many pages, each involving a
-        // real outbound request.
-        check_context(context, effective_deadline)?;
-        let end = start + PAGE_SIZE - 1;
+        let end = start
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(GlpiFailure::SearchPagination)?;
         let mut url = config
             .base
             .join(&format!("search/{itemtype}"))
@@ -148,6 +145,10 @@ async fn search_all_pages(
             }
         }
         let headers = session_headers(session, config)?;
+        // Each search page is a separate outbound operation. Compute its
+        // deadline immediately before issuing the request, never once for
+        // the helper-wide pagination loop.
+        let effective_deadline = effective_deadline(context, config.operation_timeout)?;
 
         let response = transport::request(
             &config.tls_connector,
@@ -159,69 +160,189 @@ async fn search_all_pages(
         )
         .await?;
 
-        if response.status != hyper::StatusCode::OK
-            && response.status != hyper::StatusCode::PARTIAL_CONTENT
-        {
+        let page = parse_search_page(&response.body, start, end)?;
+        let expected_status = if page.count == page.total_count {
+            hyper::StatusCode::OK
+        } else {
+            hyper::StatusCode::PARTIAL_CONTENT
+        };
+        if response.status != expected_status {
             return Err(GlpiFailure::SearchPagination);
         }
 
-        let parsed: Value =
-            serde_json::from_slice(&response.body).map_err(|_| GlpiFailure::SearchPagination)?;
-        let object = parsed.as_object().ok_or(GlpiFailure::SearchPagination)?;
-        let total_count = object
-            .get("totalcount")
-            .and_then(Value::as_u64)
-            .ok_or(GlpiFailure::SearchPagination)?;
-        let data = object
-            .get("data")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-
         match expected_total {
-            Some(expected) if expected != total_count => return Err(GlpiFailure::SearchPagination),
-            None => expected_total = Some(total_count),
+            Some(expected) if expected != page.total_count => {
+                return Err(GlpiFailure::SearchPagination);
+            }
+            None => expected_total = Some(page.total_count),
             _ => {}
         }
 
-        if data.is_empty() && (rows.len() as u64) < total_count {
-            // A page must make progress toward the declared total; an empty
-            // page with rows still outstanding is malformed pagination.
-            return Err(GlpiFailure::SearchPagination);
-        }
-
-        for entry in data {
+        for entry in page.data {
             let Some(entry) = entry.as_object() else {
                 return Err(GlpiFailure::SearchPagination);
             };
             let mut row = Row::new();
             for (key, value) in entry {
-                if let Ok(option_id) = key.parse::<u64>() {
-                    row.insert(option_id, value.clone());
-                }
+                let option_id = key
+                    .parse::<u64>()
+                    .map_err(|_| GlpiFailure::SearchPagination)?;
+                row.insert(option_id, value.clone());
             }
             rows.push(row);
         }
 
-        if (rows.len() as u64) >= total_count {
+        if page.total_count == 0 {
             break;
         }
-        start += PAGE_SIZE;
+        if rows.len() as u64 != page.returned_end.saturating_add(1) {
+            return Err(GlpiFailure::SearchPagination);
+        }
+        if rows.len() as u64 == page.total_count {
+            break;
+        }
+        start = page
+            .returned_end
+            .checked_add(1)
+            .ok_or(GlpiFailure::SearchPagination)?;
     }
 
     Ok(rows)
+}
+
+struct SearchPage {
+    total_count: u64,
+    count: u64,
+    returned_end: u64,
+    data: Vec<Value>,
+}
+
+#[derive(Default)]
+enum SearchData {
+    #[default]
+    Missing,
+    Present(Vec<Value>),
+}
+
+impl<'de> Deserialize<'de> for SearchData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Vec::<Value>::deserialize(deserializer).map(Self::Present)
+    }
+}
+
+#[derive(Deserialize)]
+struct WireSearchPage {
+    totalcount: u64,
+    count: u64,
+    #[serde(rename = "content-range")]
+    content_range: String,
+    #[serde(default)]
+    data: SearchData,
+}
+
+/// Parses the exact GLPI 11.0.9 V1 search response metadata. GLPI emits
+/// `0--1/0` with no `data` member for a zero-result search; non-empty result
+/// sets always include an array-valued `data` member and a normal inclusive
+/// `start-end/total` content range.
+fn parse_search_page(
+    body: &[u8],
+    requested_start: u64,
+    requested_end: u64,
+) -> Result<SearchPage, GlpiFailure> {
+    let WireSearchPage {
+        totalcount: total_count,
+        count,
+        content_range,
+        data,
+    } = serde_json::from_slice(body).map_err(|_| GlpiFailure::SearchPagination)?;
+
+    if total_count == 0 {
+        // API::searchItems clamps the requested end to totalcount - 1, which
+        // is -1 for zero results. It does not initialize `data` when no rows
+        // are emitted (API.php:1752-1880 at GLPI 11.0.9).
+        if requested_start != 0
+            || count != 0
+            || content_range != "0--1/0"
+            || !matches!(data, SearchData::Missing)
+        {
+            return Err(GlpiFailure::SearchPagination);
+        }
+        return Ok(SearchPage {
+            total_count,
+            count,
+            returned_end: 0,
+            data: Vec::new(),
+        });
+    }
+
+    let SearchData::Present(data) = data else {
+        return Err(GlpiFailure::SearchPagination);
+    };
+    if count == 0 || count != data.len() as u64 || count > total_count {
+        return Err(GlpiFailure::SearchPagination);
+    }
+
+    let (range, range_total) = content_range
+        .rsplit_once('/')
+        .ok_or(GlpiFailure::SearchPagination)?;
+    let range_total = range_total
+        .parse::<u64>()
+        .map_err(|_| GlpiFailure::SearchPagination)?;
+    let (returned_start, returned_end) =
+        range.split_once('-').ok_or(GlpiFailure::SearchPagination)?;
+    let returned_start = returned_start
+        .parse::<u64>()
+        .map_err(|_| GlpiFailure::SearchPagination)?;
+    let returned_end = returned_end
+        .parse::<u64>()
+        .map_err(|_| GlpiFailure::SearchPagination)?;
+
+    if range_total != total_count
+        || returned_start != requested_start
+        || returned_end < returned_start
+        || returned_end > requested_end
+        || returned_end >= total_count
+        || returned_end
+            .checked_sub(returned_start)
+            .and_then(|width| width.checked_add(1))
+            != Some(count)
+        // A short page is valid only for the final, clamped range. Any other
+        // short page would skip rows when the next request starts at end + 1.
+        || (returned_end != requested_end && returned_end != total_count - 1)
+    {
+        return Err(GlpiFailure::SearchPagination);
+    }
+
+    Ok(SearchPage {
+        total_count,
+        count,
+        returned_end,
+        data: data.clone(),
+    })
 }
 
 fn exact_string_field(row: &Row, field: u64) -> Option<&str> {
     row.get(&field).and_then(Value::as_str)
 }
 
-fn numeric_id(row: &Row, field: u64) -> Option<u64> {
-    row.get(&field).and_then(|value| match value {
-        Value::Number(number) => number.as_u64(),
-        Value::String(text) => text.parse().ok(),
-        _ => None,
-    })
+/// Extracts a numeric id field. `allow_zero` must be `true` only for
+/// `Entity.id`: GLPI's own top-level "Root entity" is physically id `0`
+/// (see `install/empty_data.php`), so a blanket "zero is never a usable id"
+/// rule would make the root entity permanently unresolvable as a desired
+/// selector. Every other itemtype's search-result/candidate id
+/// (`Profile.id`, `User.id`, `Profile_User.id`) is a positive database id;
+/// zero there remains a malformed-reference failure.
+fn numeric_id(row: &Row, field: u64, allow_zero: bool) -> Option<u64> {
+    row.get(&field)
+        .and_then(|value| match value {
+            Value::Number(number) => number.as_u64(),
+            Value::String(text) => text.parse().ok(),
+            _ => None,
+        })
+        .filter(|id| allow_zero || *id != 0)
 }
 
 /// Resolves exactly one GLPI object id whose stable semantic field exactly
@@ -235,8 +356,8 @@ async fn resolve_exact_id(
     id_field: u64,
     name_field: u64,
     selector: &str,
+    allow_zero_id: bool,
     context: &SynchronizationContext<'_>,
-    effective_deadline: Instant,
 ) -> Result<u64, GlpiFailure> {
     let rows = search_all_pages(
         config,
@@ -247,14 +368,14 @@ async fn resolve_exact_id(
         &[id_field, name_field],
         id_field,
         context,
-        effective_deadline,
     )
     .await?;
 
     let mut matches: Vec<u64> = Vec::new();
     for row in &rows {
         if exact_string_field(row, name_field) == Some(selector) {
-            let id = numeric_id(row, id_field).ok_or(GlpiFailure::MalformedReference)?;
+            let id =
+                numeric_id(row, id_field, allow_zero_id).ok_or(GlpiFailure::MalformedReference)?;
             if !matches.contains(&id) {
                 matches.push(id);
             }
@@ -274,7 +395,6 @@ pub(crate) async fn resolve_entity_id(
     options: &SearchOptions,
     selector: &str,
     context: &SynchronizationContext<'_>,
-    effective_deadline: Instant,
 ) -> Result<u64, GlpiFailure> {
     resolve_exact_id(
         config,
@@ -283,8 +403,10 @@ pub(crate) async fn resolve_entity_id(
         options.require("Entity.id")?,
         options.require("Entity.completename")?,
         selector,
+        // GLPI's root entity is physically id 0; it must remain resolvable
+        // as a desired `entity` selector (e.g. bare "Root entity").
+        true,
         context,
-        effective_deadline,
     )
     .await
 }
@@ -295,7 +417,6 @@ pub(crate) async fn resolve_profile_id(
     options: &SearchOptions,
     selector: &str,
     context: &SynchronizationContext<'_>,
-    effective_deadline: Instant,
 ) -> Result<u64, GlpiFailure> {
     resolve_exact_id(
         config,
@@ -304,8 +425,8 @@ pub(crate) async fn resolve_profile_id(
         options.require("Profile.id")?,
         options.require("Profile.name")?,
         selector,
+        false,
         context,
-        effective_deadline,
     )
     .await
 }
@@ -320,7 +441,6 @@ pub(crate) async fn resolve_user_id(
     options: &SearchOptions,
     username: &str,
     context: &SynchronizationContext<'_>,
-    effective_deadline: Instant,
 ) -> Result<Option<u64>, GlpiFailure> {
     match resolve_exact_id(
         config,
@@ -329,8 +449,8 @@ pub(crate) async fn resolve_user_id(
         options.require("User.id")?,
         options.require("User.name")?,
         username,
+        false,
         context,
-        effective_deadline,
     )
     .await
     {
@@ -362,7 +482,6 @@ pub(crate) async fn read_current_assignments(
     username: &str,
     user_id: u64,
     context: &SynchronizationContext<'_>,
-    effective_deadline: Instant,
 ) -> Result<Vec<crate::plan::CurrentRow>, GlpiFailure> {
     let id_field = options.require("Profile_User.id")?;
     let user_name_field = options.require("User.name")?;
@@ -376,14 +495,13 @@ pub(crate) async fn read_current_assignments(
         &[id_field, user_name_field],
         id_field,
         context,
-        effective_deadline,
     )
     .await?;
 
     let mut candidate_ids: Vec<u64> = Vec::new();
     for row in &rows {
         if exact_string_field(row, user_name_field) == Some(username) {
-            let id = numeric_id(row, id_field).ok_or(GlpiFailure::MalformedReference)?;
+            let id = numeric_id(row, id_field, false).ok_or(GlpiFailure::MalformedReference)?;
             if !candidate_ids.contains(&id) {
                 candidate_ids.push(id);
             }
@@ -396,8 +514,7 @@ pub(crate) async fn read_current_assignments(
 
     let mut current = Vec::with_capacity(candidate_ids.len());
     for candidate_id in candidate_ids {
-        let item =
-            read_profile_user_item(config, session, candidate_id, effective_deadline).await?;
+        let item = read_profile_user_item(config, session, candidate_id, context).await?;
         if item.users_id != user_id {
             // The search-discovered candidate's own joined display name
             // matched `username` exactly, but its raw item-read `users_id`
@@ -428,20 +545,24 @@ struct ProfileUserItem {
 /// Reads one `Profile_User` item's raw fields via
 /// `GET /apirest.php/Profile_User/:id`, the generic V1 item endpoint. Every
 /// field is validated at the same strictness as the item-read replaces:
-/// `users_id`/`profiles_id`/`entities_id` must be plain numeric ids, and
-/// `is_recursive` must be the raw wire integer `0` or `1`; anything else,
+/// `id`, `users_id`, and `profiles_id` must be positive plain numeric ids;
+/// `entities_id` is a plain numeric id and may be zero for GLPI's root entity;
+/// and `is_recursive` must be the raw wire integer `0` or `1`. Anything else,
 /// including a mismatched `id`, is rejected rather than coerced.
 async fn read_profile_user_item(
     config: &ValidatedConfig,
     session: &GlpiSession,
     id: u64,
-    effective_deadline: Instant,
+    context: &SynchronizationContext<'_>,
 ) -> Result<ProfileUserItem, GlpiFailure> {
     let url = config
         .base
         .join(&format!("Profile_User/{id}"))
         .map_err(|_| GlpiFailure::Transport)?;
     let headers = session_headers(session, config)?;
+    // Each item read is a separate outbound operation. This check is also the
+    // cancellation/overall-deadline gate before every raw Profile_User read.
+    let effective_deadline = effective_deadline(context, config.operation_timeout)?;
 
     let response = transport::request(
         &config.tls_connector,
@@ -464,6 +585,7 @@ async fn read_profile_user_item(
     let item_id = object
         .get("id")
         .and_then(Value::as_u64)
+        .filter(|id| *id != 0)
         .ok_or(GlpiFailure::SearchPagination)?;
     if item_id != id {
         return Err(GlpiFailure::SearchPagination);
@@ -472,10 +594,12 @@ async fn read_profile_user_item(
     let users_id = object
         .get("users_id")
         .and_then(Value::as_u64)
+        .filter(|id| *id != 0)
         .ok_or(GlpiFailure::SearchPagination)?;
     let profiles_id = object
         .get("profiles_id")
         .and_then(Value::as_u64)
+        .filter(|id| *id != 0)
         .ok_or(GlpiFailure::SearchPagination)?;
     let entities_id = object
         .get("entities_id")
@@ -502,3 +626,66 @@ pub(crate) const REQUIRED_ENTITY_UIDS: &[&str] = &["Entity.id", "Entity.complete
 pub(crate) const REQUIRED_PROFILE_UIDS: &[&str] = &["Profile.id", "Profile.name"];
 pub(crate) const REQUIRED_USER_UIDS: &[&str] = &["User.id", "User.name"];
 pub(crate) const REQUIRED_PROFILE_USER_UIDS: &[&str] = &["Profile_User.id", "User.name"];
+
+#[cfg(test)]
+mod tests {
+    use super::parse_search_page;
+
+    #[test]
+    fn search_page_accepts_glpi_zero_result_shape() {
+        let page = parse_search_page(
+            br#"{"totalcount":0,"count":0,"content-range":"0--1/0"}"#,
+            0,
+            49,
+        )
+        .expect("GLPI's zero-result shape must be accepted");
+
+        assert_eq!(page.total_count, 0);
+        assert!(page.data.is_empty());
+    }
+
+    #[test]
+    fn search_page_requires_complete_consistent_metadata() {
+        let page = parse_search_page(
+            br#"{"totalcount":51,"count":50,"content-range":"0-49/51","data":[{},{}]}"#,
+            0,
+            49,
+        );
+        assert!(page.is_err(), "count must equal data length");
+
+        for body in [
+            br#"{"totalcount":1,"count":1,"data":[{}]}"#.as_slice(),
+            br#"{"totalcount":1,"count":1,"content-range":"0-0/1"}"#.as_slice(),
+            br#"{"totalcount":1,"count":1,"content-range":"1-1/1","data":[{}]}"#.as_slice(),
+            br#"{"totalcount":2,"count":1,"content-range":"0-0/1","data":[{}]}"#.as_slice(),
+            br#"{"totalcount":2,"count":1,"content-range":"0-0/2","data":[]}"#.as_slice(),
+            br#"{"totalcount":0,"count":0,"content-range":"0-0/0","data":[]}"#.as_slice(),
+        ] {
+            assert!(
+                parse_search_page(body, 0, 49).is_err(),
+                "must reject {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_page_accepts_a_final_short_inclusive_range_only() {
+        let page = parse_search_page(
+            br#"{"totalcount":51,"count":1,"content-range":"50-50/51","data":[{}]}"#,
+            50,
+            99,
+        )
+        .expect("final clamped page must be accepted");
+        assert_eq!(page.returned_end, 50);
+
+        assert!(
+            parse_search_page(
+                br#"{"totalcount":100,"count":1,"content-range":"50-50/100","data":[{}]}"#,
+                50,
+                99,
+            )
+            .is_err(),
+            "non-final short pages must be rejected"
+        );
+    }
+}

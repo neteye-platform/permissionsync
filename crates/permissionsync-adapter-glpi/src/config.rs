@@ -108,9 +108,11 @@ pub(crate) fn validate(
 /// Parses and validates the configured `apirest.php` base endpoint.
 ///
 /// Requires an absolute `https` URI with a non-empty host, no userinfo, no
-/// fragment, and no pre-existing query string, and normalizes it to always
-/// end with a trailing `/` so that later `Url::join` calls compose operation
-/// paths correctly and safely (never through string interpolation).
+/// fragment, and no pre-existing query string. Its terminal path component
+/// must be exactly `apirest.php`, with an optional trailing slash. The
+/// accepted endpoint is then normalized to one trailing `/` so later
+/// `Url::join` calls compose operation paths correctly and safely (never
+/// through string interpolation).
 fn parse_base(endpoint: &str) -> Result<Url, GlpiAdapterConfigError> {
     let mut url = Url::parse(endpoint).map_err(|_| GlpiAdapterConfigError::new())?;
 
@@ -124,11 +126,15 @@ fn parse_base(endpoint: &str) -> Result<Url, GlpiAdapterConfigError> {
         return Err(GlpiAdapterConfigError::new());
     }
 
-    if !url.path().ends_with('/') {
-        let mut path = url.path().to_owned();
-        path.push('/');
-        url.set_path(&path);
+    let path_without_trailing_slash = url.path().strip_suffix('/').unwrap_or(url.path());
+    if path_without_trailing_slash
+        .rsplit_once('/')
+        .map(|(_, terminal)| terminal)
+        != Some("apirest.php")
+    {
+        return Err(GlpiAdapterConfigError::new());
     }
+    url.set_path(&format!("{path_without_trailing_slash}/"));
 
     Ok(url)
 }
@@ -179,6 +185,33 @@ mod tests {
     #[test]
     fn accepts_a_well_formed_https_endpoint() {
         assert!(validate(config("https://glpi.example.test/apirest.php")).is_ok());
+    }
+
+    #[test]
+    fn accepts_deployment_prefix_and_normalizes_one_trailing_slash() {
+        let validated = validate(config("https://glpi.example.test/glpi/apirest.php"))
+            .expect("prefixed apirest.php endpoint");
+        assert_eq!(validated.base.path(), "/glpi/apirest.php/");
+
+        let validated = validate(config("https://glpi.example.test/apirest.php/"))
+            .expect("trailing slash is accepted");
+        assert_eq!(validated.base.path(), "/apirest.php/");
+    }
+
+    #[test]
+    fn rejects_non_terminal_apirest_php_paths() {
+        for endpoint in [
+            "https://glpi.example.test/",
+            "https://glpi.example.test/api",
+            "https://glpi.example.test/foo.php",
+            "https://glpi.example.test/apirest.php/extra",
+            "https://glpi.example.test/apirest.php//",
+        ] {
+            assert!(
+                validate(config(endpoint)).is_err(),
+                "must reject {endpoint}"
+            );
+        }
     }
 
     #[test]

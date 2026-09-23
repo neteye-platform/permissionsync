@@ -50,7 +50,7 @@ impl TargetAdapter for GlpiAdapter {
     }
 }
 
-fn effective_deadline(
+pub(crate) fn effective_deadline(
     context: &SynchronizationContext<'_>,
     operation_timeout: Duration,
 ) -> Result<Instant, GlpiFailure> {
@@ -180,14 +180,12 @@ async fn reconcile_with_session(
             let entity_options = entity_options
                 .as_ref()
                 .expect("entity_options is populated whenever desired is non-empty");
-            let deadline = effective_deadline(context, config.operation_timeout)?;
             let id = search::resolve_entity_id(
                 config,
                 session,
                 entity_options,
                 &assignment.entity,
                 context,
-                deadline,
             )
             .await?;
             resolved_entities.push((assignment.entity.clone(), id));
@@ -201,24 +199,20 @@ async fn reconcile_with_session(
             let profile_options = profile_options
                 .as_ref()
                 .expect("profile_options is populated whenever desired is non-empty");
-            let deadline = effective_deadline(context, config.operation_timeout)?;
             let id = search::resolve_profile_id(
                 config,
                 session,
                 profile_options,
                 &assignment.profile,
                 context,
-                deadline,
             )
             .await?;
             resolved_profiles.push((assignment.profile.clone(), id));
         }
     }
 
-    let deadline = effective_deadline(context, config.operation_timeout)?;
     let existing_user_id =
-        search::resolve_user_id(config, session, &user_options, username, context, deadline)
-            .await?;
+        search::resolve_user_id(config, session, &user_options, username, context).await?;
 
     let (user_id, mut changed) = match existing_user_id {
         Some(id) => (id, false),
@@ -236,7 +230,6 @@ async fn reconcile_with_session(
         }
     };
 
-    let deadline = effective_deadline(context, config.operation_timeout)?;
     let current = search::read_current_assignments(
         config,
         session,
@@ -244,7 +237,6 @@ async fn reconcile_with_session(
         username,
         user_id,
         context,
-        deadline,
     )
     .await?;
 
@@ -373,13 +365,14 @@ mod tests {
         let operation_timeout = Duration::from_millis(200);
 
         let first = effective_deadline(&context, operation_timeout).expect("first deadline");
-        std::thread::sleep(Duration::from_millis(50));
+        let before_second = Instant::now();
         let second = effective_deadline(&context, operation_timeout).expect("second deadline");
 
-        // The second window starts later in wall-clock time than the first,
-        // so it must not be earlier than (and should be strictly later
-        // than) the first window despite elapsed time between calls.
-        assert!(second > first);
+        // A new call creates a full new operation window, rather than reusing
+        // the first operation's deadline. No wall-clock sleep is needed to
+        // establish that lower bound.
+        assert!(second >= before_second + operation_timeout);
+        assert!(second >= first);
     }
 
     /// No operation may start after the overall deadline: `effective_deadline`
