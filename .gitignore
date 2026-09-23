@@ -1,1 +1,5 @@
 /target/
+
+# Disposable real-GLPI integration environment run state (never committed;
+# see crates/permissionsync-adapter-glpi/tests/real-glpi/bootstrap.sh).
+crates/permissionsync-adapter-glpi/tests/real-glpi/.real-glpi-run-env
