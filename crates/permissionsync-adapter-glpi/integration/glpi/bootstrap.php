@@ -156,27 +156,17 @@ if (!is_string($app_token_plaintext) || $app_token_plaintext === '') {
     bootstrap_fail('failed to decrypt the stored application token');
 }
 
-// Sibling-entity visibility topology (task section 3 / ADR 0009
-// changeActiveEntities fix). The default service account above is
-// deliberately left as-is (Root entity, recursive) because every existing
-// scenario in this suite targets `Root entity`, and GLPI's entity tree is
-// single-rooted: a recursive grant on Root always structurally covers every
-// entity, so it can never be used to *prove* "all entities" semantics
-// against "root entity selected recursively" -- the two are indistinguishable
-// whenever Root itself is granted. A second, dedicated service account below
-// instead holds separate non-recursive Profile_User rows on two independent
-// sibling entities under Root, and deliberately none on Root itself.
+// Full-coverage entity visibility topology (ADR 0009
+// changeActiveEntities fix). The dedicated service account below holds three
+// separate non-recursive Profile_User rows: Root and each of its two child
+// branches. Together they cover every entity in this disposable database, so
+// omitting `entities_id` selects "all" entities and enables
+// `glpishowallentities`, despite the account having no recursive grant.
 //
-// GLPI's Session::changeActiveEntities() (src/Session.php, 11.0.9) only
-// permits selecting a specific numeric `entities_id` when the account holds a
-// Profile_User row on that id or one of its ancestors; this account has no
-// row on Root, so requesting `entities_id => 0` (recursive or not) is
-// rejected outright, while omitting `entities_id` ("all") succeeds and
-// resolves to exactly the union of this account's own branches (both
-// siblings). A production reconciliation against Branch Two through this
-// dedicated account can therefore only succeed under "all entities"
-// semantics: no root-recursive selection could ever reach it, because this
-// account never has a Root grant to select from.
+// The Root row deliberately remains non-recursive. GLPI rejects a numeric Root
+// request with `is_recursive => true` for this account, so this topology also
+// distinguishes the omitted-field "all" contract from a literal
+// `entities_id => "all"` request that PHP would coerce to Root.
 $branch_one = new Entity();
 $branch_one_id = $branch_one->add([
     'name'        => 'permissionsync-topology-branch-one',
@@ -209,6 +199,16 @@ if (!$topology_user_id) {
     bootstrap_fail('failed to create the dedicated topology service-account user');
 }
 $topology_profile_user = new Profile_User();
+$topology_root_profile_user_id = $topology_profile_user->add([
+    'users_id'     => (int) $topology_user_id,
+    'profiles_id'  => $service_profile_id,
+    'entities_id'  => 0,
+    'is_recursive' => 0,
+]);
+if (!$topology_root_profile_user_id) {
+    bootstrap_fail('failed to grant the topology service account access to Root entity');
+}
+$topology_profile_user = new Profile_User();
 $topology_profile_user_id = $topology_profile_user->add([
     'users_id'     => (int) $topology_user_id,
     'profiles_id'  => $service_profile_id,
@@ -217,6 +217,34 @@ $topology_profile_user_id = $topology_profile_user->add([
 ]);
 if (!$topology_profile_user_id) {
     bootstrap_fail('failed to grant the topology service account access to sibling branch two');
+}
+
+$expected_topology_profile_user_rows = [
+    "{$topology_user_id}:{$service_profile_id}:0:0",
+    "{$topology_user_id}:{$service_profile_id}:{$branch_one_id}:0",
+    "{$topology_user_id}:{$service_profile_id}:{$branch_two_id}:0",
+];
+$actual_topology_profile_user_rows = [];
+foreach ($DB->request([
+    'SELECT' => ['users_id', 'profiles_id', 'entities_id', 'is_recursive'],
+    'FROM'   => $topology_profile_user->getTable(),
+    'WHERE'  => [
+        'users_id'    => (int) $topology_user_id,
+        'profiles_id' => $service_profile_id,
+    ],
+]) as $profile_user_row) {
+    $actual_topology_profile_user_rows[] = sprintf(
+        '%d:%d:%d:%d',
+        $profile_user_row['users_id'],
+        $profile_user_row['profiles_id'],
+        $profile_user_row['entities_id'],
+        $profile_user_row['is_recursive']
+    );
+}
+sort($expected_topology_profile_user_rows);
+sort($actual_topology_profile_user_rows);
+if ($actual_topology_profile_user_rows !== $expected_topology_profile_user_rows) {
+    bootstrap_fail('topology service-account Profile_User grants do not match the expected entities');
 }
 
 $topology_generated_user_token = User::getToken((int) $topology_user_id, 'api_token');

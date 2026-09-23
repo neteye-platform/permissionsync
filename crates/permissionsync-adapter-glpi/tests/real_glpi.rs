@@ -48,11 +48,9 @@ struct RealGlpiEnvironment {
     target_profile_a: String,
     target_profile_b: String,
     target_profile_c: String,
-    /// User token of a second, dedicated service account used only by the
-    /// sibling-entity visibility topology test. This account holds separate
-    /// non-recursive `Profile_User` rows on two independent sibling entities
-    /// under `Root entity` and, deliberately, none on `Root entity` itself
-    /// (see `integration/glpi/bootstrap.php`).
+    /// User token of a dedicated service account with non-recursive
+    /// `Profile_User` rows on Root, Branch One, and Branch Two, covering this
+    /// disposable database's complete entity set (see `integration/glpi/bootstrap.php`).
     topology_user_token: String,
     /// Full `Entity.completename` of the second sibling branch granted to the
     /// topology service account above.
@@ -784,34 +782,21 @@ async fn current_assignment_pagination_removes_a_stale_row_from_a_later_page() {
     );
 }
 
-/// Proves ADR 0009's `changeActiveEntities` fix (omit `entities_id` so GLPI
-/// applies "all entities" semantics; see `src/session.rs`) against a topology
-/// where "all entities" cannot be reproduced by selecting `Root entity`
-/// recursively.
+/// Proves that GLPI's omitted-`entities_id` "all entities" semantics provide
+/// complete visibility for a service account with full non-recursive coverage.
 ///
 /// The dedicated topology service account provisioned by
-/// `integration/glpi/bootstrap.php` holds two separate non-recursive
-/// `Profile_User` rows, one on each of two independent sibling entities under
-/// `Root entity`, and deliberately none on `Root entity` itself. GLPI's
-/// `Session::changeActiveEntities()` (src/Session.php, 11.0.9) only allows
-/// selecting a specific numeric `entities_id` when the account holds a
-/// `Profile_User` row on that id or one of its ancestors; since this account
-/// has no row on `Root entity` (id 0), any request for `entities_id => 0` --
-/// recursive or not -- is structurally impossible for it. Only omitting
-/// `entities_id` ("all") succeeds, and it resolves to exactly the union of
-/// this account's own branches. A production reconciliation against the
-/// second branch below can therefore only succeed because the adapter omits
-/// `entities_id`: no root-recursive selection could ever reach it, because
-/// this account never has a `Root entity` grant to select from in the first
-/// place. This is a stronger, non-coincidental distinction than asserting
-/// `glpishowallentities == 1` after a manual `getFullSession` call, which
-/// would also be `1` for a root-recursive selection whenever the account
-/// additionally happens to hold a `Root entity` grant (as the default service
-/// account intentionally does, to keep every other test in this suite able to
-/// operate on `Root entity`).
+/// `integration/glpi/bootstrap.php` holds three separate non-recursive
+/// `Profile_User` rows: `Root entity`, Branch One, and Branch Two. These rows
+/// cover every entity in the disposable database, so omitting `entities_id`
+/// selects "all" entities, yields `glpishowallentities == 1`, and allows
+/// reconciliation against Branch Two even though none of the grants is
+/// recursive and the account has no recursive path from Root. The production
+/// omitted-field contract is separately protected by `src/session.rs` and the
+/// wire-level conformance tests.
 #[tokio::test]
 #[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
-async fn all_entities_semantics_reach_a_sibling_branch_with_no_root_grant() {
+async fn all_entities_semantics_succeeds_with_full_non_recursive_entity_coverage() {
     let environment = real_environment();
     let username = "permissionsync-real-topology-branch-two";
     let profile = environment.target_profile_a.as_str();
@@ -850,10 +835,9 @@ async fn all_entities_semantics_reach_a_sibling_branch_with_no_root_grant() {
             .reconcile(TargetAdapterRequest::new(&identity, &envelope, context))
             .await
             .expect(
-                "reconciliation against a sibling branch must succeed: it can only do so \
-                 through 'all entities' semantics, since the topology account holds no Root \
-                 entity Profile_User row from which any root-recursive selection could reach \
-                 this branch"
+                "reconciliation against Branch Two must succeed with full visibility from the \
+                 topology account's three non-recursive Profile_User grants covering every \
+                 disposable-database entity"
             ),
         ReconciliationOutcome::Changed
     );
