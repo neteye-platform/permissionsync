@@ -280,4 +280,185 @@ mod tests {
         assert_eq!(assignments[0].entity, "Räume > Büro > Abteilung");
         assert_eq!(assignments[0].profile, "Café Técnico 日本語 🎉");
     }
+
+    fn assert_normalizes_to(json: &str, expected: &[(&str, &str, bool)]) {
+        let mut actual = parse_and_normalize(json)
+            .unwrap()
+            .into_iter()
+            .map(|assignment| (assignment.entity, assignment.profile, assignment.recursive))
+            .collect::<Vec<_>>();
+        let mut expected = expected
+            .iter()
+            .map(|&(entity, profile, recursive)| (entity.to_owned(), profile.to_owned(), recursive))
+            .collect::<Vec<_>>();
+
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn a_single_false_recursive_value_normalizes_to_false() {
+        assert_normalizes_to(
+            r#"{"permissions": [{"entity": "entity", "profile": "profile", "recursive": false}]}"#,
+            &[("entity", "profile", false)],
+        );
+    }
+
+    #[test]
+    fn repeated_true_permission_objects_are_valid_and_normalize_to_true_assignment() {
+        assert_normalizes_to(
+            r#"{"permissions": [
+                {"entity": "entity", "profile": "profile", "recursive": true},
+                {"entity": "entity", "profile": "profile", "recursive": true}
+            ]}"#,
+            &[("entity", "profile", true)],
+        );
+    }
+
+    #[test]
+    fn true_true_false_recursive_values_normalize_to_true() {
+        assert_normalizes_to(
+            r#"{"permissions": [
+                {"entity": "entity", "profile": "profile", "recursive": true},
+                {"entity": "entity", "profile": "profile", "recursive": true},
+                {"entity": "entity", "profile": "profile", "recursive": false}
+            ]}"#,
+            &[("entity", "profile", true)],
+        );
+    }
+
+    #[test]
+    fn a_long_mixed_recursive_sequence_normalizes_to_true() {
+        assert_normalizes_to(
+            r#"{"permissions": [
+                {"entity": "entity", "profile": "profile", "recursive": false},
+                {"entity": "entity", "profile": "profile", "recursive": true},
+                {"entity": "entity", "profile": "profile", "recursive": false},
+                {"entity": "entity", "profile": "profile", "recursive": false},
+                {"entity": "entity", "profile": "profile", "recursive": true},
+                {"entity": "entity", "profile": "profile", "recursive": false}
+            ]}"#,
+            &[("entity", "profile", true)],
+        );
+    }
+
+    #[test]
+    fn pairs_sharing_an_entity_or_profile_normalize_independently() {
+        assert_normalizes_to(
+            r#"{"permissions": [
+                {"entity": "shared entity", "profile": "shared profile", "recursive": false},
+                {"entity": "shared entity", "profile": "shared profile", "recursive": false},
+                {"entity": "shared entity", "profile": "other profile", "recursive": true},
+                {"entity": "shared entity", "profile": "other profile", "recursive": false},
+                {"entity": "other entity", "profile": "shared profile", "recursive": true},
+                {"entity": "other entity", "profile": "shared profile", "recursive": true}
+            ]}"#,
+            &[
+                ("shared entity", "shared profile", false),
+                ("shared entity", "other profile", true),
+                ("other entity", "shared profile", true),
+            ],
+        );
+    }
+
+    #[test]
+    fn several_independent_pairs_each_resolve_their_own_duplicate_values() {
+        assert_normalizes_to(
+            r#"{"permissions": [
+                {"entity": "alpha", "profile": "reader", "recursive": false},
+                {"entity": "alpha", "profile": "reader", "recursive": false},
+                {"entity": "alpha", "profile": "writer", "recursive": true},
+                {"entity": "alpha", "profile": "writer", "recursive": true},
+                {"entity": "beta", "profile": "reader", "recursive": false},
+                {"entity": "beta", "profile": "reader", "recursive": true},
+                {"entity": "beta", "profile": "reader", "recursive": false},
+                {"entity": "gamma", "profile": "auditor", "recursive": true},
+                {"entity": "gamma", "profile": "auditor", "recursive": false},
+                {"entity": "gamma", "profile": "auditor", "recursive": true}
+            ]}"#,
+            &[
+                ("alpha", "reader", false),
+                ("alpha", "writer", true),
+                ("beta", "reader", true),
+                ("gamma", "auditor", true),
+            ],
+        );
+    }
+
+    #[test]
+    fn duplicate_and_mixed_entries_normalize_independently_of_input_order() {
+        let expected = [
+            ("entity", "profile", true),
+            ("other entity", "other profile", true),
+            ("third entity", "third profile", false),
+        ];
+        let json_a = r#"{"permissions": [
+            {"entity": "entity", "profile": "profile", "recursive": false},
+            {"entity": "other entity", "profile": "other profile", "recursive": true},
+            {"entity": "entity", "profile": "profile", "recursive": true},
+            {"entity": "third entity", "profile": "third profile", "recursive": false},
+            {"entity": "other entity", "profile": "other profile", "recursive": true},
+            {"entity": "entity", "profile": "profile", "recursive": false},
+            {"entity": "third entity", "profile": "third profile", "recursive": false}
+        ]}"#;
+        let json_b = r#"{"permissions": [
+            {"entity": "third entity", "profile": "third profile", "recursive": false},
+            {"entity": "entity", "profile": "profile", "recursive": true},
+            {"entity": "other entity", "profile": "other profile", "recursive": true},
+            {"entity": "entity", "profile": "profile", "recursive": false},
+            {"entity": "third entity", "profile": "third profile", "recursive": false},
+            {"entity": "entity", "profile": "profile", "recursive": false},
+            {"entity": "other entity", "profile": "other profile", "recursive": true}
+        ]}"#;
+
+        assert_normalizes_to(json_a, &expected);
+        assert_normalizes_to(json_b, &expected);
+    }
+
+    #[test]
+    fn whitespace_and_case_differences_in_selectors_remain_distinct() {
+        assert_normalizes_to(
+            r#"{"permissions": [
+                {"entity": "Root  Entity", "profile": "Role", "recursive": false},
+                {"entity": " Root  Entity ", "profile": "Role", "recursive": true},
+                {"entity": "Case Entity", "profile": "MiXeD Role", "recursive": false},
+                {"entity": "Case Entity", "profile": "mixed role", "recursive": true}
+            ]}"#,
+            &[
+                ("Root  Entity", "Role", false),
+                (" Root  Entity ", "Role", true),
+                ("Case Entity", "MiXeD Role", false),
+                ("Case Entity", "mixed role", true),
+            ],
+        );
+    }
+
+    #[test]
+    fn punctuation_in_selectors_survives_byte_for_byte() {
+        assert_normalizes_to(
+            r#"{"permissions": [{"entity": "Division, (North) & East", "profile": "Read-Only, Level (2) & Audit", "recursive": true}]}"#,
+            &[(
+                "Division, (North) & East",
+                "Read-Only, Level (2) & Audit",
+                true,
+            )],
+        );
+    }
+
+    #[test]
+    fn unicode_normalization_variants_remain_distinct_entity_selectors() {
+        let nfc = "Café";
+        let nfd = "Cafe\u{301}";
+        assert_ne!(nfc, nfd);
+
+        let json = format!(
+            r#"{{"permissions": [
+                {{"entity": "{nfc}", "profile": "Reviewer", "recursive": false}},
+                {{"entity": "{nfd}", "profile": "Reviewer", "recursive": true}}
+            ]}}"#
+        );
+
+        assert_normalizes_to(&json, &[(nfc, "Reviewer", false), (nfd, "Reviewer", true)]);
+    }
 }

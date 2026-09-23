@@ -155,17 +155,18 @@ mod tests {
     }
 
     #[test]
-    fn case_a_keeps_one_canonical_row_and_removes_duplicates_and_opposite_recursive() {
+    fn case_a_keeps_lowest_id_canonical_row_and_removes_duplicates_and_opposite_recursive() {
         let current = [
-            row(1, 10, 20, true),
-            row(2, 10, 20, true),
-            row(3, 10, 20, false),
+            row(20, 10, 20, true),
+            row(10, 10, 20, true),
+            row(30, 10, 20, false),
         ];
         let desired = [desired(10, 20, true)];
 
         let plan = compute(&current, &desired);
 
-        assert_eq!(plan.removals, vec![2, 3]);
+        assert_eq!(plan.removals, vec![20, 30]);
+        assert!(!plan.removals.contains(&10));
         assert!(plan.additions.is_empty());
     }
 
@@ -225,16 +226,38 @@ mod tests {
     }
 
     #[test]
-    fn plan_is_deterministic_regardless_of_input_order() {
-        let current_a = [row(3, 10, 20, false), row(1, 10, 20, true)];
-        let current_b = [row(1, 10, 20, true), row(3, 10, 20, false)];
-        let desired = [desired(10, 20, true)];
+    fn mixed_multi_pair_plan_is_deterministic_regardless_of_input_order() {
+        let current_a = [
+            row(30, 10, 20, false),
+            row(10, 10, 20, true),
+            row(50, 30, 40, true),
+            row(40, 5, 6, false),
+        ];
+        let current_b = [
+            row(40, 5, 6, false),
+            row(50, 30, 40, true),
+            row(10, 10, 20, true),
+            row(30, 10, 20, false),
+        ];
+        let desired_a = [
+            desired(10, 20, true),
+            desired(7, 8, false),
+            desired(5, 6, true),
+        ];
+        let desired_b = [
+            desired(5, 6, true),
+            desired(10, 20, true),
+            desired(7, 8, false),
+        ];
 
-        assert_eq!(compute(&current_a, &desired), compute(&current_b, &desired));
+        assert_eq!(
+            compute(&current_a, &desired_a),
+            compute(&current_b, &desired_b)
+        );
     }
 
     #[test]
-    fn removals_never_reorder_by_addition_and_never_update_in_place() {
+    fn plan_collects_all_removals_before_additions_without_updates() {
         let current = [row(5, 1, 1, false), row(6, 2, 2, true)];
         let desired = [desired(1, 1, true), desired(3, 3, false)];
 
@@ -259,6 +282,278 @@ mod tests {
                     recursive: false
                 },
             ]
+        );
+    }
+
+    fn retained_ids(current: &[CurrentRow], removals: &[u64]) -> Vec<u64> {
+        current
+            .iter()
+            .filter(|current_row| !removals.contains(&current_row.id))
+            .map(|current_row| current_row.id)
+            .collect()
+    }
+
+    type DesiredRowCase = (
+        &'static str,
+        &'static [bool],
+        &'static [u64],
+        &'static [u64],
+        Option<bool>,
+    );
+
+    #[test]
+    fn desired_false_current_row_matrix_has_exact_cleanup_and_retention() {
+        let cases: &[DesiredRowCase] = &[
+            ("single canonical false", &[false], &[], &[1], None),
+            (
+                "duplicate canonical false",
+                &[false, false],
+                &[2],
+                &[1],
+                None,
+            ),
+            ("single opposite true", &[true], &[1], &[], Some(false)),
+            ("mixed true then false", &[true, false], &[1], &[2], None),
+            (
+                "duplicate canonical false with opposite true",
+                &[false, false, true],
+                &[2, 3],
+                &[1],
+                None,
+            ),
+        ];
+
+        for (label, recursive_values, expected_removals, expected_retained, addition) in cases {
+            let current: Vec<_> = recursive_values
+                .iter()
+                .enumerate()
+                .map(|(index, recursive)| row(index as u64 + 1, 10, 20, *recursive))
+                .collect();
+            let plan = compute(&current, &[desired(10, 20, false)]);
+            let expected_additions = addition.map_or_else(Vec::new, |recursive| {
+                vec![Addition {
+                    entities_id: 10,
+                    profiles_id: 20,
+                    recursive,
+                }]
+            });
+
+            assert_eq!(plan.removals, *expected_removals, "case {label}: removals");
+            assert_eq!(
+                retained_ids(&current, &plan.removals),
+                *expected_retained,
+                "case {label}: retained row ids"
+            );
+            assert_eq!(
+                plan.additions, expected_additions,
+                "case {label}: additions"
+            );
+        }
+    }
+
+    #[test]
+    fn desired_true_current_row_matrix_has_exact_cleanup_and_retention() {
+        let cases: &[DesiredRowCase] = &[
+            ("duplicate canonical true", &[true, true], &[2], &[1], None),
+            ("single opposite false", &[false], &[1], &[], Some(true)),
+            ("mixed false then true", &[false, true], &[1], &[2], None),
+        ];
+
+        for (label, recursive_values, expected_removals, expected_retained, addition) in cases {
+            let current: Vec<_> = recursive_values
+                .iter()
+                .enumerate()
+                .map(|(index, recursive)| row(index as u64 + 1, 10, 20, *recursive))
+                .collect();
+            let plan = compute(&current, &[desired(10, 20, true)]);
+            let expected_additions = addition.map_or_else(Vec::new, |recursive| {
+                vec![Addition {
+                    entities_id: 10,
+                    profiles_id: 20,
+                    recursive,
+                }]
+            });
+
+            assert_eq!(plan.removals, *expected_removals, "case {label}: removals");
+            assert_eq!(
+                retained_ids(&current, &plan.removals),
+                *expected_retained,
+                "case {label}: retained row ids"
+            );
+            assert_eq!(
+                plan.additions, expected_additions,
+                "case {label}: additions"
+            );
+        }
+    }
+
+    #[test]
+    fn undesired_pair_current_row_matrix_removes_every_row() {
+        let cases: &[(&str, &[bool])] = &[
+            ("single false", &[false]),
+            ("single true", &[true]),
+            ("duplicate false", &[false, false]),
+            ("duplicate true", &[true, true]),
+        ];
+
+        for (label, recursive_values) in cases {
+            let current: Vec<_> = recursive_values
+                .iter()
+                .enumerate()
+                .map(|(index, recursive)| row(index as u64 + 1, 10, 20, *recursive))
+                .collect();
+            let plan = compute(&current, &[]);
+            let expected_removals: Vec<_> = (1..=recursive_values.len() as u64).collect();
+
+            assert_eq!(plan.removals, expected_removals, "case {label}: removals");
+            assert!(
+                retained_ids(&current, &plan.removals).is_empty(),
+                "case {label}: no row is retained"
+            );
+            assert!(plan.additions.is_empty(), "case {label}: no additions");
+        }
+    }
+
+    #[test]
+    fn several_undesired_pairs_are_all_removed_without_cross_contamination() {
+        let current = [
+            row(101, 10, 20, false),
+            row(205, 30, 40, true),
+            row(102, 10, 20, true),
+            row(303, 50, 60, false),
+        ];
+
+        let plan = compute(&current, &[]);
+
+        assert_eq!(plan.removals, vec![101, 102, 205, 303]);
+        assert!(retained_ids(&current, &plan.removals).is_empty());
+        assert!(plan.additions.is_empty());
+    }
+
+    #[test]
+    fn same_entity_different_profiles_are_planned_independently() {
+        let current = [
+            row(1, 10, 20, false),
+            row(2, 10, 20, true),
+            row(3, 10, 30, true),
+        ];
+        let desired = [desired(10, 20, true), desired(10, 30, false)];
+
+        let plan = compute(&current, &desired);
+
+        assert_eq!(plan.removals, vec![1, 3]);
+        assert_eq!(retained_ids(&current, &plan.removals), vec![2]);
+        assert_eq!(
+            plan.additions,
+            vec![Addition {
+                entities_id: 10,
+                profiles_id: 30,
+                recursive: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn same_profile_different_entities_are_planned_independently() {
+        let current = [
+            row(1, 10, 20, false),
+            row(2, 30, 20, true),
+            row(3, 30, 20, false),
+        ];
+        let desired = [desired(10, 20, true), desired(30, 20, false)];
+
+        let plan = compute(&current, &desired);
+
+        assert_eq!(plan.removals, vec![1, 2]);
+        assert_eq!(retained_ids(&current, &plan.removals), vec![3]);
+        assert_eq!(
+            plan.additions,
+            vec![Addition {
+                entities_id: 10,
+                profiles_id: 20,
+                recursive: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn multiple_desired_pairs_missing_from_current_are_all_pure_additions() {
+        let desired = [
+            desired(30, 40, true),
+            desired(10, 20, false),
+            desired(20, 30, true),
+        ];
+
+        let plan = compute(&[], &desired);
+
+        assert!(plan.removals.is_empty());
+        assert_eq!(
+            plan.additions,
+            vec![
+                Addition {
+                    entities_id: 10,
+                    profiles_id: 20,
+                    recursive: false,
+                },
+                Addition {
+                    entities_id: 20,
+                    profiles_id: 30,
+                    recursive: true,
+                },
+                Addition {
+                    entities_id: 30,
+                    profiles_id: 40,
+                    recursive: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn desired_and_undesired_pairs_are_reconciled_together_without_cross_contamination() {
+        let current = [
+            row(1, 10, 20, true),
+            row(2, 30, 40, false),
+            row(3, 30, 40, true),
+        ];
+        let desired = [desired(10, 20, true), desired(50, 60, false)];
+
+        let plan = compute(&current, &desired);
+
+        assert_eq!(plan.removals, vec![2, 3]);
+        assert_eq!(retained_ids(&current, &plan.removals), vec![1]);
+        assert_eq!(
+            plan.additions,
+            vec![Addition {
+                entities_id: 50,
+                profiles_id: 60,
+                recursive: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn independent_case_a_and_case_b_cleanup_are_combined_without_interference() {
+        let current = [
+            row(1, 10, 20, false),
+            row(2, 10, 20, false),
+            row(3, 10, 20, true),
+            row(4, 30, 40, false),
+            row(5, 30, 40, false),
+        ];
+        let desired = [desired(10, 20, false), desired(30, 40, true)];
+
+        let plan = compute(&current, &desired);
+
+        assert_eq!(plan.removals, vec![2, 3, 4, 5]);
+        assert_eq!(retained_ids(&current, &plan.removals), vec![1]);
+        assert_eq!(
+            plan.additions,
+            vec![Addition {
+                entities_id: 30,
+                profiles_id: 40,
+                recursive: true,
+            }]
         );
     }
 }

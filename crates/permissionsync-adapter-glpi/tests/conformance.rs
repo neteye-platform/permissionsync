@@ -10,6 +10,7 @@
 //! accepts one connection per scripted request/response pair, in order.
 
 use std::{
+    future::Future,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -38,7 +39,7 @@ use permissionsync_core::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    sync::oneshot,
+    task::JoinHandle,
 };
 use tokio_native_tls::TlsAcceptor;
 
@@ -51,6 +52,8 @@ const ROOT_CERTIFICATE_SERIAL: u32 = 1;
 const LEAF_CERTIFICATE_SERIAL: u32 = 2;
 const CERTIFICATE_NOT_BEFORE_UNIX_SECONDS: i64 = 1_700_000_000;
 const CERTIFICATE_NOT_AFTER_UNIX_SECONDS: i64 = 4_100_000_000;
+const FAKE_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
+const HELD_RESPONSE_DEADLINE: Duration = Duration::from_secs(5);
 
 // --- Scripted fake GLPI server -----------------------------------------------
 
@@ -58,6 +61,41 @@ const CERTIFICATE_NOT_AFTER_UNIX_SECONDS: i64 = 4_100_000_000;
 struct ScriptedResponse {
     status_line: &'static str,
     body: Vec<u8>,
+}
+
+async fn await_fake_server_step<T>(waiting_for: &str, future: impl Future<Output = T>) -> T {
+    tokio::time::timeout(FAKE_SERVER_TIMEOUT, future)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "fake GLPI server timed out waiting for {waiting_for} after {FAKE_SERVER_TIMEOUT:?}"
+            )
+        })
+}
+
+async fn join_fake_server<T>(server: JoinHandle<T>, task_name: &str) -> T {
+    await_fake_server_step(&format!("{task_name} task to finish"), server)
+        .await
+        .unwrap_or_else(|error| panic!("{task_name} task failed: {error}"))
+}
+
+async fn abort_fake_server<T>(server: JoinHandle<T>, task_name: &str) {
+    server.abort();
+    let result =
+        await_fake_server_step(&format!("aborted {task_name} task to finish"), server).await;
+    if let Err(error) = result {
+        assert!(
+            error.is_cancelled(),
+            "{task_name} task failed before it could be aborted: {error}"
+        );
+    }
+}
+
+async fn accept_one_tls_connection(listener: TcpListener, acceptor: TlsAcceptor) {
+    let (socket, _) = await_fake_server_step("expected TLS connection", listener.accept())
+        .await
+        .expect("accept connection");
+    let _ = await_fake_server_step("TLS handshake", acceptor.accept(socket)).await;
 }
 
 fn json_response(status_line: &'static str, body: &str) -> ScriptedResponse {
@@ -93,9 +131,16 @@ async fn run_scripted_server(
     script: Vec<ScriptedResponse>,
 ) -> Vec<(String, Vec<(String, String)>, Vec<u8>)> {
     let mut recorded = Vec::new();
-    for entry in script {
-        let (socket, _) = listener.accept().await.expect("accept connection");
-        let mut stream = acceptor.accept(socket).await.expect("tls handshake");
+    for (request_index, entry) in script.into_iter().enumerate() {
+        let (socket, _) = await_fake_server_step(
+            &format!("expected request {} connection", request_index + 1),
+            listener.accept(),
+        )
+        .await
+        .expect("accept connection");
+        let mut stream = await_fake_server_step("TLS handshake", acceptor.accept(socket))
+            .await
+            .expect("tls handshake");
         let request = read_request(&mut stream).await;
         assert_outgoing_wire_contract(&request);
         let response = format!(
@@ -105,53 +150,10 @@ async fn run_scripted_server(
         );
         let mut bytes = response.into_bytes();
         bytes.extend_from_slice(&entry.body);
-        stream.write_all(&bytes).await.expect("write response");
-        let _ = stream.shutdown().await;
-        recorded.push(request);
-    }
-    recorded
-}
-
-/// A response gate releases one already-validated request only when the test
-/// explicitly permits it. This is used for bounded deadline tests that need to
-/// consume a known portion of an operation window without a connection race.
-struct ResponseGate {
-    request_received: oneshot::Sender<RecordedRequest>,
-    release: oneshot::Receiver<()>,
-}
-
-/// Like [`run_scripted_server`], but selected responses wait for a test-owned
-/// gate after request validation and before their response is written.
-async fn run_gated_scripted_server(
-    listener: TcpListener,
-    acceptor: TlsAcceptor,
-    script: Vec<(ScriptedResponse, Option<ResponseGate>)>,
-) -> Vec<RecordedRequest> {
-    let mut recorded = Vec::new();
-    for (entry, gate) in script {
-        let (socket, _) = listener.accept().await.expect("accept connection");
-        let mut stream = acceptor.accept(socket).await.expect("tls handshake");
-        let request = read_request(&mut stream).await;
-        assert_outgoing_wire_contract(&request);
-        if let Some(ResponseGate {
-            request_received,
-            release,
-        }) = gate
-        {
-            request_received
-                .send(request.clone())
-                .expect("deadline test receiver remains live");
-            release.await.expect("deadline test releases response");
-        }
-        let response = format!(
-            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            entry.status_line,
-            entry.body.len()
-        );
-        let mut bytes = response.into_bytes();
-        bytes.extend_from_slice(&entry.body);
-        stream.write_all(&bytes).await.expect("write response");
-        let _ = stream.shutdown().await;
+        await_fake_server_step("response write", stream.write_all(&bytes))
+            .await
+            .expect("write response");
+        let _ = await_fake_server_step("response shutdown", stream.shutdown()).await;
         recorded.push(request);
     }
     recorded
@@ -164,7 +166,9 @@ where
     let mut buffer = Vec::new();
     let header_end = loop {
         let mut chunk = [0_u8; 1024];
-        let read = stream.read(&mut chunk).await.expect("read request bytes");
+        let read = await_fake_server_step("request headers", stream.read(&mut chunk))
+            .await
+            .expect("read request bytes");
         assert!(
             read > 0,
             "connection closed before request headers completed"
@@ -193,7 +197,9 @@ where
     let mut body = buffer[header_end + 4..].to_vec();
     while body.len() < content_length {
         let mut chunk = [0_u8; 1024];
-        let read = stream.read(&mut chunk).await.expect("read request body");
+        let read = await_fake_server_step("request body", stream.read(&mut chunk))
+            .await
+            .expect("read request body");
         assert!(read > 0, "connection closed before request body completed");
         body.extend_from_slice(&chunk[..read]);
     }
@@ -755,9 +761,16 @@ async fn run_counted_scripted_server(
     completed: Arc<AtomicUsize>,
 ) -> Vec<RecordedRequest> {
     let mut recorded = Vec::new();
-    for entry in script {
-        let (socket, _) = listener.accept().await.expect("accept connection");
-        let mut stream = acceptor.accept(socket).await.expect("tls handshake");
+    for (request_index, entry) in script.into_iter().enumerate() {
+        let (socket, _) = await_fake_server_step(
+            &format!("expected request {} connection", request_index + 1),
+            listener.accept(),
+        )
+        .await
+        .expect("accept connection");
+        let mut stream = await_fake_server_step("TLS handshake", acceptor.accept(socket))
+            .await
+            .expect("tls handshake");
         let request = read_request(&mut stream).await;
         assert_outgoing_wire_contract(&request);
         completed.fetch_add(1, Ordering::SeqCst);
@@ -768,29 +781,42 @@ async fn run_counted_scripted_server(
         );
         let mut bytes = response.into_bytes();
         bytes.extend_from_slice(&entry.body);
-        stream.write_all(&bytes).await.expect("write response");
-        let _ = stream.shutdown().await;
+        await_fake_server_step("response write", stream.write_all(&bytes))
+            .await
+            .expect("write response");
+        let _ = await_fake_server_step("response shutdown", stream.shutdown()).await;
         recorded.push(request);
     }
     recorded
 }
 
-/// Accepts exactly one fully formed request then deliberately withholds its
-/// response. The notification makes deadline tests race-free: they advance
-/// only after the adapter has actually started the bounded operation.
+/// Accepts exactly one fully formed request then withholds its response until
+/// the adapter closes the timed-out connection.
 async fn hold_one_response(
     listener: TcpListener,
     acceptor: TlsAcceptor,
-    started: oneshot::Sender<RecordedRequest>,
+    started: tokio::sync::oneshot::Sender<RecordedRequest>,
 ) {
-    let (socket, _) = listener.accept().await.expect("accept connection");
-    let mut stream = acceptor.accept(socket).await.expect("tls handshake");
+    let (socket, _) =
+        await_fake_server_step("expected held-response connection", listener.accept())
+            .await
+            .expect("accept connection");
+    let mut stream = await_fake_server_step("TLS handshake", acceptor.accept(socket))
+        .await
+        .expect("tls handshake");
     let request = read_request(&mut stream).await;
     assert_outgoing_wire_contract(&request);
     started
         .send(request)
         .expect("deadline test receiver remains live");
-    std::future::pending::<()>().await;
+    let mut buffer = [0_u8; 1];
+    let read = await_fake_server_step(
+        "client to close held-response connection",
+        stream.read(&mut buffer),
+    )
+    .await
+    .expect("read client closure");
+    assert_eq!(read, 0, "client must not send data while response is held");
 }
 
 async fn reconcile_with_cancellation(
@@ -1065,11 +1091,10 @@ async fn rejects_a_server_certificate_signed_by_an_untrusted_root() {
     // certificate signed by a completely independent root.
     let adapter = adapter_for(port, trusted_identity.trust_anchor_pem);
 
-    let accept_task = tokio::spawn(async move {
-        if let Ok((socket, _)) = listener.accept().await {
-            let _ = server_identity.acceptor.accept(socket).await;
-        }
-    });
+    let accept_task = tokio::spawn(accept_one_tls_connection(
+        listener,
+        server_identity.acceptor,
+    ));
 
     let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
     accept_task.await.expect("accept task completed");
@@ -1309,7 +1334,7 @@ async fn duplicate_desired_permissions_with_already_canonical_current_state_is_u
 
     let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
     let outcome = reconcile(&adapter, &envelope).await.unwrap();
-    server.await.expect("scripted server completed its script");
+    join_fake_server(server, "scripted server completed its script").await;
 
     assert_eq!(outcome, ReconciliationOutcome::Unchanged);
 }
@@ -1513,7 +1538,7 @@ async fn case_sensitive_lookalike_does_not_count_as_an_exact_user_match() {
     let outcome = reconcile(&adapter, &empty_desired_envelope())
         .await
         .unwrap();
-    server.await.expect("scripted server completed its script");
+    join_fake_server(server, "scripted server completed its script").await;
 
     assert_eq!(outcome, ReconciliationOutcome::Changed);
 }
@@ -1698,6 +1723,92 @@ async fn entity_and_profile_selectors_with_metacharacters_are_percent_encoded() 
     assert_eq!(
         query_value(&recorded[7], "criteria[0][value]"),
         Some(entity_selector.to_owned())
+    );
+}
+
+/// A nested-looking Entity.completename is one opaque exact selector: its
+/// `>` characters are percent-encoded on the wire but never parsed into
+/// separate entity-resolution requests.
+#[tokio::test]
+async fn nested_looking_entity_completename_resolves_as_one_opaque_exact_match() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let entity_selector = "Root entity > IT > Operations";
+    let envelope = envelope_json(&format!(
+        r#"{{"permissions": [{{"entity": "{entity_selector}", "profile": "Technician", "recursive": true}}]}}"#
+    ));
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(11, entity_selector, "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(0, &[])),
+        created(r#"{"id":99,"message":"created"}"#),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &envelope).await.unwrap();
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
+    let entity_searches: Vec<&RecordedRequest> = recorded
+        .iter()
+        .filter(|recorded| {
+            let (_, path, _) = parsed_request_line(&recorded.0);
+            path == "/apirest.php/search/Entity"
+        })
+        .collect();
+    assert_eq!(
+        entity_searches.len(),
+        1,
+        "the opaque selector must make exactly one Entity search request"
+    );
+    let entity_search = entity_searches[0];
+    assert_request(entity_search, "GET", "/apirest.php/search/Entity");
+    let raw_target = entity_search
+        .0
+        .split(' ')
+        .nth(1)
+        .expect("request line has a target");
+    assert!(
+        !entity_search.0.contains(entity_selector),
+        "the complete selector must be percent-encoded on the wire"
+    );
+    assert!(
+        !raw_target.contains('>'),
+        "the raw Entity search target must not contain literal > characters"
+    );
+    assert_eq!(
+        raw_target.to_ascii_lowercase().matches("%3e").count(),
+        2,
+        "the raw Entity search target must percent-encode both > characters"
+    );
+    assert_eq!(
+        query_value(entity_search, "criteria[0][value]"),
+        Some(entity_selector.to_owned()),
+        "the complete selector must reach the single Entity search unmodified"
     );
 }
 
@@ -2354,6 +2465,74 @@ async fn desired_true_with_true_and_false_current_rows_removes_only_the_false_ro
     }
 }
 
+/// Desired `false` with current rows `[false, false, true]` retains one
+/// canonical non-recursive row and removes the duplicate and wrong-recursive
+/// rows, leaving exactly one physical canonical row without an addition.
+#[tokio::test]
+async fn desired_false_with_duplicate_false_and_true_current_rows_retains_one_false_and_removes_the_rest()
+ {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let envelope = envelope_json(
+        r#"{"permissions": [{"entity": "Root Entity > IT", "profile": "Technician", "recursive": false}]}"#,
+    );
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(
+            3,
+            &[(99, "jdoe"), (100, "jdoe"), (101, "jdoe")],
+        )),
+        ok(&profile_user_item_body(99, 30, 20, 10, 0)), // retained canonical false
+        ok(&profile_user_item_body(100, 30, 20, 10, 0)), // duplicate canonical false
+        ok(&profile_user_item_body(101, 30, 20, 10, 1)), // wrong-recursive true
+        deleted(100),
+        deleted(101),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &envelope).await.unwrap();
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
+    assert_request(&recorded[14], "DELETE", "/apirest.php/Profile_User/100");
+    assert_request(&recorded[15], "DELETE", "/apirest.php/Profile_User/101");
+    for entry in &recorded {
+        let (method, path, _) = parsed_request_line(&entry.0);
+        if path == "/apirest.php/changeActiveEntities" {
+            continue;
+        }
+        assert_ne!(
+            method, "POST",
+            "the retained canonical false row must prevent an unnecessary addition"
+        );
+    }
+}
+
 /// An undesired pair with mixed recursive current rows is fully removed
 /// regardless of either row's `is_recursive` value.
 #[tokio::test]
@@ -2393,6 +2572,55 @@ async fn undesired_pair_with_mixed_recursive_rows_is_fully_removed() {
     assert_eq!(outcome, ReconciliationOutcome::Changed);
     assert_request(&recorded[9], "DELETE", "/apirest.php/Profile_User/99");
     assert_request(&recorded[10], "DELETE", "/apirest.php/Profile_User/100");
+}
+
+/// Removing an existing undesired assignment for an existing user requires
+/// only its `DELETE`; it must not spuriously create a User, Entity, Profile,
+/// or replacement Profile_User row.
+#[tokio::test]
+async fn removing_an_undesired_assignment_does_not_issue_any_creation_post() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 1)),
+        deleted(99),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope())
+        .await
+        .unwrap();
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
+    assert_request(&recorded[8], "DELETE", "/apirest.php/Profile_User/99");
+    for entry in &recorded {
+        let (method, path, _) = parsed_request_line(&entry.0);
+        if path == "/apirest.php/changeActiveEntities" {
+            continue;
+        }
+        assert_ne!(
+            method, "POST",
+            "removing an undesired assignment must not create any GLPI resource"
+        );
+    }
 }
 
 // =============================================================================
@@ -3082,11 +3310,10 @@ async fn rejects_a_hostname_mismatched_server_certificate() {
     let mismatched_identity = build_test_identity("127.0.0.2", ROOT_KEY_LABEL, LEAF_KEY_LABEL);
     let adapter = adapter_for(port, mismatched_identity.trust_anchor_pem.clone());
 
-    let accept_task = tokio::spawn(async move {
-        if let Ok((socket, _)) = listener.accept().await {
-            let _ = mismatched_identity.acceptor.accept(socket).await;
-        }
-    });
+    let accept_task = tokio::spawn(accept_one_tls_connection(
+        listener,
+        mismatched_identity.acceptor,
+    ));
 
     let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
     accept_task.await.expect("accept task completed");
@@ -3266,7 +3493,7 @@ async fn cancellation_after_init_session_stops_before_visibility_change() {
     ));
     let outcome =
         reconcile_with_cancellation(&adapter, &one_permission_envelope(), &cancellation).await;
-    server.abort();
+    abort_fake_server(server, "counted scripted server").await;
 
     assert!(outcome.is_err());
     assert_eq!(completed.load(Ordering::SeqCst), 1);
@@ -3294,7 +3521,7 @@ async fn cancellation_during_visibility_establishment_stops_before_verification(
     ));
     let outcome =
         reconcile_with_cancellation(&adapter, &one_permission_envelope(), &cancellation).await;
-    server.abort();
+    abort_fake_server(server, "counted scripted server").await;
 
     assert!(outcome.is_err());
     assert_eq!(completed.load(Ordering::SeqCst), 2);
@@ -3322,7 +3549,7 @@ async fn cancellation_between_semantic_resolution_stages_stops_immediately() {
     ));
     let outcome =
         reconcile_with_cancellation(&adapter, &one_permission_envelope(), &cancellation).await;
-    server.abort();
+    abort_fake_server(server, "counted scripted server").await;
 
     assert!(outcome.is_err());
     assert_eq!(completed.load(Ordering::SeqCst), 4);
@@ -3350,7 +3577,7 @@ async fn cancellation_before_user_lookup_stops_immediately() {
     ));
     let outcome =
         reconcile_with_cancellation(&adapter, &one_permission_envelope(), &cancellation).await;
-    server.abort();
+    abort_fake_server(server, "counted scripted server").await;
 
     assert!(outcome.is_err());
     assert_eq!(completed.load(Ordering::SeqCst), 9);
@@ -3379,7 +3606,7 @@ async fn cancellation_before_current_state_read_stops_immediately() {
     ));
     let outcome =
         reconcile_with_cancellation(&adapter, &one_permission_envelope(), &cancellation).await;
-    server.abort();
+    abort_fake_server(server, "counted scripted server").await;
 
     assert!(outcome.is_err());
     assert_eq!(completed.load(Ordering::SeqCst), 10);
@@ -3407,7 +3634,7 @@ async fn cancellation_before_first_delete_stops_immediately() {
     ));
     let outcome =
         reconcile_with_cancellation(&adapter, &one_permission_envelope(), &cancellation).await;
-    server.abort();
+    abort_fake_server(server, "counted scripted server").await;
 
     assert!(outcome.is_err());
     assert_eq!(completed.load(Ordering::SeqCst), 12);
@@ -3435,7 +3662,7 @@ async fn cancellation_between_delete_and_add_phases_stops_immediately() {
     ));
     let outcome =
         reconcile_with_cancellation(&adapter, &one_permission_envelope(), &cancellation).await;
-    server.abort();
+    abort_fake_server(server, "counted scripted server").await;
 
     assert!(outcome.is_err());
     assert_eq!(completed.load(Ordering::SeqCst), 13);
@@ -3464,7 +3691,7 @@ async fn cancellation_before_cleanup_suppresses_kill_session_without_failing() {
     ));
     let outcome =
         reconcile_with_cancellation(&adapter, &one_permission_envelope(), &cancellation).await;
-    server.abort();
+    abort_fake_server(server, "counted scripted server").await;
 
     assert_eq!(
         outcome.unwrap(),
@@ -3533,7 +3760,7 @@ async fn cancellation_between_search_pages_stops_before_next_page() {
     ));
     let outcome =
         reconcile_with_cancellation(&adapter, &empty_desired_envelope(), &cancellation).await;
-    server.abort();
+    abort_fake_server(server, "counted scripted server").await;
 
     assert!(outcome.is_err());
     assert_eq!(completed.load(Ordering::SeqCst), 7);
@@ -3582,183 +3809,73 @@ async fn cancellation_between_profile_user_item_reads_stops_before_second_read()
 
     let outcome =
         reconcile_with_cancellation(&adapter, &empty_desired_envelope(), &cancellation).await;
-    server.abort();
+    abort_fake_server(server, "counted scripted server").await;
 
     assert!(outcome.is_err());
     assert_eq!(completed.load(Ordering::SeqCst), 8);
 }
 
-/// Consecutive search pages each receive their own operation window. The fake
-/// server signals that each page request has arrived before withholding its
-/// response. This necessarily uses real time because production calculates
-/// deadlines with `std::time::Instant`; virtual-time proof would require an
-/// invasive production clock seam. Each 450 ms hold is materially below the
-/// 750 ms operation timeout, while their 900 ms total exceeds any stale page-1
-/// deadline. The three-second readiness and completion bounds only detect a
-/// stalled test/server interaction; the only real-time waits deliberately hold
-/// already-received server responses for the stated operation-window portions.
+/// A held response consumes the fresh per-operation budget. The server first
+/// confirms the request, then waits for the adapter to close its timed-out
+/// connection.
 #[tokio::test]
-async fn second_search_page_succeeds_with_a_fresh_operation_timeout() {
-    const OPERATION_TIMEOUT: Duration = Duration::from_millis(750);
-    const HELD_RESPONSE_DURATION: Duration = Duration::from_millis(450);
-    const TEST_BOUND: Duration = Duration::from_secs(3);
-
+async fn held_response_respects_operation_deadline_and_closes_connection() {
     let listener = bind_loopback_listener().await;
     let port = listener.local_addr().unwrap().port();
     let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
-    let adapter =
-        adapter_for_with_timeout(port, identity.trust_anchor_pem.clone(), OPERATION_TIMEOUT);
-    let mut first_page_rows = Vec::new();
-    for id in 1..=50 {
-        first_page_rows.push((id, "not-jdoe", "2"));
-    }
-    let first_page = search_page_body(51, 0, &first_page_rows);
-    let second_page = search_page_body(51, 50, &[(51, "jdoe", "2")]);
-
-    let (first_started_tx, mut first_started_rx) = oneshot::channel();
-    let (first_release_tx, first_release_rx) = oneshot::channel();
-    let (second_started_tx, mut second_started_rx) = oneshot::channel();
-    let (second_release_tx, second_release_rx) = oneshot::channel();
-    let script = vec![
-        (ok(r#"{"session_token":"sess-1"}"#), None),
-        (ok("true"), None),
-        (ok(&full_session_body(1)), None),
-        (
-            ok(&search_options_body(&[
-                ("1", "User.id"),
-                ("2", "User.name"),
-            ])),
-            None,
-        ),
-        (
-            ok(&search_options_body(&[
-                ("1", "Profile_User.id"),
-                ("2", "User.name"),
-            ])),
-            None,
-        ),
-        (
-            partial(&first_page),
-            Some(ResponseGate {
-                request_received: first_started_tx,
-                release: first_release_rx,
-            }),
-        ),
-        (
-            partial(&second_page),
-            Some(ResponseGate {
-                request_received: second_started_tx,
-                release: second_release_rx,
-            }),
-        ),
-        (ok(&profile_user_search_body(0, &[])), None),
-        (ok("true"), None),
-    ];
-    let server = tokio::spawn(run_gated_scripted_server(
-        listener,
-        identity.acceptor,
-        script,
-    ));
+    let adapter = adapter_for_with_timeout(
+        port,
+        identity.trust_anchor_pem.clone(),
+        HELD_RESPONSE_DEADLINE,
+    );
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(hold_one_response(listener, identity.acceptor, started_tx));
 
     let envelope = empty_desired_envelope();
     let reconciliation = reconcile(&adapter, &envelope);
     tokio::pin!(reconciliation);
-
-    let first_request = tokio::select! {
-        request = tokio::time::timeout(TEST_BOUND, &mut first_started_rx) => request
-            .expect("page 1 readiness within test bound")
-            .expect("first page readiness signal"),
-        outcome = &mut reconciliation => panic!("reconciliation ended before page 1: {outcome:?}"),
+    let request = tokio::select! {
+        request = await_fake_server_step("held initSession request", started_rx) => request
+            .expect("held server reports the request"),
+        outcome = &mut reconciliation => panic!("reconciliation ended before held initSession request: {outcome:?}"),
     };
-    assert_request(&first_request, "GET", "/apirest.php/search/User");
-    assert_eq!(
-        query_value(&first_request, "range"),
-        Some("0-49".to_owned())
-    );
-    tokio::time::sleep(HELD_RESPONSE_DURATION).await;
-    first_release_tx
-        .send(())
-        .expect("server awaits page 1 release");
-
-    let second_request = tokio::select! {
-        request = tokio::time::timeout(TEST_BOUND, &mut second_started_rx) => request
-            .expect("page 2 readiness within test bound")
-            .expect("second page readiness signal"),
-        outcome = &mut reconciliation => panic!("reconciliation ended before page 2: {outcome:?}"),
-    };
-    assert_request(&second_request, "GET", "/apirest.php/search/User");
-    assert_eq!(
-        query_value(&second_request, "range"),
-        Some("50-99".to_owned())
-    );
-    tokio::time::sleep(HELD_RESPONSE_DURATION).await;
-    second_release_tx
-        .send(())
-        .expect("server awaits page 2 release");
-
-    let outcome = tokio::time::timeout(TEST_BOUND, &mut reconciliation)
-        .await
-        .expect("reconciliation finishes within test bound")
-        .expect("fresh page-2 operation timeout permits the response");
-    let recorded = server.await.expect("scripted server completed its script");
-
-    assert_eq!(outcome, ReconciliationOutcome::Unchanged);
-    assert_eq!(recorded.len(), 9, "both pages and cleanup completed");
-}
-
-/// A held response consumes the per-operation budget, not the entire
-/// synchronization budget. The server signals request receipt before it
-/// withholds the response, so no sleep or connection race is involved.
-#[tokio::test]
-async fn held_response_is_bounded_by_the_fresh_operation_timeout() {
-    let listener = bind_loopback_listener().await;
-    let port = listener.local_addr().unwrap().port();
-    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
-    let adapter = adapter_for_with_timeout(
-        port,
-        identity.trust_anchor_pem.clone(),
-        Duration::from_millis(25),
-    );
-    let (started_tx, started_rx) = oneshot::channel();
-    let server = tokio::spawn(hold_one_response(listener, identity.acceptor, started_tx));
-
-    let envelope = empty_desired_envelope();
-    let outcome = tokio::time::timeout(Duration::from_secs(1), reconcile(&adapter, &envelope))
-        .await
-        .expect("operation timeout returns within the test bound");
-    let request = started_rx.await.expect("held server reports the request");
     assert_request(&request, "GET", "/apirest.php/initSession");
-    server.abort();
+    let outcome = await_fake_server_step("operation deadline", &mut reconciliation).await;
+    join_fake_server(server, "held-response server").await;
     assert!(outcome.is_err());
 }
 
 /// An earlier overall deadline wins over a longer operation timeout while a
-/// response is held. No second request can start after that observation.
+/// response is held, and the adapter closes the held connection.
 #[tokio::test]
-async fn held_response_is_bounded_by_the_earlier_overall_deadline() {
+async fn held_response_respects_earlier_overall_deadline_and_closes_connection() {
     let listener = bind_loopback_listener().await;
     let port = listener.local_addr().unwrap().port();
     let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
     let adapter = adapter_for_with_timeout(
         port,
         identity.trust_anchor_pem.clone(),
-        Duration::from_secs(1),
+        Duration::from_secs(10),
     );
-    let (started_tx, started_rx) = oneshot::channel();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(hold_one_response(listener, identity.acceptor, started_tx));
     let cancellation = NeverCancelled;
     let identity_context = IdentityContext::new("jdoe".to_owned(), vec![]);
     let envelope = empty_desired_envelope();
     let context =
-        SynchronizationContext::new(Instant::now() + Duration::from_millis(25), &cancellation);
+        SynchronizationContext::new(Instant::now() + HELD_RESPONSE_DEADLINE, &cancellation);
     let request = TargetAdapterRequest::new(&identity_context, &envelope, context);
 
-    let outcome = tokio::time::timeout(Duration::from_secs(1), adapter.reconcile(request))
-        .await
-        .expect("overall deadline returns within the test bound");
-    let request = started_rx.await.expect("held server reports the request");
-    assert_request(&request, "GET", "/apirest.php/initSession");
-    server.abort();
+    let reconciliation = adapter.reconcile(request);
+    tokio::pin!(reconciliation);
+    let held_request = tokio::select! {
+        request = await_fake_server_step("held initSession request", started_rx) => request
+            .expect("held server reports the request"),
+        outcome = &mut reconciliation => panic!("reconciliation ended before held initSession request: {outcome:?}"),
+    };
+    assert_request(&held_request, "GET", "/apirest.php/initSession");
+    let outcome = await_fake_server_step("overall deadline", &mut reconciliation).await;
+    join_fake_server(server, "held-response server").await;
     assert!(outcome.is_err());
 }
 
@@ -3852,7 +3969,7 @@ async fn cancellation_flip_between_cleanup_eligibility_check_and_kill_session_su
     let envelope = one_permission_envelope();
     let request = TargetAdapterRequest::new(&identity_ctx, &envelope, context);
     let outcome = adapter.reconcile(request).await;
-    server.abort();
+    abort_fake_server(server, "counted scripted server").await;
 
     assert_eq!(
         outcome.unwrap(),
