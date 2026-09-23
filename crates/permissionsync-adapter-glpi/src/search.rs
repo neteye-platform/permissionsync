@@ -460,12 +460,6 @@ pub(crate) async fn resolve_user_id(
     }
 }
 
-/// The per-user `Profile_User` candidate-row sanity bound. Real GLPI
-/// deployments own at most a small number of assignment rows per user; a
-/// user with more candidate rows than this is treated as malformed search
-/// metadata rather than issued an unbounded number of per-row item reads.
-const MAX_ASSIGNMENTS_PER_USER: usize = 10_000;
-
 /// Reads the complete current `Profile_User` assignment set for `user_id`.
 ///
 /// `Profile_User`'s own search options expose only semantic joined display
@@ -506,10 +500,6 @@ pub(crate) async fn read_current_assignments(
                 candidate_ids.push(id);
             }
         }
-    }
-
-    if candidate_ids.len() > MAX_ASSIGNMENTS_PER_USER {
-        return Err(GlpiFailure::AssignmentCountExceeded);
     }
 
     let mut current = Vec::with_capacity(candidate_ids.len());

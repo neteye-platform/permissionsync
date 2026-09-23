@@ -97,9 +97,16 @@ for ($index = 1; $index <= 60; ++$index) {
 
 // Profile_User has no independent "assign_user" right in GLPI 11.0.9. Its
 // canCreateItem() requires User READ, entity visibility, and a strictly lower
-// target profile. These are the only service grants needed by this suite.
+// target profile. READ/CREATE/UPDATE on "user" cover: looking up existing
+// users, creating a missing user via POST /apirest.php/User/, and removing a
+// stale Profile_User row. Profile_User deletion is not gated by its own
+// canPurgeItem() (which adds no user-right requirement); it inherits
+// CommonDBRelation::canDeleteItem(), which checks canUpdateItem on the
+// related User side, i.e. User UPDATE. DELETE and PURGE on "user" are not
+// checked anywhere in this path and are intentionally omitted; the adapter
+// never deletes or purges User objects directly.
 $service_profile_id = add_profile_or_fail('permissionsync-service-account', [
-    'user'    => READ | CREATE | UPDATE | DELETE | PURGE,
+    'user'    => READ | CREATE | UPDATE,
     'entity'  => READ,
     'profile' => READ,
 ]);

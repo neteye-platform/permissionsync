@@ -34,22 +34,6 @@ fi
 
 readonly safe_runtime_dir
 
-cleanup_runtime_dir() {
-  local status=$?
-
-  if ! rm -rf -- "$safe_runtime_dir"; then
-    printf '%s\n' 'GLPI teardown failed: could not remove the generated runtime directory.' >&2
-    if ((status == 0)); then
-      status=1
-    fi
-  fi
-
-  trap - EXIT
-  exit "$status"
-}
-
-trap cleanup_runtime_dir EXIT
-
 unset PERMISSIONSYNC_GLPI_PROJECT_NAME GLPI_TEST_RUNTIME_DIR
 # shellcheck disable=SC1090
 source "$runtime_env"
@@ -61,7 +45,16 @@ if [[ "$GLPI_TEST_RUNTIME_DIR" != "$safe_runtime_dir" ]]; then
   exit 1
 fi
 
+# The runtime directory (and its runtime.env) must only be removed after a
+# successful `docker compose down`. On failure it must be preserved so that
+# teardown can be retried; a blanket EXIT trap cannot express that
+# conditional cleanup safely, so this is handled inline instead.
 if ! docker compose --env-file "$runtime_env" -p "$PERMISSIONSYNC_GLPI_PROJECT_NAME" down --volumes --remove-orphans; then
-  printf '%s\n' 'GLPI teardown failed: docker compose down did not complete.' >&2
+  printf '%s\n' 'GLPI teardown failed: docker compose down did not complete; preserving runtime directory for retry.' >&2
+  exit 1
+fi
+
+if ! rm -rf -- "$safe_runtime_dir"; then
+  printf '%s\n' 'GLPI teardown failed: could not remove the generated runtime directory.' >&2
   exit 1
 fi

@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn effective_deadline_caps_at_overall_deadline_when_shorter_than_operation_timeout() {
         let cancellation = NeverCancelled;
-        let overall_deadline = Instant::now() + Duration::from_millis(10);
+        let overall_deadline = Instant::now() + Duration::from_secs(30);
         let context = SynchronizationContext::new(overall_deadline, &cancellation);
         let operation_timeout = Duration::from_secs(60);
 
