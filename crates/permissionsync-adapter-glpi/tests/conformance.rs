@@ -422,7 +422,10 @@ fn search_page_body(total: u64, start: u64, rows: &[(u64, &str, &str)]) -> Strin
 
     let mut data = Vec::new();
     for (id, name, name_field) in rows {
-        data.push(format!(r#"{{"1": {id}, "{name_field}": "{name}"}}"#));
+        data.push(format!(
+            r#"{{"1": {id}, "{name_field}": {}}}"#,
+            serde_json::to_string(name).expect("fixture name serializes to JSON")
+        ));
     }
     let end = start + rows.len() as u64 - 1;
     format!(
@@ -633,7 +636,7 @@ fn assert_outgoing_wire_contract(recorded: &RecordedRequest) {
             }
             assert_eq!(
                 query_value(recorded, "criteria[0][searchtype]"),
-                Some("equals".to_owned())
+                Some("contains".to_owned())
             );
             assert_eq!(query_value(recorded, "order"), Some("ASC".to_owned()));
             for key in [
@@ -1271,13 +1274,10 @@ async fn every_structurally_invalid_payload_makes_zero_glpi_requests() {
 
         let outcome = reconcile(&adapter, &envelope).await;
 
-        assert!(
-            outcome.is_err(),
-            "expected rejection for payload: {payload}"
-        );
+        assert!(outcome.is_err(), "expected payload validation rejection");
         match listener.try_accept_nonblocking() {
             Err(kind) => assert_eq!(kind, std::io::ErrorKind::WouldBlock),
-            Ok(()) => panic!("adapter unexpectedly connected to GLPI for payload: {payload}"),
+            Ok(()) => panic!("adapter unexpectedly connected to GLPI for invalid payload"),
         }
     }
 }
@@ -1339,8 +1339,8 @@ async fn duplicate_desired_permissions_with_already_canonical_current_state_is_u
     assert_eq!(outcome, ReconciliationOutcome::Unchanged);
 }
 
-/// Selector strings reach the outbound GLPI search request exactly as
-/// given: never trimmed and never case-folded.
+/// Selector strings remain untrimmed and uncasefolded within the anchored
+/// GLPI `contains` pattern.
 #[tokio::test]
 async fn selector_strings_reach_glpi_search_untrimmed_and_uncasefolded() {
     let listener = bind_loopback_listener().await;
@@ -1387,9 +1387,88 @@ async fn selector_strings_reach_glpi_search_untrimmed_and_uncasefolded() {
     assert_empty_body(&recorded[7]);
     assert_eq!(
         query_value(&recorded[7], "criteria[0][value]"),
-        Some("  Root Entity > IT ".to_owned()),
-        "the entity selector must reach GLPI untrimmed"
+        Some("^%  Root Entity > IT %$".to_owned()),
+        "the entity selector must remain untrimmed within the GLPI pattern"
     );
+}
+
+/// GLPI 11.0.9 receives an anchored `contains` pattern for every exact
+/// selector form. The fake deliberately returns a fuzzy row alongside the
+/// exact row to prove adapter-side case-sensitive equality remains final.
+#[tokio::test]
+async fn exact_search_patterns_preserve_selector_metacharacters_and_ignore_fuzzy_rows() {
+    for (selector, expected_query_value) in [
+        ("Technician", "^Technician$"),
+        ("literal%", "^literal%$"),
+        ("literal_", "^literal_$"),
+        ("^literal", "^^literal$"),
+        ("literal$", "^literal$$"),
+        (r"literal\backslash", r"^literal\backslash$"),
+        (" boundary ", "^% boundary %$"),
+    ] {
+        let listener = bind_loopback_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+        let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+        let envelope = envelope_json(
+            &serde_json::json!({
+                "permissions": [{
+                    "entity": selector,
+                    "profile": "Technician",
+                    "recursive": true,
+                }],
+            })
+            .to_string(),
+        );
+        let fuzzy_candidate = format!("{selector} fuzzy candidate");
+        let entity_search = search_body(
+            2,
+            &[(10, fuzzy_candidate.as_str(), "2"), (11, selector, "2")],
+        );
+
+        let script = vec![
+            ok(r#"{"session_token": "sess-1"}"#),
+            ok("true"),
+            ok(&full_session_body(1)),
+            ok(&search_options_body(&[
+                ("1", "Entity.id"),
+                ("2", "Entity.completename"),
+            ])),
+            ok(&search_options_body(&[
+                ("1", "Profile.id"),
+                ("2", "Profile.name"),
+            ])),
+            ok(&search_options_body(&[
+                ("1", "User.id"),
+                ("2", "User.name"),
+            ])),
+            ok(&search_options_body(&[
+                ("1", "Profile_User.id"),
+                ("2", "User.name"),
+            ])),
+            ok(&entity_search),
+            // The missing profile ends this scenario after successful entity
+            // resolution. Reaching it proves the fuzzy entity row did not
+            // count as a second exact match.
+            ok(&search_body(0, &[])),
+            ok("true"),
+        ];
+
+        let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+        let outcome = reconcile(&adapter, &envelope).await;
+        let recorded = server.await.expect("scripted server completed its script");
+
+        assert!(
+            outcome.is_err(),
+            "the deliberately missing profile must stop reconciliation"
+        );
+        assert_request(&recorded[8], "GET", "/apirest.php/search/Profile");
+        assert_eq!(
+            query_value(&recorded[7], "criteria[0][value]"),
+            Some(expected_query_value.to_owned()),
+            "decoded GLPI search pattern must preserve the exact selector"
+        );
+    }
 }
 
 // =============================================================================
@@ -1667,9 +1746,9 @@ async fn missing_user_creation_with_empty_desired_state_is_still_changed() {
 // =============================================================================
 
 /// Entity and Profile selectors containing spaces and URL/query
-/// metacharacters (`>`, `&`, `=`) are percent-encoded on the wire and
-/// decoded back to the exact original string; ambiguous exact matches for
-/// either fail before any user lookup or mutation.
+/// metacharacters (`>`, `&`, `=`) are percent-encoded on the wire and encoded
+/// in an anchored GLPI `contains` pattern; ambiguous exact matches fail before
+/// any user lookup or mutation.
 #[tokio::test]
 async fn entity_and_profile_selectors_with_metacharacters_are_percent_encoded() {
     let listener = bind_loopback_listener().await;
@@ -1722,7 +1801,7 @@ async fn entity_and_profile_selectors_with_metacharacters_are_percent_encoded() 
     assert!(!recorded[7].0.contains("R&D > Team=1"));
     assert_eq!(
         query_value(&recorded[7], "criteria[0][value]"),
-        Some(entity_selector.to_owned())
+        Some(format!("^{entity_selector}$"))
     );
 }
 
@@ -1807,8 +1886,8 @@ async fn nested_looking_entity_completename_resolves_as_one_opaque_exact_match()
     );
     assert_eq!(
         query_value(entity_search, "criteria[0][value]"),
-        Some(entity_selector.to_owned()),
-        "the complete selector must reach the single Entity search unmodified"
+        Some(format!("^{entity_selector}$")),
+        "the complete selector must remain inside the single Entity search pattern"
     );
 }
 
@@ -4442,8 +4521,8 @@ async fn profile_selector_case_mismatch_is_not_a_match() {
     );
 }
 
-/// A profile selector containing search metacharacters is percent-encoded
-/// on the wire, and the exact percent-decoded value still reaches GLPI.
+/// A profile selector containing search metacharacters is percent-encoded on
+/// the wire and remains inside the anchored GLPI `contains` pattern.
 #[tokio::test]
 async fn profile_selector_metacharacters_are_percent_encoded() {
     let listener = bind_loopback_listener().await;
@@ -4488,7 +4567,7 @@ async fn profile_selector_metacharacters_are_percent_encoded() {
     assert!(!recorded[8].0.contains(profile_selector));
     assert_eq!(
         query_value(&recorded[8], "criteria[0][value]"),
-        Some(profile_selector.to_owned())
+        Some(format!("^{profile_selector}$"))
     );
 }
 

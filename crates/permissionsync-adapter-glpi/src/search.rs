@@ -18,6 +18,42 @@ use crate::{
 /// pagination logic is always exercised even for small fixtures.
 const PAGE_SIZE: u64 = 50;
 
+/// Builds a GLPI `contains` criterion that narrows candidates to an exact
+/// selector without altering the selector itself. GLPI 11.0.9's
+/// `makeTextSearchValue()` doubles backslashes, escapes underscores, trims PHP
+/// whitespace, and removes its outer `^`/`$` anchors before applying `LIKE`.
+fn exact_search_query_value(selector: &str) -> String {
+    fn is_php_trim_byte(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\0' | 0x0b)
+    }
+
+    let starts_with_php_trim = selector
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| is_php_trim_byte(*byte));
+    let ends_with_php_trim = selector
+        .as_bytes()
+        .last()
+        .is_some_and(|byte| is_php_trim_byte(*byte));
+
+    let mut value = String::with_capacity(selector.len() + 4);
+    value.push('^');
+    // Keep trim-sensitive boundary whitespace behind a LIKE wildcard while
+    // exact adapter-side comparison remains the final authority.
+    if starts_with_php_trim {
+        value.push('%');
+    }
+    // GLPI leaves percent as a LIKE wildcard; the outer anchors and exact
+    // adapter-side comparison keep it safe and non-excluding. It handles
+    // backslashes and underscores itself, so do not pre-escape them here.
+    value.push_str(selector);
+    if ends_with_php_trim {
+        value.push('%');
+    }
+    value.push('$');
+    value
+}
+
 /// Resolved GLPI V1 search-option ids for one itemtype's required semantic
 /// fields, keyed by their stable `uid`.
 pub(crate) struct SearchOptions {
@@ -102,9 +138,9 @@ pub(crate) async fn resolve_search_options(
 /// One raw search result row, keyed by search-option id (as GLPI returns it).
 type Row = HashMap<u64, Value>;
 
-/// Runs one complete paginated GLPI V1 search, applying one equality
-/// criterion, and returns every row across every page. Fails on non-progress
-/// (a page that does not advance the observed range) or inconsistent
+/// Runs one complete paginated GLPI V1 search, applying one exact-selector
+/// narrowing criterion, and returns every row across every page. Fails on
+/// non-progress (a page that does not advance the observed range) or inconsistent
 /// `totalcount` between pages, rather than looping forever.
 #[allow(clippy::too_many_arguments)]
 async fn search_all_pages(
@@ -117,6 +153,7 @@ async fn search_all_pages(
     sort_field: u64,
     context: &SynchronizationContext<'_>,
 ) -> Result<Vec<Row>, GlpiFailure> {
+    let criterion_value = exact_search_query_value(criterion_value);
     let mut rows = Vec::new();
     let mut start: u64 = 0;
     let mut expected_total: Option<u64> = None;
@@ -133,8 +170,8 @@ async fn search_all_pages(
             let mut query = url.query_pairs_mut();
             query.append_pair("range", &format!("{start}-{end}"));
             query.append_pair("criteria[0][field]", &criterion_field.to_string());
-            query.append_pair("criteria[0][searchtype]", "equals");
-            query.append_pair("criteria[0][value]", criterion_value);
+            query.append_pair("criteria[0][searchtype]", "contains");
+            query.append_pair("criteria[0][value]", &criterion_value);
             // Pin an explicit, stable sort so monotonic page progress is
             // actually provable across pages, rather than relying on GLPI's
             // unspecified default order.
@@ -619,7 +656,34 @@ pub(crate) const REQUIRED_PROFILE_USER_UIDS: &[&str] = &["Profile_User.id", "Use
 
 #[cfg(test)]
 mod tests {
-    use super::parse_search_page;
+    use super::{exact_search_query_value, parse_search_page};
+
+    #[test]
+    fn exact_search_query_value_preserves_exact_selector_metacharacters() {
+        for (selector, expected) in [
+            ("Technician", "^Technician$"),
+            ("literal%", "^literal%$"),
+            ("literal_", "^literal_$"),
+            ("^literal", "^^literal$"),
+            ("literal$", "^literal$$"),
+            (r"literal\backslash", r"^literal\backslash$"),
+            (" boundary ", "^% boundary %$"),
+        ] {
+            assert_eq!(exact_search_query_value(selector), expected, "{selector:?}");
+        }
+    }
+
+    #[test]
+    fn exact_search_query_value_protects_every_php_trim_boundary_byte() {
+        for boundary in [' ', '\t', '\n', '\r', '\0', '\x0b'] {
+            let selector = format!("{boundary}selector{boundary}");
+            assert_eq!(
+                exact_search_query_value(&selector),
+                format!("^%{selector}%$"),
+                "boundary byte {boundary:?}"
+            );
+        }
+    }
 
     #[test]
     fn search_page_accepts_glpi_zero_result_shape() {

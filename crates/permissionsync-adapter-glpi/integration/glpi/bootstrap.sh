@@ -121,6 +121,20 @@ until curl --fail --silent --show-error "http://127.0.0.1:${GLPI_TEST_HTTP_PORT}
   sleep 2
 done
 
+# The command string is intentionally single-quoted so GLPI_CONFIG_DIR expands
+# in the container rather than in the bootstrap host shell.
+# shellcheck disable=SC2016
+if ! compose exec -T glpi sh -c '
+  config_dir="${GLPI_CONFIG_DIR:-/var/glpi/config}"
+  [ -f "${config_dir}/config_db.php" ] || exit 5
+  php bin/console db:check --quiet >/dev/null 2>&1
+  status=$?
+  [ "$status" -lt 5 ]
+'; then
+  printf '%s\n' 'GLPI HTTP is ready, but GLPI is uninstalled or database consistency failed.' >&2
+  exit 1
+fi
+
 if ! compose exec -T glpi php bootstrap.php >"$bootstrap_stdout" 2>"$bootstrap_stderr"; then
   printf '%s\n' 'GLPI PHP bootstrap failed; captured output was redacted.' >&2
   exit 1

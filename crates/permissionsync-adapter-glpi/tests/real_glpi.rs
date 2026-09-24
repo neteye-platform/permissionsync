@@ -80,15 +80,14 @@ fn real_environment() -> RealGlpiEnvironment {
     fn required(name: &str) -> String {
         env::var(name).unwrap_or_else(|_| {
             panic!(
-                "{name} is not set. Run `source <(crates/permissionsync-adapter-glpi/integration/glpi/bootstrap.sh)` first; missing real-GLPI configuration is a hard failure."
+                "required real-GLPI configuration is not set. Run `source <(crates/permissionsync-adapter-glpi/integration/glpi/bootstrap.sh)` first; missing configuration is a hard failure."
             )
         })
     }
 
     let ca_pem_path = required("GLPI_TEST_CA_PEM_PATH");
-    let ca_pem = fs::read(&ca_pem_path).unwrap_or_else(|error| {
-        panic!("GLPI_TEST_CA_PEM_PATH={ca_pem_path} could not be read: {error}")
-    });
+    let ca_pem =
+        fs::read(&ca_pem_path).unwrap_or_else(|_| panic!("test CA certificate could not be read"));
 
     RealGlpiEnvironment {
         endpoint: required("GLPI_TEST_ENDPOINT"),
@@ -109,7 +108,7 @@ fn real_environment() -> RealGlpiEnvironment {
 }
 
 fn quote_sql_string(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 /// Executes fixture-only SQL against the disposable database. All values used
@@ -135,11 +134,7 @@ fn run_fixture_sql(environment: &RealGlpiEnvironment, sql: &str) {
         ])
         .output()
         .expect("docker compose exec must be invocable against the disposable database");
-    assert!(
-        output.status.success(),
-        "fixture SQL failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success(), "fixture SQL command failed");
 }
 
 /// Runs a fixture-only read query to prove GLPI's physical state independently
@@ -168,18 +163,12 @@ fn query_physical_row_count(environment: &RealGlpiEnvironment, sql: &str) -> u64
         .expect("docker compose exec must be invocable against the disposable database");
     assert!(
         output.status.success(),
-        "physical-state verification query failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "physical-state verification query failed"
     );
     String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse::<u64>()
-        .unwrap_or_else(|error| {
-            panic!(
-                "physical-state query returned a non-numeric result: {error}; stdout={:?}",
-                String::from_utf8_lossy(&output.stdout)
-            )
-        })
+        .unwrap_or_else(|_| panic!("physical-state query returned a non-numeric result"))
 }
 
 fn assignment_pair_where(username: &str, entity: &str, profile: &str) -> String {
@@ -230,7 +219,7 @@ fn assert_exactly_one_physical_assignment(
     assert_eq!(
         physical_assignment_count(environment, username, entity, profile, None),
         1,
-        "expected one total Profile_User row for user={username}, entity={entity}, profile={profile}"
+        "expected one total Profile_User row for the fixture assignment"
     );
     assert_eq!(
         physical_assignment_count(
@@ -241,7 +230,7 @@ fn assert_exactly_one_physical_assignment(
             Some(expected_recursive),
         ),
         1,
-        "expected one is_recursive={expected_recursive} row for user={username}, entity={entity}, profile={profile}"
+        "expected one Profile_User row with the expected recursive value"
     );
     assert_eq!(
         physical_assignment_count(
@@ -252,7 +241,7 @@ fn assert_exactly_one_physical_assignment(
             Some(opposite_recursive),
         ),
         0,
-        "expected no opposite is_recursive={opposite_recursive} row for user={username}, entity={entity}, profile={profile}"
+        "expected no Profile_User row with the opposite recursive value"
     );
 }
 
@@ -265,7 +254,7 @@ fn assert_no_physical_assignment(
     assert_eq!(
         physical_assignment_count(environment, username, entity, profile, None),
         0,
-        "expected no Profile_User row for user={username}, entity={entity}, profile={profile}"
+        "expected no Profile_User row for the fixture assignment"
     );
 }
 
@@ -278,7 +267,7 @@ fn assert_no_physical_assignments(environment: &RealGlpiEnvironment, username: &
     assert_eq!(
         query_physical_row_count(environment, &sql),
         0,
-        "expected no Profile_User rows for user={username}"
+        "expected no Profile_User rows for the fixture user"
     );
 }
 
@@ -290,7 +279,7 @@ fn assert_exactly_one_physical_user(environment: &RealGlpiEnvironment, username:
     assert_eq!(
         query_physical_row_count(environment, &sql),
         1,
-        "expected exactly one User row for username={username}"
+        "expected exactly one User row for the fixture user"
     );
 }
 
@@ -482,6 +471,33 @@ async fn missing_user_is_created_through_v1_and_gains_a_canonical_assignment() {
     assert_exactly_one_physical_assignment(&environment, username, ROOT_ENTITY, profile, 1);
 }
 
+/// A controlled username containing GLPI LIKE metacharacters must be found by
+/// its exact second reconciliation, rather than being created again or lost to
+/// GLPI's search normalization.
+#[tokio::test]
+#[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
+async fn exact_user_lookup_with_like_metacharacters_is_idempotent() {
+    let environment = real_environment();
+    let username = r"^permissionsync-real-search-%_\$";
+
+    assert_eq!(
+        reconcile(&environment, username, r#"{"permissions":[]}"#)
+            .await
+            .expect("initial V1 reconciliation must succeed"),
+        ReconciliationOutcome::Changed,
+        "initial reconciliation must create the controlled user"
+    );
+    assert_exactly_one_physical_user(&environment, username);
+    assert_eq!(
+        reconcile(&environment, username, r#"{"permissions":[]}"#)
+            .await
+            .expect("repeated V1 reconciliation must find the controlled user"),
+        ReconciliationOutcome::Unchanged,
+        "repeated reconciliation must resolve the exact controlled user"
+    );
+    assert_exactly_one_physical_user(&environment, username);
+}
+
 /// Empty desired state is authoritative and exercises real `Profile_User`
 /// deletion after a real V1 user/assignment creation.
 #[tokio::test]
@@ -525,7 +541,7 @@ async fn ordinary_recursive_values_are_idempotent() {
                 .await
                 .expect("initial V1 reconciliation must succeed"),
             ReconciliationOutcome::Changed,
-            "initial result for {username}"
+            "initial reconciliation must report a change"
         );
         assert_exactly_one_physical_assignment(
             &environment,
@@ -539,7 +555,7 @@ async fn ordinary_recursive_values_are_idempotent() {
                 .await
                 .expect("repeated V1 reconciliation must succeed"),
             ReconciliationOutcome::Unchanged,
-            "repeat result for {username}"
+            "repeated reconciliation must report no change"
         );
     }
 }
@@ -597,7 +613,7 @@ async fn desired_duplicate_matrix_canonicalizes_and_is_idempotent() {
                 .await
                 .expect("initial duplicate-input reconciliation must succeed"),
             ReconciliationOutcome::Changed,
-            "initial result for {username}"
+            "initial duplicate-input reconciliation must report a change"
         );
         assert_exactly_one_physical_assignment(
             &environment,
@@ -611,7 +627,7 @@ async fn desired_duplicate_matrix_canonicalizes_and_is_idempotent() {
                 .await
                 .expect("repeated duplicate-input reconciliation must succeed"),
             ReconciliationOutcome::Unchanged,
-            "provider multiplicity alone must not change canonical state for {username}"
+            "provider multiplicity alone must not change canonical state"
         );
     }
 }
@@ -646,7 +662,7 @@ async fn mixed_current_rows_are_cleaned_to_the_desired_canonical_value() {
         assert_eq!(
             physical_assignment_count(&environment, username, ROOT_ENTITY, profile, None),
             2,
-            "fixture must contain false+true rows for {username}"
+            "fixture must contain both recursive variants"
         );
         assert_eq!(
             physical_assignment_count(&environment, username, ROOT_ENTITY, profile, Some(0)),
@@ -969,9 +985,8 @@ async fn production_adapter_killsession_is_observed_at_the_tls_proxy_boundary() 
     let profile = environment.target_profile_b.as_str();
     let log_path = Path::new(&environment.proxy_log_dir).join("killsession.log");
 
-    let contents_before = fs::read_to_string(&log_path).unwrap_or_else(|error| {
-        panic!("killsession proxy log at {log_path:?} must exist and be readable: {error}")
-    });
+    let contents_before = fs::read_to_string(&log_path)
+        .unwrap_or_else(|_| panic!("killsession proxy log must exist and be readable"));
     assert!(
         contents_before.is_empty(),
         "exclusive killsession proxy log must be empty before the cleanup reconciliation"
@@ -1001,7 +1016,7 @@ async fn production_adapter_killsession_is_observed_at_the_tls_proxy_boundary() 
     stop_cleanup_proxy_after_reconciliation(&environment);
 
     let contents_after = fs::read_to_string(&log_path)
-        .unwrap_or_else(|error| panic!("killsession proxy log at {log_path:?} must be readable after a successful reconciliation: {error}"));
+        .unwrap_or_else(|_| panic!("killsession proxy log must be readable after reconciliation"));
     assert!(
         contents_after.ends_with('\n'),
         "the exclusive killsession proxy log record must end with a newline"
