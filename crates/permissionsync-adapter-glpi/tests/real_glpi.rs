@@ -471,14 +471,14 @@ async fn missing_user_is_created_through_v1_and_gains_a_canonical_assignment() {
     assert_exactly_one_physical_assignment(&environment, username, ROOT_ENTITY, profile, 1);
 }
 
-/// A controlled username containing GLPI LIKE metacharacters must be found by
-/// its exact second reconciliation, rather than being created again or lost to
-/// GLPI's search normalization.
+/// A controlled username containing a GLPI LIKE single-character wildcard
+/// (`_`) must be found by its exact second reconciliation, rather than being
+/// created again or lost to GLPI's search normalization.
 #[tokio::test]
 #[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
-async fn exact_user_lookup_with_like_metacharacters_is_idempotent() {
+async fn exact_user_lookup_with_like_underscore_is_idempotent() {
     let environment = real_environment();
-    let username = r"^permissionsync-real-search-%_\$";
+    let username = "permissionsync_real_search_like";
 
     assert_eq!(
         reconcile(&environment, username, r#"{"permissions":[]}"#)

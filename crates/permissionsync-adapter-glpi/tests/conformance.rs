@@ -441,7 +441,7 @@ fn search_body(total: u64, rows: &[(u64, &str, &str)]) -> String {
 
 /// A scripted `Profile_User` candidate-discovery search response: one row
 /// per `(row_id, username)` pair, keyed by the "Profile_User.id" (`"1"`) and
-/// joined "User.name" (`"2"`) search-option ids.
+/// joined "Profile_User.User.name" (`"2"`) search-option ids.
 fn profile_user_search_body(total: u64, rows: &[(u64, &str)]) -> String {
     let named_rows: Vec<(u64, &str, &str)> = rows
         .iter()
@@ -856,7 +856,7 @@ fn oversized_script() -> Vec<ScriptedResponse> {
         ])), // 6: listSearchOptions/User
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])), // 7: listSearchOptions/Profile_User
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])), // 8: search Entity
         ok(&search_body(1, &[(20, "Technician", "2")])), // 9: search Profile
@@ -904,7 +904,7 @@ async fn full_reconciliation_creates_the_missing_assignment_and_returns_changed(
         ])), // listSearchOptions/User
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])), // listSearchOptions/Profile_User
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])), // search Entity
         ok(&search_body(1, &[(20, "Technician", "2")])), // search Profile
@@ -921,6 +921,57 @@ async fn full_reconciliation_creates_the_missing_assignment_and_returns_changed(
     server.await.expect("scripted server completed");
 
     assert_eq!(outcome, ReconciliationOutcome::Changed);
+}
+
+/// A `Profile_User` `listSearchOptions` response that still exposes the
+/// joined username under the bare `User.name` uid (rather than the correct
+/// `Profile_User.User.name` uid used by the real GLPI `listSearchOptions`
+/// endpoint for this itemtype) must be rejected as unavailable search
+/// metadata, with zero further GLPI requests beyond session establishment
+/// and cleanup.
+#[tokio::test]
+async fn profile_user_search_options_missing_the_joined_username_uid_fails_closed() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#), // initSession
+        ok("true"),                           // changeActiveEntities
+        ok(&full_session_body(1)),            // getFullSession
+        ok(&search_options_body(&[
+            ("1", "Entity.id"),
+            ("2", "Entity.completename"),
+        ])), // listSearchOptions/Entity
+        ok(&search_options_body(&[
+            ("1", "Profile.id"),
+            ("2", "Profile.name"),
+        ])), // listSearchOptions/Profile
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])), // listSearchOptions/User
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "User.name"),
+        ])), // listSearchOptions/Profile_User: old incorrect uid
+        ok("true"),                           // killSession
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+    let recorded = server
+        .await
+        .expect("scripted server completed exactly its script");
+
+    assert!(outcome.is_err());
+    assert_eq!(
+        recorded.len(),
+        8,
+        "no Entity/Profile/User search and no Profile_User mutation after \
+         the missing Profile_User.User.name search-option uid"
+    );
 }
 
 /// GLPI's root entity is physically id `0` (see GLPI's own
@@ -957,7 +1008,7 @@ async fn desired_entity_selector_resolving_to_root_entity_id_zero_succeeds() {
         ])), // listSearchOptions/User
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])), // listSearchOptions/Profile_User
         ok(&search_body(1, &[(0, "Root entity", "2")])), // search Entity: id 0
         ok(&search_body(1, &[(20, "Technician", "2")])), // search Profile
@@ -1024,7 +1075,7 @@ async fn ambiguous_user_lookup_is_a_failure() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(2, &[(30, "jdoe", "2"), (31, "jdoe", "2")])), // two exact User matches
         ok("true"),                                                   // killSession
@@ -1127,7 +1178,7 @@ async fn cleanup_failure_after_success_becomes_the_returned_failure() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])), // search User: existing
         ok(&profile_user_search_body(0, &[])), // search Profile_User (candidate discovery: none)
@@ -1173,7 +1224,7 @@ async fn idempotent_second_reconciliation_of_an_already_canonical_state_is_uncha
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
@@ -1322,7 +1373,7 @@ async fn duplicate_desired_permissions_with_already_canonical_current_state_is_u
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
@@ -1369,7 +1420,7 @@ async fn selector_strings_reach_glpi_search_untrimmed_and_uncasefolded() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         // Zero exact matches for the untrimmed selector: the adapter fails
         // closed, but the request that carried the untrimmed selector is
@@ -1444,7 +1495,7 @@ async fn exact_search_patterns_preserve_selector_metacharacters_and_ignore_fuzzy
             ])),
             ok(&search_options_body(&[
                 ("1", "Profile_User.id"),
-                ("2", "User.name"),
+                ("2", "Profile_User.User.name"),
             ])),
             ok(&entity_search),
             // The missing profile ends this scenario after successful entity
@@ -1508,7 +1559,7 @@ async fn missing_user_is_created_with_only_the_configured_provisioning_fields() 
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(0, &[])), // search User: zero exact matches
         created(r#"{"id":55,"message":"created"}"#), // POST User
@@ -1551,7 +1602,7 @@ async fn ambiguous_user_lookup_makes_zero_mutation_requests() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(2, &[(30, "jdoe", "2"), (31, "jdoe", "2")])),
         ok("true"), // killSession
@@ -1603,7 +1654,7 @@ async fn case_sensitive_lookalike_does_not_count_as_an_exact_user_match() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         // GLPI search "equals" can return a fuzzy/lookalike row; only a
         // case-sensitive exact match counts.
@@ -1650,7 +1701,7 @@ async fn user_lookup_reads_every_page_before_deciding() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         partial(&page_one),
         partial(&page_two),
@@ -1689,7 +1740,7 @@ async fn user_creation_failure_makes_zero_profile_user_mutation_requests() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(0, &[])),
         json_response("500 Internal Server Error", "{}"), // POST User fails
@@ -1724,7 +1775,7 @@ async fn missing_user_creation_with_empty_desired_state_is_still_changed() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(0, &[])),
         created(r#"{"id":70,"message":"created"}"#),
@@ -1778,7 +1829,7 @@ async fn entity_and_profile_selectors_with_metacharacters_are_percent_encoded() 
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         // Two exact matches: ambiguous entity resolution.
         ok(&search_body(
@@ -1837,7 +1888,7 @@ async fn nested_looking_entity_completename_resolves_as_one_opaque_exact_match()
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(11, entity_selector, "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
@@ -1917,7 +1968,7 @@ async fn missing_entity_fails_before_any_user_lookup() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(0, &[])), // zero exact Entity matches
         ok("true"),               // killSession
@@ -1965,7 +2016,7 @@ async fn fuzzy_profile_search_results_are_ignored() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         // "Technician II" is a fuzzy, non-exact result for "Technician".
@@ -2015,7 +2066,7 @@ async fn current_assignment_discovery_reads_every_page_before_planning() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         partial(&page_one),
@@ -2071,7 +2122,7 @@ async fn current_row_with_mismatched_users_id_fails_closed() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         ok(&profile_user_search_body(1, &[(99, "jdoe")])),
@@ -2117,7 +2168,7 @@ async fn malformed_is_recursive_representations_fail_closed() {
             ])),
             ok(&search_options_body(&[
                 ("1", "Profile_User.id"),
-                ("2", "User.name"),
+                ("2", "Profile_User.User.name"),
             ])),
             ok(&search_body(1, &[(30, "jdoe", "2")])),
             ok(&profile_user_search_body(1, &[(99, "jdoe")])),
@@ -2170,7 +2221,7 @@ async fn zero_entity_search_id_resolves_successfully_as_the_root_entity() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(0, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
@@ -2215,7 +2266,7 @@ async fn zero_profile_search_id_is_rejected_before_user_lookup_or_mutation() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(0, "Technician", "2")])),
@@ -2254,7 +2305,7 @@ async fn zero_user_search_id_is_rejected_before_assignment_discovery_or_mutation
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(0, "jdoe", "2")])),
         ok("true"),
@@ -2288,7 +2339,7 @@ async fn zero_profile_user_candidate_id_is_rejected_before_item_read_or_mutation
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         ok(&profile_user_search_body(1, &[(0, "jdoe")])),
@@ -2333,7 +2384,7 @@ async fn zero_required_profile_user_raw_ids_are_rejected_before_mutation() {
             ])),
             ok(&search_options_body(&[
                 ("1", "Profile_User.id"),
-                ("2", "User.name"),
+                ("2", "Profile_User.User.name"),
             ])),
             ok(&search_body(1, &[(30, "jdoe", "2")])),
             ok(&profile_user_search_body(1, &[(99, "jdoe")])),
@@ -2371,7 +2422,7 @@ async fn zero_profile_user_raw_entity_id_is_accepted_as_the_glpi_root_entity() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         ok(&profile_user_search_body(1, &[(99, "jdoe")])),
@@ -2411,7 +2462,7 @@ async fn malformed_pagination_with_a_short_empty_page_fails_closed() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         // Declares a total of 5 rows but returns zero: a gap, not progress.
         ok(r#"{"totalcount":5,"count":0,"content-range":"0--1/5","data":[]}"#),
@@ -2454,7 +2505,7 @@ async fn inconsistent_totalcount_across_pages_fails_closed() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         partial(&page_one),
@@ -2512,7 +2563,7 @@ async fn desired_true_with_true_and_false_current_rows_removes_only_the_false_ro
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
@@ -2576,7 +2627,7 @@ async fn desired_false_with_duplicate_false_and_true_current_rows_retains_one_fa
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
@@ -2631,7 +2682,7 @@ async fn undesired_pair_with_mixed_recursive_rows_is_fully_removed() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         ok(&profile_user_search_body(2, &[(99, "jdoe"), (100, "jdoe")])),
@@ -2673,7 +2724,7 @@ async fn removing_an_undesired_assignment_does_not_issue_any_creation_post() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         ok(&profile_user_search_body(1, &[(99, "jdoe")])),
@@ -2742,7 +2793,7 @@ async fn all_removals_precede_all_additions_one_mutation_per_request() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Entity One", "2")])),
         ok(&search_body(1, &[(20, "Profile One", "2")])),
@@ -2828,7 +2879,7 @@ async fn delete_failure_blocks_every_subsequent_removal_and_addition() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
@@ -2869,7 +2920,7 @@ async fn delete_with_200_status_but_invalid_structured_result_is_rejected() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         ok(&profile_user_search_body(1, &[(99, "jdoe")])),
@@ -2919,7 +2970,7 @@ async fn a_later_reconciliation_converges_and_becomes_unchanged() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
@@ -2960,7 +3011,7 @@ async fn a_later_reconciliation_converges_and_becomes_unchanged() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
@@ -3019,7 +3070,7 @@ async fn malformed_success_looking_creation_response_is_rejected() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
@@ -3059,7 +3110,7 @@ async fn zero_id_in_creation_response_is_rejected() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(0, &[])),
         // Hypothetical response shape, not asserted as GLPI's actual wire
@@ -3096,7 +3147,7 @@ async fn bare_false_creation_result_is_rejected() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(0, &[])),
         // Hypothetical response shape, not asserted as GLPI's actual wire
@@ -3134,7 +3185,7 @@ async fn correct_body_with_wrong_status_code_is_rejected() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(0, &[])),
         // Hypothetical response shape, not asserted as GLPI's actual wire
@@ -3172,7 +3223,7 @@ async fn delete_response_with_unexpected_status_is_rejected() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         ok(&profile_user_search_body(1, &[(99, "jdoe")])),
@@ -3212,7 +3263,7 @@ async fn kill_session_with_non_true_body_is_rejected() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(0, &[])),
         // Hypothetical response shape, not asserted as GLPI's actual wire
@@ -3256,7 +3307,7 @@ async fn init_session_and_subsequent_calls_use_the_correct_distinct_headers() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         ok(&profile_user_search_body(0, &[])),
@@ -3314,7 +3365,7 @@ async fn separate_reconciliations_use_separate_session_tokens() {
             ])),
             ok(&search_options_body(&[
                 ("1", "Profile_User.id"),
-                ("2", "User.name"),
+                ("2", "Profile_User.User.name"),
             ])),
             ok(&search_body(1, &[(30, "jdoe", "2")])),
             ok(&profile_user_search_body(0, &[])),
@@ -3355,7 +3406,7 @@ async fn cleanup_failure_after_primary_failure_is_still_a_failure() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(2, &[(30, "jdoe", "2"), (31, "jdoe", "2")])), // ambiguous
         json_response("500 Internal Server Error", "{}"),             // killSession also fails
@@ -3823,7 +3874,7 @@ async fn cancellation_between_search_pages_stops_before_next_page() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         partial(&page_one),
@@ -3872,7 +3923,7 @@ async fn cancellation_between_profile_user_item_reads_stops_before_second_read()
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         ok(&profile_user_search_body(2, &[(99, "jdoe"), (100, "jdoe")])),
@@ -4092,7 +4143,7 @@ async fn entity_selector_case_mismatch_is_not_a_match() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         // Only a case-differing candidate row: zero exact matches.
         ok(&search_body(1, &[(10, "root entity > it", "2")])),
@@ -4143,7 +4194,7 @@ async fn ambiguous_exact_entity_fails_before_any_user_lookup() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         // Two rows with an identical exact `completename` match.
         ok(&search_body(
@@ -4194,7 +4245,7 @@ async fn entity_fuzzy_lookalike_is_not_accepted_as_a_match() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         // "Root Entity > IT > Ops" is a fuzzy, non-exact result for
         // "Root Entity > IT".
@@ -4252,7 +4303,7 @@ async fn entity_resolution_reads_every_page_before_matching() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         partial(&page_one),
         partial(&page_two),
@@ -4299,7 +4350,7 @@ async fn malformed_entity_row_fails_closed() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(
             r#"{"totalcount":1,"count":1,"content-range":"0-0/1","data":[{"1":"not-a-number","2":"Root Entity > IT"}]}"#,
@@ -4358,7 +4409,7 @@ async fn malformed_entity_pagination_fails_closed() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         partial(&page_one),
         partial(&page_two),
@@ -4403,7 +4454,7 @@ async fn missing_profile_fails_before_any_user_lookup() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])), // entity resolves
         ok(&search_body(0, &[])),                              // zero exact Profile matches
@@ -4451,7 +4502,7 @@ async fn ambiguous_exact_profile_fails_before_any_user_lookup() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(
@@ -4502,7 +4553,7 @@ async fn profile_selector_case_mismatch_is_not_a_match() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "technician", "2")])),
@@ -4552,7 +4603,7 @@ async fn profile_selector_metacharacters_are_percent_encoded() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(0, &[])), // zero exact matches
@@ -4609,7 +4660,7 @@ async fn profile_resolution_reads_every_page_before_matching() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         partial(&page_one),
@@ -4656,7 +4707,7 @@ async fn malformed_profile_row_fails_closed() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(
@@ -4715,7 +4766,7 @@ async fn malformed_profile_pagination_fails_closed() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         partial(&page_one),
@@ -4765,7 +4816,7 @@ async fn partial_failure_after_user_creation_during_current_assignment_read_make
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
@@ -4832,7 +4883,7 @@ async fn reconciliation_after_partial_user_creation_failure_converges_then_becom
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
@@ -4871,7 +4922,7 @@ async fn reconciliation_after_partial_user_creation_failure_converges_then_becom
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
@@ -4929,7 +4980,7 @@ async fn add_phase_partial_failure_after_removal_and_first_addition_makes_no_com
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
@@ -4994,7 +5045,7 @@ async fn reconciliation_after_add_phase_partial_failure_converges_then_becomes_u
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
@@ -5037,7 +5088,7 @@ async fn reconciliation_after_add_phase_partial_failure_converges_then_becomes_u
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
@@ -5095,7 +5146,7 @@ async fn glpi_default_assignment_after_user_creation_is_cleaned_up() {
         ])),
         ok(&search_options_body(&[
             ("1", "Profile_User.id"),
-            ("2", "User.name"),
+            ("2", "Profile_User.User.name"),
         ])),
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),

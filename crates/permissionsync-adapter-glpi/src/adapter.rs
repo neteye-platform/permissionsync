@@ -713,7 +713,7 @@ mod cleanup_survival_tests {
             ), // listSearchOptions/User
             json_response(
                 "200 OK",
-                &search_options_body(&[("1", "Profile_User.id"), ("2", "User.name")]),
+                &search_options_body(&[("1", "Profile_User.id"), ("2", "Profile_User.User.name")]),
             ), // listSearchOptions/Profile_User
             json_response("200 OK", &user_search_two_exact_matches_body()), // search User: ambiguous
             // killSession itself also fails (a non-"true" body): the primary
@@ -769,7 +769,7 @@ mod cleanup_survival_tests {
             ), // listSearchOptions/User
             json_response(
                 "200 OK",
-                &search_options_body(&[("1", "Profile_User.id"), ("2", "User.name")]),
+                &search_options_body(&[("1", "Profile_User.id"), ("2", "Profile_User.User.name")]),
             ), // listSearchOptions/Profile_User
             // Zero exact Entity matches: MissingReference, before any user
             // lookup.

@@ -500,7 +500,8 @@ pub(crate) async fn resolve_user_id(
 /// Reads the complete current `Profile_User` assignment set for `user_id`.
 ///
 /// `Profile_User`'s own search options expose only semantic joined display
-/// fields (the joined `User.name`), never the raw `users_id`/`profiles_id`/
+/// fields (the joined `Profile_User.User.name`), never the raw
+/// `users_id`/`profiles_id`/
 /// `entities_id`/`is_recursive` foreign-key fields, so GLPI search is used
 /// only to discover candidate row ids for `username`. Every raw field is
 /// then read authoritatively from the generic V1 item endpoint
@@ -515,7 +516,7 @@ pub(crate) async fn read_current_assignments(
     context: &SynchronizationContext<'_>,
 ) -> Result<Vec<crate::plan::CurrentRow>, GlpiFailure> {
     let id_field = options.require("Profile_User.id")?;
-    let user_name_field = options.require("User.name")?;
+    let user_name_field = options.require("Profile_User.User.name")?;
 
     let rows = search_all_pages(
         config,
@@ -652,7 +653,8 @@ async fn read_profile_user_item(
 pub(crate) const REQUIRED_ENTITY_UIDS: &[&str] = &["Entity.id", "Entity.completename"];
 pub(crate) const REQUIRED_PROFILE_UIDS: &[&str] = &["Profile.id", "Profile.name"];
 pub(crate) const REQUIRED_USER_UIDS: &[&str] = &["User.id", "User.name"];
-pub(crate) const REQUIRED_PROFILE_USER_UIDS: &[&str] = &["Profile_User.id", "User.name"];
+pub(crate) const REQUIRED_PROFILE_USER_UIDS: &[&str] =
+    &["Profile_User.id", "Profile_User.User.name"];
 
 #[cfg(test)]
 mod tests {

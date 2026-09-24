@@ -129,7 +129,7 @@ if ! compose exec -T glpi sh -c '
   [ -f "${config_dir}/config_db.php" ] || exit 5
   php bin/console db:check --quiet >/dev/null 2>&1
   status=$?
-  [ "$status" -lt 5 ]
+  [ "$status" -eq 0 ]
 '; then
   printf '%s\n' 'GLPI HTTP is ready, but GLPI is uninstalled or database consistency failed.' >&2
   exit 1
