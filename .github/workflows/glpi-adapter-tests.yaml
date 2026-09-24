@@ -1,0 +1,48 @@
+name: GLPI Adapter Tests
+
+on:
+  pull_request:
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+
+jobs:
+  glpi-adapter-tests:
+    name: GLPI Adapter Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Bootstrap disposable GLPI environment
+        working-directory: crates/permissionsync-adapter-glpi/integration/glpi
+        run: ./bootstrap.sh
+
+      - name: Run the real GLPI integration suite
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          set -a
+          # shellcheck disable=SC1090
+          source "$GLPI_TEST_RUNTIME_ENV"
+          set +a
+          cargo test -p permissionsync-adapter-glpi --test real_glpi --locked \
+            -- --ignored
+
+      - name: Collect GLPI container logs on failure
+        if: failure()
+        working-directory: crates/permissionsync-adapter-glpi/integration/glpi
+        run: ./diagnostics.sh
+
+      - name: Tear down the disposable environment
+        if: always()
+        working-directory: crates/permissionsync-adapter-glpi/integration/glpi
+        run: ./teardown.sh

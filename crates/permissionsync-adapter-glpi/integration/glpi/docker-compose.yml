@@ -1,0 +1,69 @@
+services:
+  db:
+    image: mariadb:11.4.13@sha256:70cc072b29b4a89ae07abb2d4da2c64678a7f2dfe092751bb51c87d67dc1338b
+    environment:
+      MARIADB_ROOT_PASSWORD: ${GLPI_TEST_DB_ROOT_PASSWORD:?db root password required}
+      MARIADB_DATABASE: glpi
+      MARIADB_USER: glpi
+      MARIADB_PASSWORD: ${GLPI_TEST_DB_PASSWORD:?db password required}
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    tmpfs:
+      - /var/lib/mysql
+
+  glpi:
+    image: glpi/glpi:11.0.9@sha256:7b50172cdb7d0878c57f4f0031837c40191dd8aced81d15598ed8f8880e0ba0e
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      GLPI_DB_HOST: db
+      GLPI_DB_PORT: 3306
+      GLPI_DB_NAME: glpi
+      GLPI_DB_USER: glpi
+      GLPI_DB_PASSWORD: ${GLPI_TEST_DB_PASSWORD:?db password required}
+      TZ: UTC
+    healthcheck:
+      # Base install/HTTP readiness only (GLPI's unauthenticated monitoring
+      # endpoint). This MUST NOT depend on the V1 apirest.php API, which is
+      # only enabled by the PHP bootstrap step that runs after this
+      # container is considered healthy (ADR 0009 bootstrap ordering).
+      test: ["CMD", "curl", "-fsS", "http://localhost/status.php"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+    volumes:
+      - ./bootstrap.php:/var/www/glpi/bootstrap.php:ro
+    ports:
+      # Docker-assigned ephemeral host port (no pre-discovery/TOCTOU): the
+      # real host port is discovered afterwards via `docker compose port`.
+      - "127.0.0.1::80"
+
+  tls-proxy:
+    image: nginx:1.27.5@sha256:6784fb0834aa7dbbe12e3d7471e69c290df3e6ba810dc38b34ae33d3c1c05f7d
+    depends_on:
+      glpi:
+        condition: service_healthy
+    volumes:
+      - ${GLPI_TEST_TLS_DIR:?tls material directory required}:/etc/nginx/tls:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      # Docker-assigned ephemeral host port; discovered via `docker compose port`.
+      - "127.0.0.1::8443"
+
+  cleanup-proxy:
+    image: nginx:1.27.5@sha256:6784fb0834aa7dbbe12e3d7471e69c290df3e6ba810dc38b34ae33d3c1c05f7d
+    depends_on:
+      glpi:
+        condition: service_healthy
+    stop_signal: SIGQUIT
+    volumes:
+      - ${GLPI_TEST_TLS_DIR:?tls material directory required}:/etc/nginx/tls:ro
+      - ./nginx-cleanup.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${GLPI_TEST_PROXY_LOG_DIR:?proxy log directory required}:/var/log/nginx/killsession
+    ports:
+      # Docker-assigned ephemeral host port; discovered via `docker compose port`.
+      - "127.0.0.1::8444"

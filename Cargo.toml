@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/permissionsync-adapter-glpi",
   "crates/permissionsync-core",
   "crates/permissionsync-auth",
   "crates/permissionsync-inbound-http",

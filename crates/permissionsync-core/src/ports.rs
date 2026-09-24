@@ -144,7 +144,13 @@ impl Error for PermissionProviderError {
 }
 
 /// Inputs for one Target Adapter reconciliation attempt.
+///
+/// The identity is the same synchronized `IdentityContext` supplied to the
+/// Permission Provider, transported separately from the opaque desired-state
+/// envelope. Core neither compares identity with the envelope nor inspects the
+/// envelope's semantics; the selected adapter owns target-specific use of both.
 pub struct TargetAdapterRequest<'a> {
+    identity: &'a IdentityContext,
     desired_state: &'a DesiredStateEnvelope,
     context: SynchronizationContext<'a>,
 }
@@ -152,13 +158,24 @@ pub struct TargetAdapterRequest<'a> {
 impl<'a> TargetAdapterRequest<'a> {
     /// Creates inputs for a Target Adapter reconciliation operation.
     pub fn new(
+        identity: &'a IdentityContext,
         desired_state: &'a DesiredStateEnvelope,
         context: SynchronizationContext<'a>,
     ) -> Self {
         Self {
+            identity,
             desired_state,
             context,
         }
+    }
+
+    /// Returns the synchronized end-user identity context.
+    ///
+    /// This is the same identity supplied to the Permission Provider for this
+    /// synchronization, transported independently of the desired-state
+    /// envelope.
+    pub fn identity(&self) -> &IdentityContext {
+        self.identity
     }
 
     /// Returns the opaque desired state selected for this adapter.
@@ -326,6 +343,7 @@ mod tests {
         ) -> BoxFuture<'a, Result<ReconciliationOutcome, TargetAdapterError>> {
             Box::pin(async move {
                 *self.deadline.lock().unwrap() = Some(request.context().deadline());
+                let _ = request.identity().username();
                 let _ = request.desired_state().payload().as_json();
                 let _ = request.context().cancellation().is_cancelled();
 
@@ -346,6 +364,34 @@ mod tests {
             Box::pin(async move {
                 *self.payload.lock().unwrap() =
                     Some(request.desired_state().payload().as_json().to_owned());
+
+                Ok(ReconciliationOutcome::Unchanged)
+            })
+        }
+    }
+
+    struct AdapterRequestObservation {
+        username: String,
+        groups: Vec<String>,
+        payload: String,
+    }
+
+    struct AdapterInspectingIdentity {
+        observation: Mutex<Option<AdapterRequestObservation>>,
+    }
+
+    impl TargetAdapter for AdapterInspectingIdentity {
+        fn reconcile<'a>(
+            &'a self,
+            request: TargetAdapterRequest<'a>,
+        ) -> BoxFuture<'a, Result<ReconciliationOutcome, TargetAdapterError>> {
+            Box::pin(async move {
+                let observation = AdapterRequestObservation {
+                    username: request.identity().username().to_owned(),
+                    groups: request.identity().groups().to_vec(),
+                    payload: request.desired_state().payload().as_json().to_owned(),
+                };
+                *self.observation.lock().unwrap() = Some(observation);
 
                 Ok(ReconciliationOutcome::Unchanged)
             })
@@ -450,13 +496,14 @@ mod tests {
             payload: Mutex::new(None),
         };
         let cancellation = Cancelled;
+        let identity = IdentityContext::new("jdoe".to_owned(), Vec::new());
         let raw_payload = "{\"roles\": [\"operator\"], \"enabled\": true}";
         let desired_state = DesiredStateEnvelope::new(
             EnvelopeVersion::new(1),
             OpaquePayload::try_from(raw_payload.to_owned()).unwrap(),
         );
         let context = SynchronizationContext::new(Instant::now(), &cancellation);
-        let request = TargetAdapterRequest::new(&desired_state, context);
+        let request = TargetAdapterRequest::new(&identity, &desired_state, context);
 
         assert_eq!(
             poll_ready(adapter.reconcile(request)).unwrap(),
@@ -467,6 +514,87 @@ mod tests {
             adapter.payload.lock().unwrap().as_deref(),
             Some(raw_payload)
         );
+    }
+
+    #[test]
+    fn adapter_receives_identity_independently_of_desired_state_payload() {
+        let adapter = AdapterInspectingIdentity {
+            observation: Mutex::new(None),
+        };
+        let cancellation = Cancelled;
+        let identity = IdentityContext::new(
+            "jdoe".to_owned(),
+            vec!["/staff".to_owned(), "/staff/engineering".to_owned()],
+        );
+        let raw_payload = "{\"roles\": [\"operator\"]}";
+        let desired_state = DesiredStateEnvelope::new(
+            EnvelopeVersion::new(1),
+            OpaquePayload::try_from(raw_payload.to_owned()).unwrap(),
+        );
+        let context = SynchronizationContext::new(Instant::now(), &cancellation);
+        let request = TargetAdapterRequest::new(&identity, &desired_state, context);
+
+        assert_eq!(
+            poll_ready(adapter.reconcile(request)).unwrap(),
+            ReconciliationOutcome::Unchanged
+        );
+
+        let observation = adapter.observation.lock().unwrap().take().unwrap();
+        assert_eq!(observation.username, "jdoe");
+        assert_eq!(
+            observation.groups,
+            ["/staff".to_owned(), "/staff/engineering".to_owned()]
+        );
+        assert_eq!(observation.payload, raw_payload);
+        assert!(
+            !observation.payload.contains("jdoe"),
+            "Core must not inject the username into the opaque payload"
+        );
+    }
+
+    #[test]
+    fn provider_and_adapter_receive_the_same_synchronized_identity() {
+        let provider = InspectingProvider {
+            observation: Mutex::new(None),
+        };
+        let adapter = AdapterInspectingIdentity {
+            observation: Mutex::new(None),
+        };
+        let cancellation = Cancelled;
+        let identity = IdentityContext::new(
+            "jdoe".to_owned(),
+            vec!["/staff".to_owned(), "/staff/engineering".to_owned()],
+        );
+        let target = LogicalTarget::try_from("target".to_owned()).unwrap();
+        let technical_caller_bearer_token = TechnicalCallerBearerToken::new("raw-token".to_owned());
+        let desired_state = DesiredStateEnvelope::new(
+            EnvelopeVersion::new(1),
+            OpaquePayload::try_from("null".to_owned()).unwrap(),
+        );
+        let deadline = Instant::now();
+
+        let provider_request = PermissionProviderRequest::new(
+            &identity,
+            &target,
+            &technical_caller_bearer_token,
+            SynchronizationContext::new(deadline, &cancellation),
+        );
+        let adapter_request = TargetAdapterRequest::new(
+            &identity,
+            &desired_state,
+            SynchronizationContext::new(deadline, &cancellation),
+        );
+
+        assert!(poll_ready(provider.resolve(provider_request)).is_err());
+        assert_eq!(
+            poll_ready(adapter.reconcile(adapter_request)).unwrap(),
+            ReconciliationOutcome::Unchanged
+        );
+
+        let provider_observation = provider.observation.lock().unwrap().take().unwrap();
+        let adapter_observation = adapter.observation.lock().unwrap().take().unwrap();
+        assert_eq!(provider_observation.username, adapter_observation.username);
+        assert_eq!(provider_observation.groups, adapter_observation.groups);
     }
 
     #[test]
@@ -518,7 +646,7 @@ mod tests {
             &technical_caller_bearer_token,
             provider_context,
         );
-        let adapter_request = TargetAdapterRequest::new(&desired_state, adapter_context);
+        let adapter_request = TargetAdapterRequest::new(&identity, &desired_state, adapter_context);
 
         assert!(poll_ready(provider.resolve(provider_request)).is_err());
         assert_eq!(

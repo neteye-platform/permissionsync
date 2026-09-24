@@ -316,6 +316,8 @@ struct FakeAdapter {
     calls: AtomicUsize,
     received_version: Mutex<Option<u64>>,
     received_payload: Mutex<Option<String>>,
+    received_username: Mutex<Option<String>>,
+    received_groups: Mutex<Option<Vec<String>>>,
     outcome: ReconciliationOutcome,
     fail: bool,
     flip_before_return: Option<&'static FlipOnDemand>,
@@ -324,6 +326,8 @@ struct FakeAdapter {
     external_version: Option<&'static Mutex<Option<u64>>>,
     external_payload: Option<&'static Mutex<Option<String>>>,
     external_context_observation: Option<&'static Mutex<Option<ContextObservation>>>,
+    external_username: Option<&'static Mutex<Option<String>>>,
+    external_groups: Option<&'static Mutex<Option<Vec<String>>>>,
 }
 
 impl FakeAdapter {
@@ -332,6 +336,8 @@ impl FakeAdapter {
             calls: AtomicUsize::new(0),
             received_version: Mutex::new(None),
             received_payload: Mutex::new(None),
+            received_username: Mutex::new(None),
+            received_groups: Mutex::new(None),
             outcome,
             fail,
             flip_before_return: None,
@@ -340,6 +346,8 @@ impl FakeAdapter {
             external_version: None,
             external_payload: None,
             external_context_observation: None,
+            external_username: None,
+            external_groups: None,
         }
     }
 }
@@ -366,6 +374,15 @@ impl TargetAdapter for FakeAdapter {
             let payload = request.desired_state().payload().as_json().to_owned();
             *self.received_version.lock().unwrap() = Some(version);
             *self.received_payload.lock().unwrap() = Some(payload.clone());
+            *self.received_username.lock().unwrap() =
+                Some(request.identity().username().to_owned());
+            *self.received_groups.lock().unwrap() = Some(request.identity().groups().to_vec());
+            if let Some(external_username) = self.external_username {
+                *external_username.lock().unwrap() = Some(request.identity().username().to_owned());
+            }
+            if let Some(external_groups) = self.external_groups {
+                *external_groups.lock().unwrap() = Some(request.identity().groups().to_vec());
+            }
             if let Some(external_version) = self.external_version {
                 *external_version.lock().unwrap() = Some(version);
             }
@@ -787,6 +804,69 @@ fn provider_receives_exact_selected_target_inputs() {
     assert_eq!(observation.bearer_token, raw_bearer);
     assert_eq!(observation.deadline, deadline);
     assert!(!observation.cancelled_at_call_time);
+}
+
+/// The selected Target Adapter receives the same synchronized identity as the
+/// Permission Provider, independently of the opaque desired-state payload, and
+/// Core never injects identity into that payload.
+#[test]
+fn adapter_receives_the_same_identity_as_provider_independent_of_payload() {
+    let external_username: &'static Mutex<Option<String>> = Box::leak(Box::new(Mutex::new(None)));
+    let external_groups: &'static Mutex<Option<Vec<String>>> =
+        Box::leak(Box::new(Mutex::new(None)));
+    let external_payload: &'static Mutex<Option<String>> = Box::leak(Box::new(Mutex::new(None)));
+
+    let mut adapter = FakeAdapter::new(ReconciliationOutcome::Unchanged, false);
+    adapter.external_username = Some(external_username);
+    adapter.external_groups = Some(external_groups);
+    adapter.external_payload = Some(external_payload);
+    let router = one_route_router("target-a", "adapter-a", Box::new(adapter));
+    let distinctive_payload = "{\"roles\":[\"operator\"]}";
+    let provider = FakeProvider::new(distinctive_payload, false);
+    let capacity = FakeCapacity::new(false);
+
+    let target = logical_target("target-a");
+    let raw_username = "  m\u{00fc}ller\t";
+    let groups = ["/staff", "/staff", "/staff/eng\u{00fc}"];
+    let ident = identity(raw_username, &groups);
+    let raw_bearer = "raw-token";
+    let bearer = TechnicalCallerBearerToken::new(raw_bearer.to_owned());
+    let deadline = not_deadline();
+    let cancellation = NeverCancelled;
+    let context = SynchronizationContext::new(deadline, &cancellation);
+    let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
+
+    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let outcome = poll_ready(synchronizer.synchronize(request)).unwrap();
+    assert_eq!(outcome, ReconciliationOutcome::Unchanged);
+
+    let provider_observation = provider.observation.lock().unwrap().take().unwrap();
+    assert_eq!(provider_observation.username, raw_username);
+    assert_eq!(provider_observation.groups, groups);
+
+    // The Adapter received the identical identity independently of the
+    // opaque payload, and Core did not inject the username into it.
+    assert_eq!(
+        external_username.lock().unwrap().as_deref(),
+        Some(raw_username)
+    );
+    assert_eq!(
+        external_groups.lock().unwrap().as_deref(),
+        Some(groups.map(str::to_owned).as_slice())
+    );
+    assert_eq!(
+        external_payload.lock().unwrap().as_deref(),
+        Some(distinctive_payload)
+    );
+    assert!(
+        !external_payload
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap()
+            .contains("ller"),
+        "Core must not inject username into the opaque desired-state payload"
+    );
 }
 
 /// 15.9 Exact envelope forwarding: version and payload are preserved unchanged.
