@@ -471,6 +471,58 @@ async fn missing_user_is_created_through_v1_and_gains_a_canonical_assignment() {
     assert_exactly_one_physical_assignment(&environment, username, ROOT_ENTITY, profile, 1);
 }
 
+/// A deleted account with the exact username makes absence unsafe even when its
+/// authentication tuple differs from the adapter default. The SQL fixture uses
+/// GLPI's non-default authentication tuple (`authtype = 2`, `auths_id = 0`), whereas the
+/// default adapter sends neither provisioning field and GLPI uses its local
+/// tuple. An active-only lookup would therefore have been able to create a
+/// second physical user under the default tuple.
+#[tokio::test]
+#[ignore = "requires a disposable real GLPI environment; see integration/glpi/bootstrap.sh"]
+async fn trashed_user_blocks_reconciliation_without_creating_a_second_user() {
+    let environment = real_environment();
+    let username = "permissionsync-real-trashed-user";
+    let fixture_sql = format!(
+        "INSERT INTO glpi_users (name, authtype, auths_id, is_deleted) \
+         VALUES ({}, 2, 0, 1)",
+        quote_sql_string(username),
+    );
+    run_fixture_sql(&environment, &fixture_sql);
+    assert_eq!(
+        query_physical_row_count(
+            &environment,
+            &format!(
+                "SELECT COUNT(*) FROM glpi_users \
+                 WHERE name = {} AND is_deleted = 1 AND authtype = 2 AND auths_id = 0",
+                quote_sql_string(username),
+            ),
+        ),
+        1,
+        "fixture must contain exactly one trashed user with the non-default authentication tuple"
+    );
+    assert_no_physical_assignments(&environment, username);
+
+    assert!(
+        reconcile(&environment, username, r#"{"permissions":[]}"#)
+            .await
+            .is_err(),
+        "an exact trashed user must make reconciliation fail rather than create another user"
+    );
+    assert_exactly_one_physical_user(&environment, username);
+    assert_eq!(
+        query_physical_row_count(
+            &environment,
+            &format!(
+                "SELECT COUNT(*) FROM glpi_users WHERE name = {} AND is_deleted = 1",
+                quote_sql_string(username),
+            ),
+        ),
+        1,
+        "the sole physical user must remain trashed after the failed reconciliation"
+    );
+    assert_no_physical_assignments(&environment, username);
+}
+
 /// A controlled username containing a GLPI LIKE single-character wildcard
 /// (`_`) must be found by its exact second reconciliation, rather than being
 /// created again or lost to GLPI's search normalization.

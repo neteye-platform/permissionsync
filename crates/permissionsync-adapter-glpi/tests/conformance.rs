@@ -61,6 +61,11 @@ const HELD_RESPONSE_DEADLINE: Duration = Duration::from_secs(5);
 struct ScriptedResponse {
     status_line: &'static str,
     body: Vec<u8>,
+    /// Marks a response consumed specifically by an explicit `is_deleted=1`
+    /// User search. Unmarked deleted-user searches receive the default empty
+    /// fixture response so pre-existing scenarios stay focused on their own
+    /// behavior.
+    expects_deleted_user_search: bool,
 }
 
 async fn await_fake_server_step<T>(waiting_for: &str, future: impl Future<Output = T>) -> T {
@@ -102,6 +107,7 @@ fn json_response(status_line: &'static str, body: &str) -> ScriptedResponse {
     ScriptedResponse {
         status_line,
         body: body.as_bytes().to_vec(),
+        expects_deleted_user_search: false,
     }
 }
 
@@ -121,6 +127,14 @@ fn deleted(id: u64) -> ScriptedResponse {
     ok(&format!(r#"[{{"{id}":true,"message":"deleted"}}]"#))
 }
 
+fn deleted_user_search(status_line: &'static str, body: &str) -> ScriptedResponse {
+    ScriptedResponse {
+        status_line,
+        body: body.as_bytes().to_vec(),
+        expects_deleted_user_search: true,
+    }
+}
+
 /// Runs a scripted fake GLPI server: for each entry in `script`, in order,
 /// accepts exactly one TLS connection, strictly validates one HTTP request,
 /// writes the scripted response, and closes. Returns the recorded request
@@ -131,7 +145,9 @@ async fn run_scripted_server(
     script: Vec<ScriptedResponse>,
 ) -> Vec<(String, Vec<(String, String)>, Vec<u8>)> {
     let mut recorded = Vec::new();
-    for (request_index, entry) in script.into_iter().enumerate() {
+    let mut script = script.into_iter().peekable();
+    let mut request_index = 0;
+    while let Some(next) = script.peek() {
         let (socket, _) = await_fake_server_step(
             &format!("expected request {} connection", request_index + 1),
             listener.accept(),
@@ -143,6 +159,27 @@ async fn run_scripted_server(
             .expect("tls handshake");
         let request = read_request(&mut stream).await;
         assert_outgoing_wire_contract(&request);
+        if is_deleted_user_search(&request) && !next.expects_deleted_user_search {
+            let body = br#"{"totalcount":0,"count":0,"content-range":"0--1/0"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut bytes = response.into_bytes();
+            bytes.extend_from_slice(body);
+            await_fake_server_step("response write", stream.write_all(&bytes))
+                .await
+                .expect("write response");
+            let _ = await_fake_server_step("response shutdown", stream.shutdown()).await;
+            continue;
+        }
+
+        let entry = script.next().expect("script entry remains available");
+        assert_eq!(
+            entry.expects_deleted_user_search,
+            is_deleted_user_search(&request),
+            "deleted-user search response must match the request mode"
+        );
         let response = format!(
             "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             entry.status_line,
@@ -155,6 +192,7 @@ async fn run_scripted_server(
             .expect("write response");
         let _ = await_fake_server_step("response shutdown", stream.shutdown()).await;
         recorded.push(request);
+        request_index += 1;
     }
     recorded
 }
@@ -530,6 +568,12 @@ fn query_value(recorded: &RecordedRequest, key: &str) -> Option<String> {
         .map(|(_, value)| value)
 }
 
+fn is_deleted_user_search(recorded: &RecordedRequest) -> bool {
+    let (_, path, _) = parsed_request_line(&recorded.0);
+    path == "/apirest.php/search/User"
+        && query_value(recorded, "is_deleted") == Some("1".to_owned())
+}
+
 /// Returns the exact header value (case-insensitive name lookup) recorded
 /// on a request, if present.
 fn header_value<'a>(recorded: &'a RecordedRequest, name: &str) -> Option<&'a str> {
@@ -556,6 +600,21 @@ fn assert_no_header(recorded: &RecordedRequest, name: &str) {
         "unexpected header {name} on request line {}",
         recorded.0
     );
+}
+
+fn assert_no_reconciliation_mutation(recorded: &[RecordedRequest]) {
+    for entry in recorded {
+        let (method, path, _) = parsed_request_line(&entry.0);
+        if path == "/apirest.php/changeActiveEntities" {
+            continue;
+        }
+        assert!(
+            !((method == "POST"
+                && (path == "/apirest.php/User" || path == "/apirest.php/Profile_User"))
+                || (method == "DELETE" && path.starts_with("/apirest.php/Profile_User/"))),
+            "no user or assignment mutation after a fail-closed lookup"
+        );
+    }
 }
 
 /// GET requests used by this adapter MUST be explicitly proven to have
@@ -614,9 +673,10 @@ fn assert_outgoing_wire_contract(recorded: &RecordedRequest) {
         }
         ("GET", path) if path.starts_with("/apirest.php/search/") => {
             assert_empty_body(recorded);
+            let is_user_search = path == "/apirest.php/search/User";
             assert_eq!(
                 query.len(),
-                8,
+                if is_user_search { 9 } else { 8 },
                 "search has no unrecognized query parameters"
             );
             for key in [
@@ -639,6 +699,17 @@ fn assert_outgoing_wire_contract(recorded: &RecordedRequest) {
                 Some("contains".to_owned())
             );
             assert_eq!(query_value(recorded, "order"), Some("ASC".to_owned()));
+            if is_user_search {
+                assert!(
+                    matches!(
+                        query_value(recorded, "is_deleted").as_deref(),
+                        Some("0" | "1")
+                    ),
+                    "User search explicitly selects active or deleted records"
+                );
+            } else {
+                assert_eq!(query_value(recorded, "is_deleted"), None);
+            }
             for key in [
                 "criteria[0][field]",
                 "sort",
@@ -860,12 +931,13 @@ fn oversized_script() -> Vec<ScriptedResponse> {
         ])), // 7: listSearchOptions/Profile_User
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])), // 8: search Entity
         ok(&search_body(1, &[(20, "Technician", "2")])), // 9: search Profile
-        ok(&search_body(1, &[(30, "jdoe", "2")])), // 10: search User
-        ok(&profile_user_search_body(1, &[(99, "jdoe")])), // 11: search Profile_User candidates
-        ok(&profile_user_item_body(99, 30, 40, 50, 0)), // 12: item read (not canonical -> plan has work: 1 removal + 1 addition)
-        deleted(99),                                    // 13: DELETE Profile_User/99 (removal)
-        created(r#"{"id":100,"message":"created"}"#),   // 14: POST Profile_User (addition)
-        ok("true"),                                     // 15: killSession
+        ok(&search_body(1, &[(30, "jdoe", "2")])), // 10: search active User
+        deleted_user_search("200 OK", &search_body(0, &[])), // 11: search deleted User
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])), // 12: search Profile_User candidates
+        ok(&profile_user_item_body(99, 30, 40, 50, 0)), // 13: item read (not canonical -> plan has work: 1 removal + 1 addition)
+        deleted(99),                                    // 14: DELETE Profile_User/99 (removal)
+        created(r#"{"id":100,"message":"created"}"#),   // 15: POST Profile_User (addition)
+        ok("true"),                                     // 16: killSession
     ];
     // Extra trailing entries that must never be consumed in tests that
     // cancel earlier than this point.
@@ -1671,6 +1743,172 @@ async fn case_sensitive_lookalike_does_not_count_as_an_exact_user_match() {
     join_fake_server(server, "scripted server completed its script").await;
 
     assert_eq!(outcome, ReconciliationOutcome::Changed);
+}
+
+/// Every semantic forced-display field is mandatory. A missing or non-string
+/// field must fail closed before a lookup can be mistaken for absence or cause
+/// a reconciliation mutation.
+#[tokio::test]
+async fn missing_semantic_forcedisplay_fields_fail_closed_before_mutation() {
+    struct Scenario {
+        name: &'static str,
+        script: Vec<ScriptedResponse>,
+    }
+
+    let metadata = || {
+        vec![
+            ok(&search_options_body(&[
+                ("1", "Entity.id"),
+                ("2", "Entity.completename"),
+            ])),
+            ok(&search_options_body(&[
+                ("1", "Profile.id"),
+                ("2", "Profile.name"),
+            ])),
+            ok(&search_options_body(&[
+                ("1", "User.id"),
+                ("2", "User.name"),
+            ])),
+            ok(&search_options_body(&[
+                ("1", "Profile_User.id"),
+                ("2", "Profile_User.User.name"),
+            ])),
+        ]
+    };
+    let mut entity = vec![
+        ok(r#"{"session_token":"sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+    ];
+    entity.extend(metadata());
+    entity.extend([
+        ok(r#"{"totalcount":1,"count":1,"content-range":"0-0/1","data":[{"1":10}]}"#),
+        ok("true"),
+    ]);
+
+    let mut profile = vec![
+        ok(r#"{"session_token":"sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+    ];
+    profile.extend(metadata());
+    profile.extend([
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(r#"{"totalcount":1,"count":1,"content-range":"0-0/1","data":[{"1":20,"2":false}]}"#),
+        ok("true"),
+    ]);
+
+    let mut user = vec![
+        ok(r#"{"session_token":"sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+    ];
+    user.extend(metadata());
+    user.extend([
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(r#"{"totalcount":1,"count":1,"content-range":"0-0/1","data":[{"1":30,"2":null}]}"#),
+        ok("true"),
+    ]);
+
+    let mut profile_user = vec![
+        ok(r#"{"session_token":"sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+    ];
+    profile_user.extend(metadata());
+    profile_user.extend([
+        ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
+        ok(&search_body(1, &[(20, "Technician", "2")])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(r#"{"totalcount":1,"count":1,"content-range":"0-0/1","data":[{"1":99,"2":42}]}"#),
+        ok("true"),
+    ]);
+
+    for scenario in [
+        Scenario {
+            name: "Entity.completename",
+            script: entity,
+        },
+        Scenario {
+            name: "Profile.name",
+            script: profile,
+        },
+        Scenario {
+            name: "User.name",
+            script: user,
+        },
+        Scenario {
+            name: "Profile_User.User.name",
+            script: profile_user,
+        },
+    ] {
+        let listener = bind_loopback_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+        let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+        let server = tokio::spawn(run_scripted_server(
+            listener,
+            identity.acceptor,
+            scenario.script,
+        ));
+
+        let outcome = reconcile(&adapter, &one_permission_envelope()).await;
+        let recorded = join_fake_server(server, "scripted server completed its script").await;
+
+        assert!(outcome.is_err(), "{} must be required", scenario.name);
+        assert_no_reconciliation_mutation(&recorded);
+    }
+}
+
+/// Active and deleted User searches are independent and each paginated. An
+/// exact deleted login prevents selecting the otherwise unique active user.
+#[tokio::test]
+async fn paginated_exact_deleted_user_match_fails_closed_without_mutation() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let deleted_page_one_rows: Vec<(u64, &str, &str)> = (0..50)
+        .map(|index| (1000 + index, "other-user", "2"))
+        .collect();
+    let deleted_page_one = search_page_body(51, 0, &deleted_page_one_rows);
+    let deleted_page_two = search_page_body(51, 50, &[(31, "jdoe", "2")]);
+
+    let script = vec![
+        ok(r#"{"session_token":"sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "Profile_User.User.name"),
+        ])),
+        ok(&search_body(1, &[(30, "jdoe", "2")])),
+        deleted_user_search("206 Partial Content", &deleted_page_one),
+        deleted_user_search("206 Partial Content", &deleted_page_two),
+        ok("true"),
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
+    let recorded = join_fake_server(server, "scripted server completed its script").await;
+
+    assert!(outcome.is_err());
+    assert_eq!(
+        query_value(&recorded[5], "is_deleted"),
+        Some("0".to_owned())
+    );
+    assert_eq!(
+        query_value(&recorded[6], "is_deleted"),
+        Some("1".to_owned())
+    );
+    assert_eq!(query_value(&recorded[6], "range"), Some("0-49".to_owned()));
+    assert_eq!(query_value(&recorded[7], "range"), Some("50-99".to_owned()));
+    assert_no_reconciliation_mutation(&recorded);
 }
 
 /// User search results spanning more than one page are all read before the
@@ -3464,6 +3702,7 @@ async fn oversized_response_body_is_rejected() {
     let script = vec![ScriptedResponse {
         status_line: "200 OK",
         body: oversized_body,
+        expects_deleted_user_search: false,
     }];
 
     let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
@@ -3781,7 +4020,7 @@ async fn cancellation_between_delete_and_add_phases_stops_immediately() {
     let completed = Arc::new(AtomicUsize::new(0));
     let cancellation = CancelAfterRequests {
         completed: Arc::clone(&completed),
-        threshold: 13,
+        threshold: 14,
     };
 
     let server = tokio::spawn(run_counted_scripted_server(
@@ -3795,7 +4034,7 @@ async fn cancellation_between_delete_and_add_phases_stops_immediately() {
     abort_fake_server(server, "counted scripted server").await;
 
     assert!(outcome.is_err());
-    assert_eq!(completed.load(Ordering::SeqCst), 13);
+    assert_eq!(completed.load(Ordering::SeqCst), 14);
 }
 
 /// Cancellation observed right after every mutation completes suppresses
@@ -3810,7 +4049,7 @@ async fn cancellation_before_cleanup_suppresses_kill_session_without_failing() {
     let completed = Arc::new(AtomicUsize::new(0));
     let cancellation = CancelAfterRequests {
         completed: Arc::clone(&completed),
-        threshold: 14,
+        threshold: 15,
     };
 
     let server = tokio::spawn(run_counted_scripted_server(
@@ -3828,7 +4067,7 @@ async fn cancellation_before_cleanup_suppresses_kill_session_without_failing() {
         ReconciliationOutcome::Changed,
         "cancellation must suppress cleanup without failing an already-successful reconciliation"
     );
-    assert_eq!(completed.load(Ordering::SeqCst), 14);
+    assert_eq!(completed.load(Ordering::SeqCst), 15);
 }
 
 /// Cancellation observed between pages of one paginated `Profile_User`
@@ -4079,11 +4318,11 @@ async fn cancellation_flip_between_cleanup_eligibility_check_and_kill_session_su
     let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
     let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
     let completed = Arc::new(AtomicUsize::new(0));
-    // 14 requests complete the primary reconciliation (see `oversized_script`
-    // comments): the 15th would be `killSession`.
+    // 15 requests complete the primary reconciliation (see `oversized_script`
+    // comments): the 16th would be `killSession`.
     let cancellation = CancelOnSecondReadAfterThreshold {
         completed: Arc::clone(&completed),
-        threshold: 14,
+        threshold: 15,
         reads_after_threshold: AtomicUsize::new(0),
     };
 
@@ -4108,7 +4347,7 @@ async fn cancellation_flip_between_cleanup_eligibility_check_and_kill_session_su
     );
     assert_eq!(
         completed.load(Ordering::SeqCst),
-        14,
+        15,
         "killSession must never be sent once cancellation is observed inside the race window \
          between the eligibility check and the pre-kill_session deadline recomputation"
     );

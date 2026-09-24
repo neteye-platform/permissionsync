@@ -27,11 +27,43 @@ chmod 777 "$proxy_log_dir"
 touch "$runtime_env" "$bootstrap_stdout" "$bootstrap_stderr" "$compose_base_stdout" "$compose_base_stderr"
 chmod 600 "$runtime_env" "$bootstrap_stdout" "$bootstrap_stderr" "$compose_base_stdout" "$compose_base_stderr"
 
+# runtime.env is consumed by two different parsers: this script's own
+# `source`, and `docker compose --env-file`'s dotenv grammar (compose-go
+# dotenv/parser.go). Both treat a double-quoted value's `\\`, `\"`, and `\$`
+# identically (literal backslash, literal quote, and literal, non-interpolated
+# dollar respectively), so double-quoting with only those three escapes
+# round-trips identically under both parsers. CR/LF cannot appear in a
+# double-quoted value under either grammar, and a literal backtick means two
+# different things (bash command substitution vs. an ordinary compose
+# character) depending on whether it is backslash-escaped, so any value
+# containing CR, LF, or a backtick is rejected outright rather than encoded.
 env_put() {
   local name="$1" value="$2" escaped
-  escaped="${value//\'/\'\\\'}"
-  printf "%s='%s'\n" "$name" "$escaped" >> "$runtime_env"
+  case "$value" in
+  *$'\r'* | *$'\n'* | *'`'*)
+    printf '%s\n' 'runtime.env write refused: a generated value contained a disallowed character (CR, LF, or backtick).' >&2
+    exit 1
+    ;;
+  esac
+  escaped="${value//\\/\\\\}"
+  escaped="${escaped//\"/\\\"}"
+  escaped="${escaped//\$/\\\$}"
+  printf '%s="%s"\n' "$name" "$escaped" >> "$runtime_env"
 }
+
+# Hermetic, no-Docker self-test hook for env_put()'s dual-consumer escaping.
+# Exercised only by tests/glpi_bootstrap_env_put_escaping.rs via an explicit
+# opt-in environment variable; never set in normal bootstrap usage. Accepts
+# NAME VALUE argument pairs, appends each through the real env_put(), then
+# prints the resulting runtime.env so the test can assert on it directly.
+if [[ "${PERMISSIONSYNC_BOOTSTRAP_ENV_PUT_SELFTEST:-}" == '1' ]]; then
+  while (($# >= 2)); do
+    env_put "$1" "$2"
+    shift 2
+  done
+  cat "$runtime_env"
+  exit 0
+fi
 
 # GitHub `::add-mask::` workflow commands only make sense (and are only safe)
 # inside GitHub Actions: outside of it they are ordinary stdout, and the
@@ -158,16 +190,25 @@ expected = {
 values = {}
 with open(output_path, encoding="utf-8") as output:
     for line in output.read().splitlines():
-        match = re.fullmatch(r"([A-Z_]+)=([^\r\n=]+)", line)
+        match = re.fullmatch(r"([A-Z_]+)=([^\r\n=`]+)", line)
         if not match or match.group(1) not in expected or match.group(1) in values:
             raise SystemExit("GLPI PHP bootstrap emitted an unexpected credential record")
         values[match.group(1)] = match.group(2)
 if set(values) != set(expected):
     raise SystemExit("GLPI PHP bootstrap did not emit every required credential record")
+
+# Same dual-consumer (bash `source` / `docker compose --env-file`) escaping
+# model as env_put() in bootstrap.sh: double-quoted output, escaping only
+# backslash, double quote, and dollar, which both parsers interpret
+# identically. CR/LF/backtick are already excluded by the regex above.
+def escape_runtime_env_value(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+    return f'"{escaped}"'
+
+
 with open(env_path, "a", encoding="utf-8") as environment:
     for source, destination in expected.items():
-        value = values[source].replace("'", "'\\''")
-        environment.write(f"{destination}='{value}'\n")
+        environment.write(f"{destination}={escape_runtime_env_value(values[source])}\n")
 PY
 
 # shellcheck disable=SC1090

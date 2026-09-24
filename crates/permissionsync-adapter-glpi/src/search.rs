@@ -2,7 +2,10 @@
 //! adapter-side matching. See ADR 0009 "User, entity, and profile
 //! resolution" and "Authoritative reconciliation".
 
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use hyper::Method;
 use permissionsync_core::SynchronizationContext;
@@ -151,6 +154,7 @@ async fn search_all_pages(
     criterion_value: &str,
     forcedisplay: &[u64],
     sort_field: u64,
+    is_deleted: Option<bool>,
     context: &SynchronizationContext<'_>,
 ) -> Result<Vec<Row>, GlpiFailure> {
     let criterion_value = exact_search_query_value(criterion_value);
@@ -177,6 +181,9 @@ async fn search_all_pages(
             // unspecified default order.
             query.append_pair("sort", &sort_field.to_string());
             query.append_pair("order", "ASC");
+            if let Some(is_deleted) = is_deleted {
+                query.append_pair("is_deleted", if is_deleted { "1" } else { "0" });
+            }
             for (index, field) in forcedisplay.iter().enumerate() {
                 query.append_pair(&format!("forcedisplay[{index}]"), &field.to_string());
             }
@@ -361,8 +368,13 @@ fn parse_search_page(
     })
 }
 
-fn exact_string_field(row: &Row, field: u64) -> Option<&str> {
-    row.get(&field).and_then(Value::as_str)
+/// Returns a required semantic `forcedisplay` value. An absent or non-string
+/// display value makes the complete search result unreliable: treating it as a
+/// non-match could incorrectly create a user or mutate assignments.
+fn required_string_field(row: &Row, field: u64) -> Result<&str, GlpiFailure> {
+    row.get(&field)
+        .and_then(Value::as_str)
+        .ok_or(GlpiFailure::SearchPagination)
 }
 
 /// Extracts a numeric id field. `allow_zero` must be `true` only for
@@ -404,16 +416,18 @@ async fn resolve_exact_id(
         selector,
         &[id_field, name_field],
         id_field,
+        None,
         context,
     )
     .await?;
 
     let mut matches: Vec<u64> = Vec::new();
+    let mut seen = HashSet::new();
     for row in &rows {
-        if exact_string_field(row, name_field) == Some(selector) {
+        if required_string_field(row, name_field)? == selector {
             let id =
                 numeric_id(row, id_field, allow_zero_id).ok_or(GlpiFailure::MalformedReference)?;
-            if !matches.contains(&id) {
+            if seen.insert(id) {
                 matches.push(id);
             }
         }
@@ -479,22 +493,64 @@ pub(crate) async fn resolve_user_id(
     username: &str,
     context: &SynchronizationContext<'_>,
 ) -> Result<Option<u64>, GlpiFailure> {
-    match resolve_exact_id(
+    let id_field = options.require("User.id")?;
+    let name_field = options.require("User.name")?;
+    let active_rows = search_all_pages(
         config,
         session,
         "User",
-        options.require("User.id")?,
-        options.require("User.name")?,
+        name_field,
         username,
-        false,
+        &[id_field, name_field],
+        id_field,
+        Some(false),
         context,
     )
-    .await
-    {
-        Ok(id) => Ok(Some(id)),
-        Err(GlpiFailure::MissingReference) => Ok(None),
-        Err(error) => Err(error),
+    .await?;
+    let deleted_rows = search_all_pages(
+        config,
+        session,
+        "User",
+        name_field,
+        username,
+        &[id_field, name_field],
+        id_field,
+        Some(true),
+        context,
+    )
+    .await?;
+
+    let active_matches = exact_positive_ids(&active_rows, id_field, name_field, username)?;
+    let deleted_matches = exact_positive_ids(&deleted_rows, id_field, name_field, username)?;
+
+    // An exact deleted account makes absence unsafe, while multiple active
+    // accounts make selection unsafe. Never create or select in either case.
+    if !deleted_matches.is_empty() || active_matches.len() > 1 {
+        return Err(GlpiFailure::AmbiguousReference);
     }
+
+    Ok(active_matches.first().copied())
+}
+
+/// Validates every required semantic string field and returns unique exact
+/// positive ids in their first-observed order.
+fn exact_positive_ids(
+    rows: &[Row],
+    id_field: u64,
+    name_field: u64,
+    selector: &str,
+) -> Result<Vec<u64>, GlpiFailure> {
+    let mut matches = Vec::new();
+    let mut seen = HashSet::new();
+    for row in rows {
+        if required_string_field(row, name_field)? == selector {
+            let id = numeric_id(row, id_field, false).ok_or(GlpiFailure::MalformedReference)?;
+            if seen.insert(id) {
+                matches.push(id);
+            }
+        }
+    }
+    Ok(matches)
 }
 
 /// Reads the complete current `Profile_User` assignment set for `user_id`.
@@ -526,15 +582,17 @@ pub(crate) async fn read_current_assignments(
         username,
         &[id_field, user_name_field],
         id_field,
+        None,
         context,
     )
     .await?;
 
     let mut candidate_ids: Vec<u64> = Vec::new();
+    let mut seen_candidate_ids = HashSet::new();
     for row in &rows {
-        if exact_string_field(row, user_name_field) == Some(username) {
+        if required_string_field(row, user_name_field)? == username {
             let id = numeric_id(row, id_field, false).ok_or(GlpiFailure::MalformedReference)?;
-            if !candidate_ids.contains(&id) {
+            if seen_candidate_ids.insert(id) {
                 candidate_ids.push(id);
             }
         }

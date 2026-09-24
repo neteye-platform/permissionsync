@@ -2,7 +2,10 @@
 //! ADR 0009 end to end. See the crate-level documentation for the full
 //! contract.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use permissionsync_core::{
     BoxFuture, ReconciliationOutcome, SynchronizationContext, TargetAdapter, TargetAdapterError,
@@ -153,80 +156,86 @@ async fn reconcile_with_session(
     let deadline = effective_deadline(context, config.operation_timeout)?;
     session::verify_complete_visibility(config, session, deadline).await?;
 
-    let entity_options = if desired.is_empty() {
-        None
-    } else {
-        Some(
-            resolve_search_options(config, session, "Entity", REQUIRED_ENTITY_UIDS, context)
-                .await?,
-        )
-    };
-    let profile_options = if desired.is_empty() {
-        None
-    } else {
-        Some(
-            resolve_search_options(config, session, "Profile", REQUIRED_PROFILE_UIDS, context)
-                .await?,
-        )
-    };
-    let user_options =
-        resolve_search_options(config, session, "User", REQUIRED_USER_UIDS, context).await?;
-    let profile_user_options = resolve_search_options(
-        config,
-        session,
-        "Profile_User",
-        REQUIRED_PROFILE_USER_UIDS,
-        context,
-    )
-    .await?;
-
     // Resolve every unique desired entity/profile reference before any user
     // lookup, creation, or mutation. When there is no desired assignment at
-    // all, no Entity or Profile GLPI request is issued: `entity_options`/
-    // `profile_options` above are never populated in that case, and the
-    // loop below runs zero times regardless.
-    let mut resolved_entities: Vec<(String, u64)> = Vec::new();
-    let mut resolved_profiles: Vec<(String, u64)> = Vec::new();
+    // all, no Entity or Profile GLPI request is issued.
+    let (resolved_entities, resolved_profiles, user_options, profile_user_options) = if desired
+        .is_empty()
+    {
+        let user_options =
+            resolve_search_options(config, session, "User", REQUIRED_USER_UIDS, context).await?;
+        let profile_user_options = resolve_search_options(
+            config,
+            session,
+            "Profile_User",
+            REQUIRED_PROFILE_USER_UIDS,
+            context,
+        )
+        .await?;
 
-    for assignment in desired {
-        check_context(context, context.deadline())?;
-        if !resolved_entities
-            .iter()
-            .any(|(selector, _)| selector == &assignment.entity)
-        {
-            let entity_options = entity_options
-                .as_ref()
-                .expect("entity_options is populated whenever desired is non-empty");
-            let id = search::resolve_entity_id(
-                config,
-                session,
-                entity_options,
-                &assignment.entity,
-                context,
-            )
-            .await?;
-            resolved_entities.push((assignment.entity.clone(), id));
+        (
+            BTreeMap::new(),
+            BTreeMap::new(),
+            user_options,
+            profile_user_options,
+        )
+    } else {
+        let entity_options =
+            resolve_search_options(config, session, "Entity", REQUIRED_ENTITY_UIDS, context)
+                .await?;
+        let profile_options =
+            resolve_search_options(config, session, "Profile", REQUIRED_PROFILE_UIDS, context)
+                .await?;
+
+        let user_options =
+            resolve_search_options(config, session, "User", REQUIRED_USER_UIDS, context).await?;
+        let profile_user_options = resolve_search_options(
+            config,
+            session,
+            "Profile_User",
+            REQUIRED_PROFILE_USER_UIDS,
+            context,
+        )
+        .await?;
+
+        let mut resolved_entities = BTreeMap::new();
+        let mut resolved_profiles = BTreeMap::new();
+
+        for assignment in desired {
+            check_context(context, context.deadline())?;
+            if !resolved_entities.contains_key(&assignment.entity) {
+                let id = search::resolve_entity_id(
+                    config,
+                    session,
+                    &entity_options,
+                    &assignment.entity,
+                    context,
+                )
+                .await?;
+                resolved_entities.insert(assignment.entity.clone(), id);
+            }
+
+            check_context(context, context.deadline())?;
+            if !resolved_profiles.contains_key(&assignment.profile) {
+                let id = search::resolve_profile_id(
+                    config,
+                    session,
+                    &profile_options,
+                    &assignment.profile,
+                    context,
+                )
+                .await?;
+                resolved_profiles.insert(assignment.profile.clone(), id);
+            }
         }
 
-        check_context(context, context.deadline())?;
-        if !resolved_profiles
-            .iter()
-            .any(|(selector, _)| selector == &assignment.profile)
-        {
-            let profile_options = profile_options
-                .as_ref()
-                .expect("profile_options is populated whenever desired is non-empty");
-            let id = search::resolve_profile_id(
-                config,
-                session,
-                profile_options,
-                &assignment.profile,
-                context,
-            )
-            .await?;
-            resolved_profiles.push((assignment.profile.clone(), id));
-        }
-    }
+        (
+            resolved_entities,
+            resolved_profiles,
+            user_options,
+            profile_user_options,
+        )
+    };
 
     let existing_user_id =
         search::resolve_user_id(config, session, &user_options, username, context).await?;
@@ -261,22 +270,20 @@ async fn reconcile_with_session(
         .iter()
         .map(|assignment| {
             let entities_id = resolved_entities
-                .iter()
-                .find(|(selector, _)| selector == &assignment.entity)
-                .map(|(_, id)| *id)
-                .expect("every desired entity was resolved above");
+                .get(&assignment.entity)
+                .copied()
+                .ok_or(GlpiFailure::MissingReference)?;
             let profiles_id = resolved_profiles
-                .iter()
-                .find(|(selector, _)| selector == &assignment.profile)
-                .map(|(_, id)| *id)
-                .expect("every desired profile was resolved above");
-            plan::DesiredAssignment {
+                .get(&assignment.profile)
+                .copied()
+                .ok_or(GlpiFailure::MissingReference)?;
+            Ok(plan::DesiredAssignment {
                 entities_id,
                 profiles_id,
                 recursive: assignment.recursive,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_, GlpiFailure>>()?;
 
     let reconciliation_plan = plan::compute(&current, &desired_resolved);
     if !reconciliation_plan.is_empty() {
@@ -716,6 +723,10 @@ mod cleanup_survival_tests {
                 &search_options_body(&[("1", "Profile_User.id"), ("2", "Profile_User.User.name")]),
             ), // listSearchOptions/Profile_User
             json_response("200 OK", &user_search_two_exact_matches_body()), // search User: ambiguous
+            json_response(
+                "200 OK",
+                r#"{"totalcount":0,"count":0,"content-range":"0--1/0"}"#,
+            ), // search deleted User: no match
             // killSession itself also fails (a non-"true" body): the primary
             // AmbiguousReference failure must still be what is returned.
             json_response("200 OK", "false"),
