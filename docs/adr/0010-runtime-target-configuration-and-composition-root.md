@@ -34,59 +34,63 @@ A logical target is exactly the suffix selected by the existing
 [ADR 0001](0001-inbound-synchronization-contract.md). It is case-sensitive and
 exact; composition does not normalize or alias it. An adapter identifier is also
 an opaque exact value: it has no generic grammar, normalization, case folding, or
-aliases. It need not have a successful registration to appear in a route; lookup
-decides whether it is available. `glpi` is the stable GLPI adapter identifier.
+aliases. `glpi` is the stable GLPI adapter identifier.
 
 The root receives typed construction inputs and supplies them when constructing
 a Provider or adapter. Secrets and trust material are never logical targets or
 adapter identifiers, and never appear in diagnostics, desired state, URLs, logs,
 or metrics. This record selects no secret or trust-material delivery mechanism.
 
-### Compiled adapters, registrations, and routes
+### Compiled implementations and configured targets
 
-The binary has a compiled adapter set. `TargetRoute` is independently configured
-as an exact logical target to adapter identifier mapping. Separately, a compiled
-adapter implementation, plus any configuration required by its contract, is
-constructed into a usable adapter instance and `AdapterRegistration`. A route
-points to an identifier, not an existing registration. If construction fails, the
-route remains with no usable registration, so selection returns `500` rather than
-unknown-target `400`.
+The binary contains a compiled adapter implementation registry: an exact adapter
+identifier maps to one statically linked implementation. Separately, configured
+targets map each exact logical target to an adapter identifier and the target
+configuration required by that adapter's contract. Composition turns each
+configured target into either a usable configured instance or a target-local
+unavailable state. Thus, a route remains recognized when its compiled
+implementation is absent or its configuration or instance cannot be constructed;
+it returns `500`, not unknown-target `400`.
 
-The root reuses these routing concepts; it introduces no new registry framework.
-With unambiguous configuration, each compiled adapter identifier has zero or one
-usable registration, and only successfully configured instances are registered.
-Duplicate adapter configuration or registration definitions for the same
-identifier are invalid static configuration and fail startup, regardless of
-construction success. No usable registration for a route's identifier does not
-erase that route.
+Adapter contracts, not this ADR, choose configuration cardinality, instance
+cardinality, and sharing. For example, `target-a` may select `adapter-x` with
+configuration A and `target-b` may select `adapter-x` with configuration B when
+that adapter permits it. Different configurations for one adapter identifier are
+not generically invalid, and this ADR does not impose one runtime adapter
+instance per adapter identifier.
 
-An invalid configured logical target that violates the ADR 0001 grammar or a
-duplicate logical route is invalid or ambiguous static configuration and fails
-startup; neither is ignored. At request time, an unknown logical target returns
-`400`. A recognized route with an unavailable selected adapter registration or
-invalid selected-adapter configuration returns target-local `500`; valid routes
-selecting other valid registrations remain serviceable.
+Startup fails for a duplicate logical target, a configured logical target invalid
+under the ADR 0001 routing grammar, duplicate compiled implementation
+registrations for one adapter identifier, or globally ambiguous or structurally
+unusable composition. These failures are neither ignored nor converted into
+target-local states. Other errors isolated to a recognized target, including a
+missing compiled implementation or failed target configuration/instance
+construction, remain target-local. At request time, an unknown logical target
+returns `400`; a recognized unavailable target returns `500`; and unrelated
+usable targets remain serviceable.
 
-The adapter set is compiled into the product. Composition has no plugins, dynamic
-loading, discovery, downloads, sidecars, independent adapter-version selection,
-runtime feature selection, or deployment feature matrix.
+The registry and route terms state semantics, not a required current
+`AdapterIdentifier -> AdapterRegistration` API. Later implementation may evolve
+the routing or registration representation if needed while preserving exact,
+deterministic routing and these outcomes. The adapter set is static: there are no
+plugins, dynamic loading, discovery, downloads, sidecars, independent adapter
+version selection, runtime feature selection, or deployment feature matrix.
 
 ### GLPI registration
 
-ADR 0009 requires one `glpi` adapter instance and one GLPI backend per
-PermissionSync process. The root configures that one instance from its HTTPS
-`apirest.php` endpoint, application token, service-account User Token, bounded
-timeout, private trust anchors where required, and independently optional
-`authtype` and `auths_id` user-provisioning fields.
+ADR 0009 requires exactly one configured GLPI backend and one registered `glpi`
+adapter instance per PermissionSync process. Multiple logical targets may select
+`glpi` and share it. There is no independent per-target GLPI endpoint,
+credentials, trust, or authentication-source configuration. The one-instance rule
+is specific to the GLPI adapter and does not choose another adapter's model.
 
-Multiple logical targets may route to `glpi`, but all use that same instance and
-backend. There are no independently configured per-route GLPI instances or
-values. A failed `glpi` registration leaves every route selecting `glpi`
-recognized but unavailable: it returns target-local `500` when selected, while
-routes selecting other valid registrations remain serviceable. This GLPI decision
-does not choose instance models for future adapters. Composition does not pass a
-logical target in an adapter request or put registration values in Provider
-requests or desired-state payloads.
+GLPI authentication-source provisioning configuration may be absent when relying
+on applicable GLPI defaults. When an explicit source is configured, `authtype`
+and `auths_id` form one coherent selection under the GLPI adapter contract.
+Failed GLPI construction leaves every target selecting `glpi` recognized but
+unavailable and therefore target-local `500`; usable targets remain serviceable.
+Composition does not pass logical-target configuration in an adapter request or
+put adapter construction values in Provider requests or desired-state payloads.
 
 ### Composition, ordering, and failures
 
@@ -100,21 +104,19 @@ registration side effects. This does not alter normal platform DNS resolution or
 system trust facilities used by explicit HTTPS/TLS client configuration.
 
 After authentication, scope processing, and strict body validation, a valid
-zero-target request returns `204` before routing, capacity, Provider, adapter, or
-target configuration work. This is true with zero routes and with unavailable
-Provider or adapter configuration.
+targetless request returns `204` before routing, capacity, Provider, adapter, or
+target configuration work. It requires neither Provider nor target configuration,
+including when either is unavailable.
 
 For one grammar-valid selected target, route resolution precedes capacity and
-Provider work. An unavailable selected adapter registration/configuration returns
-`500` before capacity, Provider, or adapter work. Invalid or unavailable Provider
-construction/configuration likewise does not prevent a valid targetless `204`,
-but selected-target synchronization returns `500` before Provider work. The
-Provider's availability is considered only after route resolution, so it cannot
-hide ADR 0001's unknown-target `400` precedence. The current synchronizer uses a
-concrete Provider; later composition must preserve this unavailable-Provider
-behavior. This ADR does not prescribe its exact Rust representation. A
-runtime Provider failure after invocation remains an explicit selected-target
-server-side failure and never becomes empty desired state or success.
+Provider availability. An unknown target therefore returns `400` even when the
+Provider is unavailable. A recognized unavailable target returns `500` before
+capacity, Provider, or adapter work. Unavailable Provider construction or
+configuration does not prevent a targetless `204`, but selected-target
+synchronization returns `500` before Provider work. A runtime Provider failure
+after invocation remains a selected-target server-side failure, never empty
+desired state or success. This ADR does not prescribe the Provider's exact Rust
+representation.
 
 ### Deferred details and follow-up
 
@@ -134,9 +136,9 @@ formats and platform integration remain separate.
   compiled adapter model.
 - **A GLPI instance per logical target:** rejected because ADR 0009 defines one
   `glpi` instance and backend per process.
-- **Globally failing startup for every unavailable registration:** rejected
+- **Globally failing startup for every unavailable target:** rejected
   because routes must retain recognized target-local `500` behavior while valid
-  registrations remain serviceable.
+  targets remain serviceable.
 - **A deployment-specific configuration model:** rejected to keep semantic
   configuration independent of formats, loaders, platforms, and secret delivery.
 - **A new registry framework:** rejected because the existing routing concepts
@@ -146,10 +148,10 @@ formats and platform integration remain separate.
 
 Composition has a clear distinction: invalid or ambiguous static configuration
 fails startup; an unknown request target returns `400`; and a recognized route
-without a usable selected adapter returns `500`. The process can still handle
-valid targetless requests despite unavailable downstream configuration. GLPI
-routes share one configured backend without leaking routing or construction values
-into Provider payloads or adapter requests.
+without a usable selected target instance returns `500`. The process can still
+handle valid targetless requests despite unavailable downstream configuration.
+GLPI routes share one configured backend without leaking routing or construction
+values into Provider payloads or adapter requests.
 
 ## References
 
