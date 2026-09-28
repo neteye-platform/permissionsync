@@ -50,8 +50,8 @@ pub enum CompositionError {
     InvalidLogicalTarget,
     /// More than one configured route uses one logical target.
     DuplicateLogicalTarget,
-    /// More than one compiled implementation uses one adapter identifier.
-    DuplicateAdapterImplementation,
+    /// More than one adapter instance was registered under one adapter identifier.
+    DuplicateAdapterRegistration,
 }
 
 impl ComposedApplication {
@@ -86,7 +86,7 @@ impl ComposedApplication {
                 CompositionError::DuplicateLogicalTarget
             }
             TargetRouterBuildError::DuplicateAdapterIdentifier { .. } => {
-                CompositionError::DuplicateAdapterImplementation
+                CompositionError::DuplicateAdapterRegistration
             }
         })?;
 
@@ -133,9 +133,7 @@ impl fmt::Debug for CompositionError {
         formatter.write_str(match self {
             Self::InvalidLogicalTarget => "CompositionError::InvalidLogicalTarget",
             Self::DuplicateLogicalTarget => "CompositionError::DuplicateLogicalTarget",
-            Self::DuplicateAdapterImplementation => {
-                "CompositionError::DuplicateAdapterImplementation"
-            }
+            Self::DuplicateAdapterRegistration => "CompositionError::DuplicateAdapterRegistration",
         })
     }
 }
@@ -145,7 +143,7 @@ impl fmt::Display for CompositionError {
         formatter.write_str(match self {
             Self::InvalidLogicalTarget => "invalid configured logical target",
             Self::DuplicateLogicalTarget => "duplicate configured logical target",
-            Self::DuplicateAdapterImplementation => "duplicate compiled adapter implementation",
+            Self::DuplicateAdapterRegistration => "duplicate adapter registration",
         })
     }
 }
@@ -181,7 +179,7 @@ mod tests {
 
     fn provider_configuration() -> GenericRestPermissionProviderConfig {
         GenericRestPermissionProviderConfig {
-            endpoint: "https://provider.example.test/permissions".to_owned(),
+            endpoint: "https://127.0.0.1/permissions".to_owned(),
             operation_timeout: Duration::from_secs(5),
             additional_trust_anchors_pem: Vec::new(),
         }
@@ -458,7 +456,7 @@ mod tests {
         for error in [
             CompositionError::InvalidLogicalTarget,
             CompositionError::DuplicateLogicalTarget,
-            CompositionError::DuplicateAdapterImplementation,
+            CompositionError::DuplicateAdapterRegistration,
         ] {
             assert!(error.source().is_none());
             for rendered in [format!("{error:?}"), error.to_string()] {

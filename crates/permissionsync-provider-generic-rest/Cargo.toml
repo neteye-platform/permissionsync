@@ -16,7 +16,7 @@ hyper = { version = "=1.11.1", default-features = false, features = ["client", "
 hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio"] }
 mime = { version = "=0.3.17", default-features = false }
 native-tls = { version = "=0.2.18", default-features = false }
-permissionsync-core = { path = "../permissionsync-core", version = "=0.1.0" }
+permissionsync-core = { path = "../permissionsync-core" }
 serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "=1.0.151", default-features = false, features = ["raw_value", "std"] }
 tokio = { version = "=1.53.1", default-features = false, features = ["net", "rt", "time"] }

@@ -1,4 +1,4 @@
-//! Deterministic resolution from validated logical targets to compiled adapters.
+//! Deterministic resolution from validated logical targets to registered adapters.
 //!
 //! This crate owns no configuration loading, authentication, HTTP transport,
 //! Provider work, target context, or adapter reconciliation. It only selects a
@@ -46,14 +46,17 @@ impl TargetRoute {
     }
 }
 
-/// One compiled Target Adapter implementation registered under an adapter identifier.
+/// One usable Target Adapter instance registered under an adapter identifier.
+///
+/// A registration means the selected adapter produced a usable instance, not
+/// merely that its implementation is compiled into the binary.
 pub struct AdapterRegistration {
     adapter_identifier: AdapterIdentifier,
     adapter: Box<dyn TargetAdapter>,
 }
 
 impl AdapterRegistration {
-    /// Registers an owned, statically linked adapter implementation for construction.
+    /// Registers an owned, usable adapter instance for routing.
     pub fn new(adapter_identifier: AdapterIdentifier, adapter: Box<dyn TargetAdapter>) -> Self {
         Self {
             adapter_identifier,
@@ -62,7 +65,11 @@ impl AdapterRegistration {
     }
 }
 
-/// An immutable exact-match router over configured target routes and compiled adapters.
+/// An immutable exact-match router over configured target routes and registered adapters.
+///
+/// This router holds the adapter instances that composition could construct.
+/// It is not the compiled implementation registry: a route whose
+/// implementation is compiled but unconfigured has no registration here.
 pub struct TargetRouter {
     routes: HashMap<String, AdapterIdentifier>,
     adapters: HashMap<AdapterIdentifier, Box<dyn TargetAdapter>>,
