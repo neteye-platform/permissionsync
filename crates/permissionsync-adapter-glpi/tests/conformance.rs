@@ -1269,14 +1269,26 @@ async fn cleanup_failure_after_success_becomes_the_returned_failure() {
     );
 }
 
-/// Reconciling the identical already-canonical desired state a second time
-/// returns `Unchanged` with no additional mutation.
+/// An explicit authentication source affects only missing-user creation. An
+/// existing user with an already-canonical desired state remains `Unchanged`
+/// with no additional mutation.
 #[tokio::test]
-async fn idempotent_second_reconciliation_of_an_already_canonical_state_is_unchanged() {
+async fn existing_user_is_unchanged_with_an_explicit_authentication_source() {
     let listener = bind_loopback_listener().await;
     let port = listener.local_addr().unwrap().port();
     let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
-    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+    let adapter = GlpiAdapter::new(GlpiAdapterConfig {
+        endpoint: format!("https://{LOOPBACK_ADDRESS}:{port}/apirest.php"),
+        app_token: GlpiAppToken::new("app-token".to_owned()),
+        user_token: GlpiUserToken::new("user-token".to_owned()),
+        operation_timeout: Duration::from_secs(5),
+        additional_trust_anchors_pem: vec![identity.trust_anchor_pem.clone()],
+        authentication_source: GlpiAuthenticationSource::Explicit {
+            authtype: 1,
+            auths_id: 0,
+        },
+    })
+    .expect("valid GLPI adapter configuration");
 
     let script = vec![
         ok(r#"{"session_token": "sess-1"}"#),
@@ -1313,11 +1325,15 @@ async fn idempotent_second_reconciliation_of_an_already_canonical_state_is_uncha
     let outcome = reconcile(&adapter, &one_permission_envelope())
         .await
         .unwrap();
-    server
+    let recorded = server
         .await
         .expect("scripted server completed exactly its script");
 
     assert_eq!(outcome, ReconciliationOutcome::Unchanged);
+    assert!(recorded.iter().all(|entry| {
+        let (method, path, _) = parsed_request_line(&entry.0);
+        method != "POST" || path != "/apirest.php/User"
+    }));
 }
 
 /// A pre-cancelled synchronization context makes zero GLPI requests.
@@ -1599,12 +1615,12 @@ async fn exact_search_patterns_preserve_selector_metacharacters_and_ignore_fuzzy
 // =============================================================================
 
 /// Zero exact `User.name` matches across the complete result set creates a
-/// new user whose `input.name` is exactly `IdentityContext.username`, using
-/// only the configured authentication-source fields, no password, and no
-/// Provider-payload-derived fields; the request is `POST User` with
-/// `application/json`.
+/// new user whose `input.name` is exactly `IdentityContext.username`. An
+/// explicit authentication source sends its exact complete pair, never a
+/// password or Provider-payload-derived field; the request is `POST User`
+/// with `application/json`.
 #[tokio::test]
-async fn missing_user_is_created_with_only_the_configured_provisioning_fields() {
+async fn missing_user_with_explicit_source_sends_the_exact_authentication_pair() {
     let listener = bind_loopback_listener().await;
     let port = listener.local_addr().unwrap().port();
     let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
@@ -1614,9 +1630,9 @@ async fn missing_user_is_created_with_only_the_configured_provisioning_fields() 
         user_token: GlpiUserToken::new("user-token".to_owned()),
         operation_timeout: Duration::from_secs(5),
         additional_trust_anchors_pem: vec![identity.trust_anchor_pem.clone()],
-        authentication_source: GlpiAuthenticationSource {
-            authtype: Some(1),
-            auths_id: Some(2),
+        authentication_source: GlpiAuthenticationSource::Explicit {
+            authtype: 1,
+            auths_id: 0,
         },
     })
     .expect("valid GLPI adapter configuration");
@@ -1650,8 +1666,49 @@ async fn missing_user_is_created_with_only_the_configured_provisioning_fields() 
     assert_json_body(
         &recorded[6],
         serde_json::json!({
-            "input": { "name": "jdoe", "authtype": 1, "auths_id": 2 }
+            "input": { "name": "jdoe", "authtype": 1, "auths_id": 0 }
         }),
+    );
+}
+
+/// A missing user created with the default authentication source sends only
+/// its identity-derived name, allowing GLPI to apply its defaults.
+#[tokio::test]
+async fn missing_user_with_default_source_omits_authentication_fields() {
+    let listener = bind_loopback_listener().await;
+    let port = listener.local_addr().unwrap().port();
+    let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+    let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
+
+    let script = vec![
+        ok(r#"{"session_token": "sess-1"}"#),
+        ok("true"),
+        ok(&full_session_body(1)),
+        ok(&search_options_body(&[
+            ("1", "User.id"),
+            ("2", "User.name"),
+        ])),
+        ok(&search_options_body(&[
+            ("1", "Profile_User.id"),
+            ("2", "Profile_User.User.name"),
+        ])),
+        ok(&search_body(0, &[])), // search User: zero exact matches
+        created(r#"{"id":55,"message":"created"}"#), // POST User
+        ok(&profile_user_search_body(0, &[])), // read_current_assignments: none
+        ok("true"),               // killSession
+    ];
+
+    let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
+    let outcome = reconcile(&adapter, &empty_desired_envelope())
+        .await
+        .unwrap();
+    let recorded = server.await.expect("scripted server completed its script");
+
+    assert_eq!(outcome, ReconciliationOutcome::Changed);
+    assert_request(&recorded[6], "POST", "/apirest.php/User");
+    assert_json_body(
+        &recorded[6],
+        serde_json::json!({ "input": { "name": "jdoe" } }),
     );
 }
 

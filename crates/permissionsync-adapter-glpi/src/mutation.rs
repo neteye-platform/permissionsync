@@ -169,11 +169,9 @@ pub(crate) async fn create_user(
 
     let mut input = serde_json::Map::new();
     input.insert("name".to_owned(), Value::String(username.to_owned()));
-    if let Some(authtype) = authentication_source.authtype {
-        input.insert("authtype".to_owned(), Value::from(authtype));
-    }
-    if let Some(auths_id) = authentication_source.auths_id {
-        input.insert("auths_id".to_owned(), Value::from(auths_id));
+    if let GlpiAuthenticationSource::Explicit { authtype, auths_id } = authentication_source {
+        input.insert("authtype".to_owned(), Value::from(*authtype));
+        input.insert("auths_id".to_owned(), Value::from(*auths_id));
     }
     let body = serde_json::to_vec(&serde_json::json!({ "input": Value::Object(input) }))
         .map_err(|_| GlpiFailure::MutationFailed)?;
