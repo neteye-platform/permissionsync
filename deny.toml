@@ -10,11 +10,16 @@ yanked = "deny"
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
+skip = [
+  { crate = "core-foundation@0.9.4", reason = "transitive only: system-configuration 0.7.0 (via hickory-resolver) still requires 0.9 while native-tls 0.2.18 (via security-framework 3.7.0) requires 0.10; remove once system-configuration adopts core-foundation 0.10" },
+  { crate = "syn@2.0.119", reason = "transitive only: openssl-macros, jni-macros, and jni-sys-macros still require syn 2 while async-trait, displaydoc, futures-macro, and serde_derive use syn 3; remove once those proc-macro crates adopt syn 3" },
+]
 
 [licenses]
 allow = [
   "Apache-2.0",
   "MIT",
+  "Unicode-3.0",
 ]
 confidence-threshold = 0.93
 exceptions = []

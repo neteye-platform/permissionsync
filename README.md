@@ -10,11 +10,12 @@ Provider, selected-target synchronization orchestration, and an internal
 `permissionsync-auth` boundary for technical-caller JWT verification and scope
 target selection, plus framework-neutral inbound HTTP request processing with
 authentication/authorization integration and a concrete GLPI Target Adapter
-implementing the selected GLPI V1 reconciliation contract. An actual HTTP
-server/listener and framework route registration, runtime
-configuration/composition, composition-root adapter wiring, health/readiness,
-supported-Keycloak deployment contract tests, and OCI/runtime integration
-remain future work; the internal auth-crate tests are not a deployment claim.
+implementing the selected GLPI V1 reconciliation contract, plus typed runtime
+configuration and deterministic application composition. Configuration
+delivery/loading, an actual HTTP server/listener and framework route
+registration, final runtime wiring, health/readiness, observability,
+supported-Keycloak deployment contract tests, and OCI/runtime integration remain
+future work; the internal auth-crate tests are not a deployment claim.
 
 ## Development
 

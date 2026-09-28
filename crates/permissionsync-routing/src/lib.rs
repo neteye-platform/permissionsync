@@ -1,4 +1,4 @@
-//! Deterministic resolution from validated logical targets to compiled adapters.
+//! Deterministic resolution from validated logical targets to registered adapters.
 //!
 //! This crate owns no configuration loading, authentication, HTTP transport,
 //! Provider work, target context, or adapter reconciliation. It only selects a
@@ -46,14 +46,17 @@ impl TargetRoute {
     }
 }
 
-/// One compiled Target Adapter implementation registered under an adapter identifier.
+/// One usable Target Adapter instance registered under an adapter identifier.
+///
+/// A registration means the selected adapter produced a usable instance, not
+/// merely that its implementation is compiled into the binary.
 pub struct AdapterRegistration {
     adapter_identifier: AdapterIdentifier,
     adapter: Box<dyn TargetAdapter>,
 }
 
 impl AdapterRegistration {
-    /// Registers an owned, statically linked adapter implementation for construction.
+    /// Registers an owned, usable adapter instance for routing.
     pub fn new(adapter_identifier: AdapterIdentifier, adapter: Box<dyn TargetAdapter>) -> Self {
         Self {
             adapter_identifier,
@@ -62,7 +65,11 @@ impl AdapterRegistration {
     }
 }
 
-/// An immutable exact-match router over configured target routes and compiled adapters.
+/// An immutable exact-match router over configured target routes and registered adapters.
+///
+/// This router holds the adapter instances that composition could construct.
+/// It is not the compiled implementation registry: a route whose
+/// implementation is compiled but unconfigured has no registration here.
 pub struct TargetRouter {
     routes: HashMap<String, AdapterIdentifier>,
     adapters: HashMap<AdapterIdentifier, Box<dyn TargetAdapter>>,
@@ -116,7 +123,7 @@ impl TargetRouter {
         })
     }
 
-    /// Resolves a validated target to its exact compiled adapter without invoking it.
+    /// Resolves a validated target to its exact available adapter without invoking it.
     pub fn resolve(
         &self,
         target: &LogicalTarget,
@@ -129,7 +136,7 @@ impl TargetRouter {
         self.adapters
             .get(identifier)
             .map(|adapter| adapter.as_ref())
-            .ok_or_else(|| TargetResolutionError::UnavailableCompiledAdapter {
+            .ok_or_else(|| TargetResolutionError::UnavailableAdapter {
                 identifier: identifier.clone(),
             })
     }
@@ -142,7 +149,7 @@ pub enum TargetRouterBuildError {
         /// The repeated logical target definition.
         target: LogicalTarget,
     },
-    /// More than one compiled adapter registration used the same identifier.
+    /// More than one adapter registration used the same identifier.
     DuplicateAdapterIdentifier {
         /// The repeated adapter identifier.
         identifier: AdapterIdentifier,
@@ -181,9 +188,12 @@ impl Error for TargetRouterBuildError {}
 pub enum TargetResolutionError {
     /// No configured route matches the supplied logical target.
     UnknownLogicalTarget,
-    /// A configured target selects an adapter absent from the compiled registry.
-    UnavailableCompiledAdapter {
-        /// The configured identifier without a compiled adapter registration.
+    /// A configured target selects an unavailable adapter.
+    ///
+    /// The adapter may not be compiled into the binary, or its configuration
+    /// may not have produced a usable instance.
+    UnavailableAdapter {
+        /// The configured identifier for the unavailable adapter.
         identifier: AdapterIdentifier,
     },
 }
@@ -194,8 +204,8 @@ impl fmt::Debug for TargetResolutionError {
             Self::UnknownLogicalTarget => {
                 formatter.write_str("TargetResolutionError::UnknownLogicalTarget")
             }
-            Self::UnavailableCompiledAdapter { .. } => {
-                formatter.write_str("TargetResolutionError::UnavailableCompiledAdapter")
+            Self::UnavailableAdapter { .. } => {
+                formatter.write_str("TargetResolutionError::UnavailableAdapter")
             }
         }
     }
@@ -205,7 +215,7 @@ impl fmt::Display for TargetResolutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownLogicalTarget => formatter.write_str("unknown logical target"),
-            Self::UnavailableCompiledAdapter { .. } => {
+            Self::UnavailableAdapter { .. } => {
                 formatter.write_str("configured adapter is unavailable")
             }
         }
@@ -306,7 +316,7 @@ mod tests {
             error
         };
 
-        let TargetResolutionError::UnavailableCompiledAdapter { identifier } = error else {
+        let TargetResolutionError::UnavailableAdapter { identifier } = error else {
             panic!("missing adapter returned the wrong error");
         };
 
@@ -337,7 +347,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            TargetResolutionError::UnavailableCompiledAdapter { .. }
+            TargetResolutionError::UnavailableAdapter { .. }
         ));
         assert!(ptr::eq(
             router.resolve(&good_target).unwrap() as *const dyn TargetAdapter,
@@ -467,7 +477,7 @@ mod tests {
             panic!("case-different adapter identifier unexpectedly matched");
         };
 
-        let TargetResolutionError::UnavailableCompiledAdapter { identifier } = error else {
+        let TargetResolutionError::UnavailableAdapter { identifier } = error else {
             panic!("case-different identifier returned the wrong error");
         };
 

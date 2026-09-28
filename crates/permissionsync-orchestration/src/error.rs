@@ -21,7 +21,7 @@ pub enum SelectedTargetSynchronizationError {
     Cancelled,
     /// No configured route matches the selected logical target.
     UnknownTarget,
-    /// The selected target is recognized, but its compiled adapter is unavailable.
+    /// The selected target is recognized, but its adapter is unavailable.
     TargetUnavailable,
     /// Bounded synchronization capacity could not be acquired.
     CapacityUnavailable,

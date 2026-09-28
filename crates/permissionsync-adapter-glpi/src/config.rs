@@ -2,7 +2,7 @@
 //!
 //! This is construction input for one concrete [`crate::GlpiAdapter`]
 //! instance, not the eventual global PermissionSync runtime configuration
-//! schema (deferred; see ADR 0006/0009).
+//! schema (see ADR 0010).
 
 use std::time::Duration;
 

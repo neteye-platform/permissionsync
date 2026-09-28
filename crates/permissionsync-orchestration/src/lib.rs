@@ -47,8 +47,8 @@
 //! 8. Invoke `TargetAdapter::reconcile` exactly once with the returned envelope.
 //! 9. Re-check the overall deadline/cancellation before reporting success.
 //!
-//! An unknown target or a recognized target with an unavailable compiled
-//! adapter returns immediately: no capacity, Provider, or Adapter work starts.
+//! An unknown target or a recognized target with an unavailable adapter returns
+//! immediately: no capacity, Provider, or Adapter work starts.
 //!
 //! ## At-most-once behavior
 //!
