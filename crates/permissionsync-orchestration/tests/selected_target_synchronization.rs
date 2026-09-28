@@ -648,7 +648,7 @@ fn unknown_target_starts_no_downstream_work() {
     ));
 }
 
-/// 15.4 Recognized target with unavailable compiled adapter starts no downstream work.
+/// 15.4 Recognized target with unavailable adapter starts no downstream work.
 #[test]
 fn recognized_target_with_unavailable_adapter_starts_no_downstream_work() {
     let router = TargetRouter::new(

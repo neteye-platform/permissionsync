@@ -58,7 +58,7 @@ impl<'a> SelectedTargetSynchronizer<'a> {
                 Err(TargetResolutionError::UnknownLogicalTarget) => {
                     return Err(SelectedTargetSynchronizationError::UnknownTarget);
                 }
-                Err(TargetResolutionError::UnavailableCompiledAdapter { .. }) => {
+                Err(TargetResolutionError::UnavailableAdapter { .. }) => {
                     return Err(SelectedTargetSynchronizationError::TargetUnavailable);
                 }
             };

@@ -80,7 +80,7 @@ pub enum HttpOutcome {
     VerifierUnavailable,
     /// The request context was cancelled or its deadline expired.
     CancelledOrExpired,
-    /// The selected target's compiled adapter was unavailable.
+    /// The selected target's adapter was unavailable.
     TargetUnavailable,
     /// Selected-target synchronization capacity was unavailable.
     CapacityUnavailable,

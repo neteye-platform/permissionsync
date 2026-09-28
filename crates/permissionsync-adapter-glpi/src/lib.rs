@@ -8,9 +8,9 @@
 //!
 //! This crate depends only on `permissionsync-core`'s public contract. It
 //! does not depend on orchestration internals, routing internals, the
-//! Generic REST Provider, or any other concrete adapter. Registration,
-//! runtime configuration schema, and application composition are a later
-//! task; this crate is independently buildable, testable, and usable.
+//! Generic REST Provider, or any other concrete adapter. This crate remains
+//! independently buildable, testable, and usable; application composition owns
+//! its registration and runtime configuration.
 
 #![forbid(unsafe_code)]
 
