@@ -43,15 +43,16 @@ impl GlpiAppToken {
     }
 }
 
-/// The narrow, typed missing-user authentication-source fields required by
-/// the deployment-selected GLPI authentication source, per ADR 0009. Never
-/// derived from Provider payload; never includes a password.
+/// The deployment-selected missing-user authentication source, per ADR 0010.
+/// Never derived from Provider payload; never includes a password.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct GlpiAuthenticationSource {
-    /// The GLPI `authtype` value required for user creation, when needed.
-    pub authtype: Option<i64>,
-    /// The GLPI `auths_id` value required for user creation, when needed.
-    pub auths_id: Option<i64>,
+pub enum GlpiAuthenticationSource {
+    #[default]
+    Default,
+    Explicit {
+        authtype: i64,
+        auths_id: i64,
+    },
 }
 
 /// Construction input for one [`crate::GlpiAdapter`] instance.
@@ -66,8 +67,7 @@ pub struct GlpiAdapterConfig {
     pub operation_timeout: Duration,
     /// Additional PEM-encoded private trust anchors, in addition to system roots.
     pub additional_trust_anchors_pem: Vec<Vec<u8>>,
-    /// Missing-user authentication-source fields, when the deployment-selected
-    /// GLPI authentication source requires them for user creation.
+    /// Missing-user authentication source used when creating a user.
     pub authentication_source: GlpiAuthenticationSource,
 }
 
