@@ -25,7 +25,6 @@ Every ADR uses this standard structure:
 
 PermissionSync uses these statuses:
 
-- **Proposed**: Under consideration; it does not guide the architecture.
 - **Accepted**: Active; it guides the architecture.
 - **Superseded**: Replaced by a newer ADR; retained for its decision history.
 - **Deprecated**: No longer to be used; no replacement ADR is named.
@@ -36,7 +35,7 @@ PermissionSync uses these statuses:
 - Use the next available number; once assigned, never reuse or renumber it.
 - A replacement is a new ADR and normally marks the replaced Accepted decision
   Superseded.
-- A design discarded before acceptance may be omitted from the architecture
+- A design discarded before adoption may be omitted from the architecture
   baseline; retain useful rationale in the selected ADR's Alternatives.
 - Cross-references provide context; an ADR must state the decision it owns.
 
@@ -59,3 +58,5 @@ PermissionSync uses these statuses:
 8. [0008](0008-generic-rest-permission-provider-wire-and-transport-contract.md)
    Generic REST Permission Provider Wire and Transport Contract (Accepted)
 9. [0009](0009-glpi-target-adapter.md) GLPI Target Adapter (Accepted)
+10. [0010](0010-runtime-target-configuration-and-composition-root.md) Runtime
+    Target Configuration and Composition Root (Accepted)
