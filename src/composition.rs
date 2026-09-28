@@ -7,7 +7,6 @@ use permissionsync_core::{LogicalTarget, PermissionProvider, TargetAdapter};
 use permissionsync_provider_generic_rest::GenericRestPermissionProvider;
 use permissionsync_routing::{
     AdapterIdentifier, AdapterRegistration, TargetResolutionError, TargetRoute, TargetRouter,
-    TargetRouterBuildError,
 };
 
 use crate::configuration::{ProviderConfiguration, RuntimeConfiguration};
@@ -44,14 +43,23 @@ pub enum TargetAvailability<'a> {
     Unknown,
 }
 
-/// A global, safely reportable composition failure.
-pub enum CompositionError {
-    /// A configured logical target violates the ADR 0001 grammar.
-    InvalidLogicalTarget,
-    /// More than one configured route uses one logical target.
-    DuplicateLogicalTarget,
-    /// More than one adapter instance was registered under one adapter identifier.
-    DuplicateAdapterRegistration,
+/// A safe, non-diagnostic error for globally invalid application composition.
+///
+/// Composition inputs can include sensitive trust material, credentials, and
+/// configured identifiers, so this type intentionally retains neither those
+/// details nor an error source. It reports only that static configuration was
+/// globally unusable, such as a configured logical target outside the ADR 0001
+/// grammar, a duplicate configured logical target, or a routing construction
+/// state the current application cannot use.
+pub struct CompositionError {
+    _private: (),
+}
+
+impl CompositionError {
+    /// Creates a non-diagnostic invalid-composition category.
+    const fn new() -> Self {
+        Self { _private: () }
+    }
 }
 
 impl ComposedApplication {
@@ -62,7 +70,7 @@ impl ComposedApplication {
             .into_iter()
             .map(|target| {
                 let logical_target = LogicalTarget::try_from(target.logical_target)
-                    .map_err(|_| CompositionError::InvalidLogicalTarget)?;
+                    .map_err(|_| CompositionError::new())?;
                 Ok(TargetRoute::new(
                     logical_target,
                     AdapterIdentifier::new(target.adapter_identifier),
@@ -81,14 +89,8 @@ impl ComposedApplication {
             None => Vec::new(),
         };
 
-        let router = TargetRouter::new(routes, registrations).map_err(|error| match error {
-            TargetRouterBuildError::DuplicateLogicalTarget { .. } => {
-                CompositionError::DuplicateLogicalTarget
-            }
-            TargetRouterBuildError::DuplicateAdapterIdentifier { .. } => {
-                CompositionError::DuplicateAdapterRegistration
-            }
-        })?;
+        let router =
+            TargetRouter::new(routes, registrations).map_err(|_| CompositionError::new())?;
 
         let provider = match configuration.provider {
             Some(ProviderConfiguration::GenericRest(configuration)) => {
@@ -130,25 +132,21 @@ impl ComposedApplication {
 
 impl fmt::Debug for CompositionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::InvalidLogicalTarget => "CompositionError::InvalidLogicalTarget",
-            Self::DuplicateLogicalTarget => "CompositionError::DuplicateLogicalTarget",
-            Self::DuplicateAdapterRegistration => "CompositionError::DuplicateAdapterRegistration",
-        })
+        formatter.write_str("CompositionError")
     }
 }
 
 impl fmt::Display for CompositionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::InvalidLogicalTarget => "invalid configured logical target",
-            Self::DuplicateLogicalTarget => "duplicate configured logical target",
-            Self::DuplicateAdapterRegistration => "duplicate adapter registration",
-        })
+        formatter.write_str("invalid application composition configuration")
     }
 }
 
-impl Error for CompositionError {}
+impl Error for CompositionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        None
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -390,7 +388,6 @@ mod tests {
             let Err(error) = result else {
                 panic!("invalid logical target unexpectedly composed");
             };
-            assert!(matches!(error, CompositionError::InvalidLogicalTarget));
             for rendered in [format!("{error:?}"), error.to_string()] {
                 if !invalid_target.is_empty() {
                     assert!(!rendered.contains(invalid_target));
@@ -410,10 +407,7 @@ mod tests {
             ],
         ));
 
-        assert!(matches!(
-            result,
-            Err(CompositionError::DuplicateLogicalTarget)
-        ));
+        assert!(result.is_err());
     }
 
     #[test]
@@ -453,16 +447,12 @@ mod tests {
             "sensitive-certificate",
         ];
 
-        for error in [
-            CompositionError::InvalidLogicalTarget,
-            CompositionError::DuplicateLogicalTarget,
-            CompositionError::DuplicateAdapterRegistration,
-        ] {
-            assert!(error.source().is_none());
-            for rendered in [format!("{error:?}"), error.to_string()] {
-                for supplied_value in supplied_values {
-                    assert!(!rendered.contains(supplied_value));
-                }
+        let error = CompositionError::new();
+
+        assert!(error.source().is_none());
+        for rendered in [format!("{error:?}"), error.to_string()] {
+            for supplied_value in supplied_values {
+                assert!(!rendered.contains(supplied_value));
             }
         }
     }
