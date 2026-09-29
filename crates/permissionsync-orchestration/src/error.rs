@@ -25,9 +25,9 @@ pub enum SelectedTargetSynchronizationError {
     TargetUnavailable,
     /// Bounded synchronization capacity could not be acquired.
     CapacityUnavailable,
-    /// No usable Permission Provider was composed, or the Provider failed to
-    /// resolve desired state at runtime. Both cases have identical caller-facing
-    /// behavior.
+    /// No locally usable Permission Provider was available before capacity, or
+    /// an invoked Provider failed to resolve desired state. Both cases have
+    /// identical caller-facing behavior.
     ProviderFailed,
     /// The Target Adapter failed to reconcile desired state.
     AdapterFailed,
@@ -40,7 +40,7 @@ impl fmt::Display for SelectedTargetSynchronizationError {
             Self::UnknownTarget => "selected target is unknown",
             Self::TargetUnavailable => "selected target is unavailable",
             Self::CapacityUnavailable => "synchronization capacity is unavailable",
-            Self::ProviderFailed => "permission provider resolution failed",
+            Self::ProviderFailed => "permission provider is unavailable or failed",
             Self::AdapterFailed => "target adapter reconciliation failed",
         })
     }

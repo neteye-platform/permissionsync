@@ -3,8 +3,10 @@
 //! This crate coordinates work for a request that already carries one valid,
 //! selected [`LogicalTarget`](permissionsync_core::LogicalTarget). It owns:
 //!
-//! - resolving the selected target to its compiled adapter through the
-//!   existing [`TargetRouter`](permissionsync_routing::TargetRouter);
+//! - resolving the selected target to its usable registered adapter instance
+//!   through the existing [`TargetRouter`](permissionsync_routing::TargetRouter);
+//!   a compiled adapter implementation without a usable registered instance
+//!   does not resolve;
 //! - acquiring bounded synchronization capacity through a mechanism-neutral
 //!   port before any downstream call;
 //! - invoking [`PermissionProvider::resolve`](permissionsync_core::PermissionProvider::resolve)
@@ -33,14 +35,14 @@
 //! carries an already-selected, already-valid
 //! [`LogicalTarget`](permissionsync_core::LogicalTarget). This crate
 //! has no representation for "no target was selected"; that determination
-//! belongs to the future inbound layer.
+//! belongs to the inbound layer.
 //!
 //! ## Stage order
 //!
 //! 1. Check the overall deadline/cancellation.
 //! 2. Resolve the selected target with [`TargetRouter`](permissionsync_routing::TargetRouter).
 //! 3. Re-check the overall deadline/cancellation.
-//! 4. Check that a locally usable Permission Provider was composed.
+//! 4. Check that a locally usable Permission Provider is available.
 //! 5. Acquire bounded synchronization capacity and hold the permit.
 //! 6. Re-check the overall deadline/cancellation.
 //! 7. Invoke `PermissionProvider::resolve` exactly once.
@@ -50,7 +52,7 @@
 //!
 //! An unknown target or a recognized target with an unavailable adapter returns
 //! immediately: no capacity, Provider, or Adapter work starts.
-//! When no usable Provider was composed, selected-target synchronization returns
+//! When no usable Provider is available, selected-target synchronization returns
 //! [`SelectedTargetSynchronizationError::ProviderFailed`] after target resolution
 //! and before capacity, Provider, or Adapter work starts.
 //!

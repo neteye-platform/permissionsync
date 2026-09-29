@@ -26,11 +26,11 @@ pub struct SelectedTargetSynchronizer<'a> {
 impl<'a> SelectedTargetSynchronizer<'a> {
     /// Creates a synchronizer over an existing router, optional Provider, and capacity port.
     ///
-    /// `None` means no locally usable Permission Provider was composed because
-    /// Provider configuration was absent or invalid. Selected-target
-    /// synchronization then returns
+    /// `None` means no locally usable Permission Provider was supplied to this
+    /// orchestration. Selected-target synchronization then returns
     /// [`SelectedTargetSynchronizationError::ProviderFailed`] before acquiring
-    /// capacity.
+    /// capacity. This crate owns neither runtime configuration nor composition,
+    /// so it does not interpret why no usable Provider is available.
     pub fn new(
         router: &'a TargetRouter,
         provider: Option<&'a dyn PermissionProvider>,
