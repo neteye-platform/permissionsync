@@ -84,7 +84,7 @@ pub enum HttpOutcome {
     TargetUnavailable,
     /// Selected-target synchronization capacity was unavailable.
     CapacityUnavailable,
-    /// The selected-target Permission Provider failed.
+    /// The selected-target Permission Provider was unavailable or failed.
     ProviderFailed,
     /// The selected-target Target Adapter failed.
     AdapterFailed,
@@ -931,7 +931,7 @@ mod tests {
             calls: calls.clone(),
             fails: false,
         };
-        let sync = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let sync = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
         let authenticator = auth();
         let handler = InboundHttpHandler::new(&authenticator, &sync);
         let fields = [HeaderField::new(b"authorization", b"Basic secret")];
@@ -955,7 +955,7 @@ mod tests {
             calls: calls.clone(),
             fails: false,
         };
-        let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
         let authenticator = auth();
         let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
         for (error, expected) in [
@@ -1001,7 +1001,7 @@ mod tests {
             calls: calls.clone(),
             fails: false,
         };
-        let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
         let authenticator = auth();
         let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
 
@@ -1031,16 +1031,12 @@ mod tests {
     #[test]
     fn targetless_and_malformed_selected_never_start_selected_work() {
         let calls = Arc::new(Calls::default());
-        let router = selected_router(calls.clone(), ResultKind::Changed, true);
-        let provider = FakeProvider {
-            calls: calls.clone(),
-            kind: ResultKind::Changed,
-        };
+        let router = selected_router(calls.clone(), ResultKind::Changed, false);
         let capacity = FakeCapacity {
             calls: calls.clone(),
             fails: false,
         };
-        let sync = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let sync = SelectedTargetSynchronizer::new(&router, None, &capacity);
         let authenticator = auth();
         let handler = InboundHttpHandler::new(&authenticator, &sync);
         let bearer = TechnicalCallerBearerToken::new("sentinel-bearer".to_owned());
@@ -1069,6 +1065,33 @@ mod tests {
             )),
             HttpOutcome::InvalidRequest,
             400,
+        );
+        assert_eq!(count(&calls), (0, 0, 0));
+    }
+
+    #[test]
+    fn unavailable_provider_maps_selected_target_to_provider_failed() {
+        let calls = Arc::new(Calls::default());
+        let router = selected_router(calls.clone(), ResultKind::Changed, true);
+        let capacity = FakeCapacity {
+            calls: calls.clone(),
+            fails: false,
+        };
+        let synchronizer = SelectedTargetSynchronizer::new(&router, None, &capacity);
+        let authenticator = auth();
+        let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
+        let bearer = TechnicalCallerBearerToken::new("token".to_owned());
+        let selected = target("target-a");
+
+        assert_outcome(
+            poll_ready(handler.handle_authenticated(
+                &bearer,
+                Some(&selected),
+                body(),
+                context(&NeverCancelled),
+            )),
+            HttpOutcome::ProviderFailed,
+            500,
         );
         assert_eq!(count(&calls), (0, 0, 0));
     }
@@ -1109,7 +1132,7 @@ mod tests {
             calls: calls.clone(),
             fails: false,
         };
-        let sync = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let sync = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
         let authenticator = auth();
         let handler = InboundHttpHandler::new(&authenticator, &sync);
         let bearer = TechnicalCallerBearerToken::new("token".to_owned());
@@ -1141,7 +1164,7 @@ mod tests {
             calls: calls.clone(),
             fails: false,
         };
-        let sync = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let sync = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
         let authenticator = auth();
         let handler = InboundHttpHandler::new(&authenticator, &sync);
         let bearer = TechnicalCallerBearerToken::new("sentinel-bearer".to_owned());
@@ -1219,7 +1242,7 @@ mod tests {
                 calls: calls.clone(),
                 fails: capacity_fails,
             };
-            let sync = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+            let sync = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
             let authenticator = auth();
             let handler = InboundHttpHandler::new(&authenticator, &sync);
             let bearer = TechnicalCallerBearerToken::new("token".to_owned());
@@ -1245,7 +1268,7 @@ mod tests {
             calls: calls.clone(),
             fails: false,
         };
-        let sync = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let sync = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
         let authenticator = auth();
         let handler = InboundHttpHandler::new(&authenticator, &sync);
         let bearer = TechnicalCallerBearerToken::new("token".to_owned());
@@ -1275,7 +1298,7 @@ mod tests {
             calls: calls.clone(),
             fails: false,
         };
-        let sync = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let sync = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
         let authenticator = auth();
         let handler = InboundHttpHandler::new(&authenticator, &sync);
         let bearer = TechnicalCallerBearerToken::new("token".to_owned());
@@ -1305,7 +1328,7 @@ mod tests {
             calls: calls.clone(),
             fails: false,
         };
-        let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
         let authenticator = auth();
         let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
         let bearer = TechnicalCallerBearerToken::new("token".to_owned());
@@ -1339,7 +1362,7 @@ mod tests {
             calls: calls.clone(),
             fails: false,
         };
-        let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
         let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
         let cancellation = NeverCancelled;
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -1381,7 +1404,7 @@ mod tests {
             calls: calls.clone(),
             fails: false,
         };
-        let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
         let authenticator = auth();
         let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
         let headers = [HeaderField::new(b"Authorization", b"Bearer segment")];
@@ -1407,7 +1430,7 @@ mod tests {
             calls: calls.clone(),
             fails: false,
         };
-        let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
         let authenticator = auth();
         let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
         let headers = [HeaderField::new(b"Authorization", b"Bearer segment")];
@@ -1446,7 +1469,7 @@ mod tests {
             calls: calls.clone(),
             fails: false,
         };
-        let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
         let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
         let cancellation = ToggleCancelled(AtomicBool::new(false));
         let header_value = format!("Bearer {token}");

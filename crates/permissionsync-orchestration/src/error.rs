@@ -25,7 +25,9 @@ pub enum SelectedTargetSynchronizationError {
     TargetUnavailable,
     /// Bounded synchronization capacity could not be acquired.
     CapacityUnavailable,
-    /// The Permission Provider failed to resolve desired state.
+    /// No usable Permission Provider was composed, or the Provider failed to
+    /// resolve desired state at runtime. Both cases have identical caller-facing
+    /// behavior.
     ProviderFailed,
     /// The Target Adapter failed to reconcile desired state.
     AdapterFailed,

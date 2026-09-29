@@ -4,6 +4,7 @@ use std::{error::Error, fmt};
 
 use permissionsync_adapter_glpi::GlpiAdapter;
 use permissionsync_core::{LogicalTarget, PermissionProvider, TargetAdapter};
+use permissionsync_orchestration::{SelectedTargetSynchronizer, SynchronizationCapacity};
 use permissionsync_provider_generic_rest::GenericRestPermissionProvider;
 use permissionsync_routing::{
     AdapterIdentifier, AdapterRegistration, TargetResolutionError, TargetRoute, TargetRouter,
@@ -128,6 +129,23 @@ impl ComposedApplication {
     pub fn router(&self) -> &TargetRouter {
         &self.router
     }
+
+    /// Wires the composed runtime state into selected-target orchestration.
+    ///
+    /// Provider unavailability is represented explicitly and yields a
+    /// server-side selected-target failure at request time, after target
+    /// resolution.
+    pub fn selected_target_synchronizer<'a>(
+        &'a self,
+        capacity: &'a dyn SynchronizationCapacity,
+    ) -> SelectedTargetSynchronizer<'a> {
+        let provider = match &self.provider {
+            ProviderState::Usable(provider) => Some(provider.as_ref()),
+            ProviderState::Unavailable => None,
+        };
+
+        SelectedTargetSynchronizer::new(&self.router, provider, capacity)
+    }
 }
 
 impl fmt::Debug for CompositionError {
@@ -150,12 +168,26 @@ impl Error for CompositionError {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, ptr, time::Duration};
+    use std::{
+        error::Error,
+        future::Future,
+        ptr,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll, Waker},
+        time::{Duration, Instant},
+    };
 
     use permissionsync_adapter_glpi::{
         GlpiAdapterConfig, GlpiAppToken, GlpiAuthenticationSource, GlpiUserToken,
     };
-    use permissionsync_core::{LogicalTarget, TargetAdapter};
+    use permissionsync_core::{
+        CancellationSignal, IdentityContext, LogicalTarget, SynchronizationContext, TargetAdapter,
+        TechnicalCallerBearerToken,
+    };
+    use permissionsync_orchestration::{
+        SelectedTargetSynchronizationError, SynchronizationCapacity, SynchronizationCapacityError,
+        SynchronizationPermit,
+    };
     use permissionsync_provider_generic_rest::GenericRestPermissionProviderConfig;
 
     use super::{
@@ -203,6 +235,58 @@ mod tests {
             provider,
             glpi,
             targets,
+        }
+    }
+
+    fn poll_ready<F: Future>(future: F) -> F::Output {
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = Box::pin(future);
+
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("test future unexpectedly returned Poll::Pending"),
+        }
+    }
+
+    struct NeverCancelled;
+
+    impl CancellationSignal for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    struct PanicOnAcquire;
+
+    impl SynchronizationCapacity for PanicOnAcquire {
+        fn acquire<'a>(
+            &'a self,
+            _context: &'a SynchronizationContext<'a>,
+        ) -> permissionsync_core::BoxFuture<
+            'a,
+            Result<Box<dyn SynchronizationPermit + Send + 'a>, SynchronizationCapacityError>,
+        > {
+            panic!("capacity must not be acquired for this scenario");
+        }
+    }
+
+    struct FailingCapacity {
+        calls: AtomicUsize,
+    }
+
+    impl SynchronizationCapacity for FailingCapacity {
+        fn acquire<'a>(
+            &'a self,
+            _context: &'a SynchronizationContext<'a>,
+        ) -> permissionsync_core::BoxFuture<
+            'a,
+            Result<Box<dyn SynchronizationPermit + Send + 'a>, SynchronizationCapacityError>,
+        > {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(SynchronizationCapacityError)
+            })
         }
     }
 
@@ -434,6 +518,141 @@ mod tests {
             application.resolve_target(&logical_target("target-b")),
             TargetAvailability::Unavailable
         ));
+    }
+
+    #[test]
+    fn unavailable_provider_unknown_target_precedes_capacity() {
+        let application = ComposedApplication::compose(configuration(
+            None,
+            None,
+            vec![target("target-b", "some-other-adapter")],
+        ))
+        .unwrap();
+        let capacity = PanicOnAcquire;
+        let target = logical_target("target-a");
+        let identity = IdentityContext::new("jdoe".to_owned(), Vec::new());
+        let bearer = TechnicalCallerBearerToken::new("bearer-token".to_owned());
+        let cancellation = NeverCancelled;
+
+        let synchronizer = application.selected_target_synchronizer(&capacity);
+        let result = poll_ready(synchronizer.synchronize(
+            permissionsync_orchestration::SelectedTargetSynchronizationRequest::new(
+                &identity,
+                &target,
+                &bearer,
+                SynchronizationContext::new(
+                    Instant::now() + Duration::from_secs(3600),
+                    &cancellation,
+                ),
+            ),
+        ));
+
+        assert!(matches!(
+            result,
+            Err(SelectedTargetSynchronizationError::UnknownTarget)
+        ));
+    }
+
+    #[test]
+    fn unavailable_provider_unavailable_target_precedes_capacity() {
+        let application = ComposedApplication::compose(configuration(
+            None,
+            None,
+            vec![target("target-a", "some-other-adapter")],
+        ))
+        .unwrap();
+        let capacity = PanicOnAcquire;
+        let target = logical_target("target-a");
+        let identity = IdentityContext::new("jdoe".to_owned(), Vec::new());
+        let bearer = TechnicalCallerBearerToken::new("bearer-token".to_owned());
+        let cancellation = NeverCancelled;
+
+        let synchronizer = application.selected_target_synchronizer(&capacity);
+        let result = poll_ready(synchronizer.synchronize(
+            permissionsync_orchestration::SelectedTargetSynchronizationRequest::new(
+                &identity,
+                &target,
+                &bearer,
+                SynchronizationContext::new(
+                    Instant::now() + Duration::from_secs(3600),
+                    &cancellation,
+                ),
+            ),
+        ));
+
+        assert!(matches!(
+            result,
+            Err(SelectedTargetSynchronizationError::TargetUnavailable)
+        ));
+    }
+
+    #[test]
+    fn unavailable_provider_usable_glpi_target_fails_before_capacity() {
+        let application = ComposedApplication::compose(configuration(
+            None,
+            Some(glpi_configuration()),
+            vec![target("target-a", GLPI_ADAPTER_IDENTIFIER)],
+        ))
+        .unwrap();
+        let capacity = PanicOnAcquire;
+        let target = logical_target("target-a");
+        let identity = IdentityContext::new("jdoe".to_owned(), Vec::new());
+        let bearer = TechnicalCallerBearerToken::new("bearer-token".to_owned());
+        let cancellation = NeverCancelled;
+
+        let synchronizer = application.selected_target_synchronizer(&capacity);
+        let result = poll_ready(synchronizer.synchronize(
+            permissionsync_orchestration::SelectedTargetSynchronizationRequest::new(
+                &identity,
+                &target,
+                &bearer,
+                SynchronizationContext::new(
+                    Instant::now() + Duration::from_secs(3600),
+                    &cancellation,
+                ),
+            ),
+        ));
+
+        assert!(matches!(
+            result,
+            Err(SelectedTargetSynchronizationError::ProviderFailed)
+        ));
+    }
+
+    #[test]
+    fn usable_provider_usable_glpi_target_reaches_capacity_before_provider_work() {
+        let application = ComposedApplication::compose(configuration(
+            Some(ProviderConfiguration::GenericRest(provider_configuration())),
+            Some(glpi_configuration()),
+            vec![target("target-a", GLPI_ADAPTER_IDENTIFIER)],
+        ))
+        .unwrap();
+        let capacity = FailingCapacity {
+            calls: AtomicUsize::new(0),
+        };
+        let target = logical_target("target-a");
+        let identity = IdentityContext::new("jdoe".to_owned(), Vec::new());
+        let bearer = TechnicalCallerBearerToken::new("bearer-token".to_owned());
+        let cancellation = NeverCancelled;
+
+        let synchronizer = application.selected_target_synchronizer(&capacity);
+        let result = poll_ready(synchronizer.synchronize(
+            permissionsync_orchestration::SelectedTargetSynchronizationRequest::new(
+                &identity,
+                &target,
+                &bearer,
+                SynchronizationContext::new(
+                    Instant::now() + Duration::from_secs(3600),
+                    &cancellation,
+                ),
+            ),
+        ));
+
+        assert!(matches!(
+            result,
+            Err(SelectedTargetSynchronizationError::CapacityUnavailable)
+        ));
+        assert_eq!(capacity.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

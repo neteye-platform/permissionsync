@@ -40,15 +40,19 @@
 //! 1. Check the overall deadline/cancellation.
 //! 2. Resolve the selected target with [`TargetRouter`](permissionsync_routing::TargetRouter).
 //! 3. Re-check the overall deadline/cancellation.
-//! 4. Acquire bounded synchronization capacity and hold the permit.
-//! 5. Re-check the overall deadline/cancellation.
-//! 6. Invoke `PermissionProvider::resolve` exactly once.
-//! 7. Re-check the overall deadline/cancellation.
-//! 8. Invoke `TargetAdapter::reconcile` exactly once with the returned envelope.
-//! 9. Re-check the overall deadline/cancellation before reporting success.
+//! 4. Check that a locally usable Permission Provider was composed.
+//! 5. Acquire bounded synchronization capacity and hold the permit.
+//! 6. Re-check the overall deadline/cancellation.
+//! 7. Invoke `PermissionProvider::resolve` exactly once.
+//! 8. Re-check the overall deadline/cancellation.
+//! 9. Invoke `TargetAdapter::reconcile` exactly once with the returned envelope.
+//! 10. Re-check the overall deadline/cancellation before reporting success.
 //!
 //! An unknown target or a recognized target with an unavailable adapter returns
 //! immediately: no capacity, Provider, or Adapter work starts.
+//! When no usable Provider was composed, selected-target synchronization returns
+//! [`SelectedTargetSynchronizationError::ProviderFailed`] after target resolution
+//! and before capacity, Provider, or Adapter work starts.
 //!
 //! ## At-most-once behavior
 //!

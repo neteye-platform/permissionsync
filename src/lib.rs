@@ -1,9 +1,9 @@
-//! Typed runtime configuration and deterministic application composition for
-//! PermissionSync.
+//! Typed runtime configuration, deterministic application composition, and
+//! selected-target orchestration wiring for PermissionSync.
 //!
-//! This crate receives semantic construction inputs directly. It deliberately
-//! selects no configuration delivery format, loading mechanism, or startup
-//! behavior.
+//! This crate receives semantic construction inputs directly and wires composed
+//! state into selected-target orchestration. It deliberately selects no
+//! configuration delivery format, loading mechanism, or startup behavior.
 
 #![forbid(unsafe_code)]
 

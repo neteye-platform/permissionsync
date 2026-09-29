@@ -11,11 +11,14 @@ Provider, selected-target synchronization orchestration, and an internal
 target selection, plus framework-neutral inbound HTTP request processing with
 authentication/authorization integration and a concrete GLPI Target Adapter
 implementing the selected GLPI V1 reconciliation contract, plus typed runtime
-configuration and deterministic application composition. Configuration
-delivery/loading, an actual HTTP server/listener and framework route
-registration, final runtime wiring, health/readiness, observability,
-supported-Keycloak deployment contract tests, and OCI/runtime integration remain
-future work; the internal auth-crate tests are not a deployment claim.
+configuration and deterministic application composition, with semantic
+application wiring from composed runtime state through selected-target
+orchestration to inbound request processing. Configuration delivery/loading,
+concrete runtime infrastructure and an actual HTTP server/listener with
+framework route registration, operational lifecycle (health/readiness,
+shutdown), observability, supported-Keycloak deployment contract tests, and
+OCI/runtime deployment integration remain future work; the internal auth-crate
+tests are not a deployment claim.
 
 ## Development
 
