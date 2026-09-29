@@ -59,4 +59,7 @@ PermissionSync uses these statuses:
    Generic REST Permission Provider Wire and Transport Contract (Accepted)
 9. [0009](0009-glpi-target-adapter.md) GLPI Target Adapter (Accepted)
 10. [0010](0010-runtime-target-configuration-and-composition-root.md) Runtime
-    Target Configuration and Composition Root (Accepted)
+     Target Configuration and Composition Root (Accepted)
+11. [0011](0011-executable-runtime-configuration-and-operational-lifecycle.md)
+    Executable Runtime, Configuration Delivery, and Operational Lifecycle
+    (Accepted)
