@@ -46,13 +46,23 @@ and observability settings. After delivery-level validation, it constructs the
 existing auth configuration and projects Provider, GLPI, and target values into
 the existing semantic `RuntimeConfiguration`.
 
-Malformed JSON, unreadable configuration, and invalid required global fields
-fail startup. Provider and target-local sections are decoded independently
-enough to preserve existing semantics: an absent or locally invalid Provider
-remains unavailable for selected-target requests, and failed target-local
-Adapter construction leaves recognized routes unavailable. Such local defects
-do not become whole-document parse failures. Unknown fields are rejected so
-misspelled global settings cannot be silently ignored.
+Configuration failures are split into global and component-local. A global
+failure aborts startup: JSON that is malformed as a document, missing or
+malformed required top-level runtime structure, invalid authentication,
+listener, deadline, or capacity configuration, routing configuration that cannot
+form deterministic logical routes, invalid or duplicate logical targets, and any
+composition that is globally ambiguous or structurally unusable. Unknown or
+misspelled global fields also fail startup rather than being ignored.
+
+A component-local failure does not abort startup, and strict decoding must not
+promote one into a global failure. An absent or invalid Provider section leaves
+the Provider unavailable, including a section that cannot be decoded or
+validated under the Provider contract. An absent or invalid GLPI section leaves
+the GLPI adapter unavailable; because GLPI is process-wide, every configured
+route selecting `glpi` stays recognized but unavailable when that section cannot
+produce the single usable GLPI instance. Unrelated correctly configured targets
+remain serviceable. A schema mistake inside a Provider or Adapter section is
+invalid component configuration, never a silently ignored field.
 
 ### HTTP runtime and transport adapter
 
@@ -77,12 +87,20 @@ Adapter, or reconciliation policy.
 ### Request body and overall deadline
 
 The executable enforces a fixed one-mebibyte product limit on the inbound
-synchronization body. The limit belongs at the Axum transport boundary, before
-the body is fully buffered or passed to `permissionsync-inbound-http`.
-`Content-Length` may permit early rejection, but streamed bytes are counted as
-they are collected, so a missing or misleading length cannot bypass the limit.
-An oversized body returns `400`; there is no unbounded mode or deployment
-tuning knob. This adds neither an endpoint nor a body format.
+synchronization body. The limit belongs at the Axum transport boundary, which
+stops accumulating bytes as soon as the limit is exceeded, so buffering is never
+unbounded. There is no unbounded mode and no deployment tuning knob.
+
+Exceeding the limit is a body-validation outcome, not an immediate transport
+rejection. The transport records the bounded collection failure and passes it to
+`permissionsync-inbound-http` in place of a body, which may require a small
+representation for "body exceeded the bounded limit". Processing then continues
+in the order ADR-0001 fixes: authentication, structural scope validation, scope
+cardinality, and suffix validation all resolve first and keep their outcomes. An
+invalid credential with an oversized body still returns `401`, and more than one
+PermissionSync scope with an oversized body still returns `403`. Only when
+processing reaches body validation does an oversized body return `400`. This
+adds neither an endpoint nor a body format.
 
 The executable starts one absolute deadline immediately when the request is
 accepted, before body collection. Its duration is required runtime
