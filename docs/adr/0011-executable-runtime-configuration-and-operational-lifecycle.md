@@ -40,19 +40,21 @@ operators, or another secret backend.
 The deserialized executable configuration is a delivery or wire model, not a
 replacement for the existing semantic `RuntimeConfiguration`. It contains the
 authentication inputs, Provider and GLPI inputs, configured target routes,
-listen address and port, overall request deadline, synchronization capacity,
-authentication, Provider, and GLPI operation timeouts, shutdown grace period,
-and observability settings. After delivery-level validation, it constructs the
-existing auth configuration and projects Provider, GLPI, and target values into
-the existing semantic `RuntimeConfiguration`.
+listen address and port, overall request deadline, inbound admission limit,
+synchronization capacity, authentication, Provider, and GLPI operation
+timeouts, shutdown grace period, and observability settings. After
+delivery-level validation, it constructs the existing auth configuration and
+projects Provider, GLPI, and target values into the existing semantic
+`RuntimeConfiguration`.
 
 Configuration failures are split into global and component-local. A global
 failure aborts startup: JSON that is malformed as a document, missing or
 malformed required top-level runtime structure, invalid authentication,
-listener, deadline, or capacity configuration, routing configuration that cannot
-form deterministic logical routes, invalid or duplicate logical targets, and any
-composition that is globally ambiguous or structurally unusable. Unknown or
-misspelled global fields also fail startup rather than being ignored.
+listener, deadline, admission, or capacity configuration, routing configuration
+that cannot form deterministic logical routes, invalid or duplicate logical
+targets, and any composition that is globally ambiguous or structurally
+unusable. Unknown or misspelled global fields also fail startup rather than
+being ignored.
 
 A component-local failure does not abort startup, and strict decoding must not
 promote one into a global failure. An absent or invalid Provider section leaves
@@ -84,7 +86,20 @@ and maps `HttpOutcome` to its existing status code with an empty response body.
 It contains no authentication, authorization, scope, routing, Provider,
 Adapter, or reconciliation policy.
 
-### Request body and overall deadline
+### Inbound admission, request body, and overall deadline
+
+Before collecting a `POST /api/sync-user` body, the transport obtains one permit
+from a process-wide inbound admission limit, a required positive finite runtime
+value. It bounds concurrently admitted synchronization requests, and therefore
+aggregate application-owned body buffering and concurrent pre-selected-target
+processing such as authentication and validation. A permit is held for that
+request's complete handling, including cancellation and error paths, without
+persistent or distributed coordination. `GET /healthz`, `GET /readyz`, and
+`GET /metrics` need no admission permit and stay observable under saturation.
+Saturation is transport-level backpressure, never an application outcome: a
+waiting request has not yet entered application processing, so a full limit adds
+no `429`, `503`, `500`, or other response to the precedence ADR-0001 fixes.
+Admission complements the per-request limit below rather than replacing it.
 
 The executable enforces a fixed one-mebibyte product limit on the inbound
 synchronization body. The limit belongs at the Axum transport boundary, which
@@ -103,7 +118,8 @@ processing reaches body validation does an oversized body return `400`. This
 adds neither an endpoint nor a body format.
 
 The executable starts one absolute deadline immediately when the request is
-accepted, before body collection. Its duration is required runtime
+admitted, before body collection. Waiting for admission precedes that deadline
+and creates no second application deadline. Its duration is required runtime
 configuration rather than a deployment-specific value compiled into the
 binary. The same absolute deadline is used for body collection and propagated
 through authentication, routing, capacity acquisition, Provider work, and
@@ -128,6 +144,9 @@ capacity-unavailable `500` path and starts no Provider or Adapter work. An
 owned semaphore permit implements `SynchronizationPermit` and releases capacity
 on drop, including cancellation and error paths. There is no separate work
 queue, distributed coordination, persistence, fairness protocol, or retry.
+Capacity is independent of inbound admission: admission is taken at the
+transport boundary for every synchronization request, while capacity is acquired
+later and only for selected-target work.
 
 ### Authentication, health, and readiness
 
@@ -170,7 +189,7 @@ Startup proceeds in this order:
 2. Parse it and validate required global and static values.
 3. Construct the technical-caller authenticator.
 4. Project semantic configuration and compose the Provider and targets.
-5. Construct the semaphore-backed capacity implementation.
+5. Construct the inbound admission limit and semaphore-backed capacity.
 6. Wire orchestration, inbound handling, and the Axum transport adapter.
 7. Bind the configured listener.
 8. Begin serving and allow bounded verifier warm-up.
@@ -178,7 +197,7 @@ Startup proceeds in this order:
 Startup aborts for an unreadable or syntactically malformed required
 configuration file, invalid global authentication configuration, invalid
 listener or runtime values, globally invalid target composition, impossible
-capacity or deadline configuration, or listener bind failure.
+admission, capacity, or deadline configuration, or listener bind failure.
 
 Startup does not abort because the Provider is absent or invalid where existing
 ADRs make it selected-target unavailable, a target-local Adapter cannot be
@@ -243,11 +262,11 @@ secrets, and private trust outside the image. Invalid local global
 configuration fails deterministically, while transient authentication metadata
 or downstream outages do not create startup crash loops.
 
-A fixed body limit, one absolute deadline, and bounded local concurrency protect
-the process from unbounded request work. Readiness reports authentication
-safety rather than downstream health. Later Kubernetes-focused packaging can
-supply the external file and probes without coupling application semantics to
-Kubernetes APIs.
+A fixed body limit, bounded inbound admission, one absolute deadline, and
+bounded local concurrency protect the process from unbounded request work.
+Readiness reports authentication safety rather than downstream health. Later
+Kubernetes-focused packaging can supply the external file and probes without
+coupling application semantics to Kubernetes APIs.
 
 ## References
 
