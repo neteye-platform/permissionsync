@@ -104,9 +104,13 @@ processing such as authentication and validation. A permit is held for that
 request's complete handling, including cancellation and error paths, without
 persistent or distributed coordination. `GET /healthz`, `GET /readyz`, and
 `GET /metrics` need no admission permit and stay observable under saturation.
-Saturation is transport-level backpressure, never an application outcome: a
-waiting request has not yet entered application processing, so a full limit adds
-no `429`, `503`, `500`, or other response to the precedence ADR-0001 fixes.
+Saturation is backpressure, never a new public outcome: a full limit adds no
+`429`, `503`, or other response to the precedence ADR-0001 fixes. Waiting is
+bounded by the request's own overall deadline below, and PermissionSync keeps no
+unbounded application-level queue of admission waiters: application-owned waiter
+state stays bounded, saturation surfaces as transport and service backpressure
+rather than many buffered bodies or queued application requests, and waiting
+adds no third work queue beyond admission and synchronization capacity.
 Admission complements the per-request limit below rather than replacing it.
 
 The executable enforces a fixed one-mebibyte product limit on the inbound
@@ -125,20 +129,29 @@ PermissionSync scope with an oversized body still returns `403`. Only when
 processing reaches body validation does an oversized body return `400`. This
 adds neither an endpoint nor a body format.
 
-The executable starts one absolute deadline immediately when the request is
-admitted, before body collection. Waiting for admission precedes that deadline
-and creates no second application deadline. Its duration is required runtime
-configuration rather than a deployment-specific value compiled into the
-binary. The same absolute deadline is used for body collection and propagated
-through authentication, routing, capacity acquisition, Provider work, and
-Adapter reconciliation. A child operation may apply its configured shorter
+The executable starts one absolute deadline immediately when it accepts the
+synchronization request at the transport boundary, before admission waiting and
+before body collection, so the admission wait shares the request's single
+budget. Admission acquisition observes that deadline and the request's
+cancellation, is cancelled when the request is dropped, creates no second
+application deadline, and neither extends nor resets the budget once the permit
+is held. Expiry or cancellation while waiting terminates through the existing
+deadline and cancellation server-side failure semantics, and no body collection,
+authentication, Provider work, or Adapter work starts when no permit was
+obtained.
+
+The deadline duration is required runtime configuration rather than a
+deployment-specific value compiled into the binary. The same absolute deadline
+covers admission waiting and body collection and is propagated through
+authentication, routing, capacity acquisition, Provider work, and Adapter
+reconciliation. A child operation may apply its configured shorter
 timeout but may never create a later deadline or reset the overall budget.
 Expiry at any stage remains `500`.
 
 Configured operation timeouts must be positive and no greater than the overall
-request deadline. Body buffering, remote calls, parsing, and capacity waiting
-must stop or return when their applicable budget expires. No new application
-work intentionally starts after expiry.
+request deadline. Admission waiting, body buffering, remote calls, parsing, and
+capacity waiting must stop or return when their applicable budget expires. No
+new application work intentionally starts after expiry.
 
 ### Synchronization capacity
 
@@ -214,12 +227,17 @@ is unreachable. Composition performs no mandatory downstream connectivity
 probe.
 
 On Linux, the executable handles `SIGTERM` and `SIGINT`. It first marks
-readiness false and stops accepting new requests. Existing bounded requests may
-finish during the configured grace period. The grace period must be positive
-and at least the overall request deadline, so every compliant request accepted
+readiness false, stops accepting new requests, and admits no further
+synchronization request: pending admission waits are cancelled and released, so
+those requests reach neither body collection nor authentication. Requests that
+already hold a permit may finish, bounded, during the configured grace period.
+The grace period must be positive and at least the overall request deadline, so
+every compliant request accepted
 before shutdown has time to return. At grace expiry, remaining request contexts
 are cancelled, their tasks are terminated and awaited, and connections are
-closed. Reconciliation is never detached or continued after process exit. With
+closed. No waiter or permit survives process exit, admission waiting never
+extends shutdown, and reconciliation is never detached or continued after it.
+With
 tracing enabled, shutdown also requests a bounded flush and shutdown of the
 trace provider; that flush must not extend shutdown indefinitely, stays
 secondary to terminating the service safely, and may lose final telemetry. No
