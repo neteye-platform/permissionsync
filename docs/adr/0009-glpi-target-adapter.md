@@ -29,12 +29,12 @@ complete desired or current GLPI assignment. `(entity, profile)` is solely the
 normalization and grouping identity; a physical `Profile_User` row may also
 carry GLPI metadata. The GLPI relationship fields are:
 
-| Field | GLPI relationship field |
-| --- | --- |
-| user | `users_id` |
-| entity | `entities_id` |
-| profile | `profiles_id` |
-| recursive | `is_recursive` |
+| Field     | GLPI relationship field |
+| --------- | ----------------------- |
+| user      | `users_id`              |
+| entity    | `entities_id`           |
+| profile   | `profiles_id`           |
+| recursive | `is_recursive`          |
 
 The adapter may create a missing user and may create or delete `Profile_User`
 assignments. It does not create or modify entities or profiles, and it does not
@@ -100,8 +100,8 @@ Repeated complete objects in the `permissions` array are valid Provider intent:
 ```json
 {
   "permissions": [
-    {"entity": "Root Entity > IT", "profile": "Technician", "recursive": false},
-    {"entity": "Root Entity > IT", "profile": "Technician", "recursive": false}
+    { "entity": "Root Entity > IT", "profile": "Technician", "recursive": false },
+    { "entity": "Root Entity > IT", "profile": "Technician", "recursive": false }
   ]
 }
 ```
@@ -112,8 +112,8 @@ Entity > IT` / `Technician` / `false`.
 ```json
 {
   "permissions": [
-    {"entity": "Root Entity > IT", "profile": "Technician", "recursive": false},
-    {"entity": "Root Entity > IT", "profile": "Technician", "recursive": true}
+    { "entity": "Root Entity > IT", "profile": "Technician", "recursive": false },
+    { "entity": "Root Entity > IT", "profile": "Technician", "recursive": true }
   ]
 }
 ```
@@ -250,14 +250,14 @@ represents the requested successful mutation before beginning the next one. The
 first failed mutation stops reconciliation. If a removal fails, the add phase
 does not start.
 
-| Stage | Example assignment |
-| --- | --- |
-| Current | `Root Entity > IT` / `Technician` / `true` |
-| Current | `Root Entity > Legacy` / `Read-Only` / `false` |
-| Desired | `Root Entity > IT` / `Technician` / `true` |
-| Desired | `Root Entity > IT > Operations` / `Read-Only` / `false` |
-| Plan | **REMOVE** `Root Entity > Legacy` / `Read-Only` / `false` |
-| Plan | **ADD** `Root Entity > IT > Operations` / `Read-Only` / `false` |
+| Stage   | Example assignment                                              |
+| ------- | --------------------------------------------------------------- |
+| Current | `Root Entity > IT` / `Technician` / `true`                      |
+| Current | `Root Entity > Legacy` / `Read-Only` / `false`                  |
+| Desired | `Root Entity > IT` / `Technician` / `true`                      |
+| Desired | `Root Entity > IT > Operations` / `Read-Only` / `false`         |
+| Plan    | **REMOVE** `Root Entity > Legacy` / `Read-Only` / `false`       |
+| Plan    | **ADD** `Root Entity > IT > Operations` / `Read-Only` / `false` |
 
 The final state is exactly the canonical desired state. Successful reconciliation
 returns `Unchanged` only when the user already existed and its physical
@@ -277,14 +277,14 @@ itemtype endpoints provide the reads, creates, and deletes needed for
 reconciliation. V2 has no equivalent `Profile_User` operation and is not
 selected for this contract.
 
-| Need | V1 REST operation |
-| --- | --- |
-| Begin authentication | `GET /apirest.php/initSession/` |
-| Resolve GLPI objects | `GET /apirest.php/search/:itemtype/` and item reads |
-| Create missing user | `POST /apirest.php/User/` |
-| Create one missing assignment | `POST /apirest.php/Profile_User/` |
-| Remove stale assignment | `DELETE /apirest.php/Profile_User/:id` |
-| End the request-scoped session | `GET /apirest.php/killSession/` |
+| Need                           | V1 REST operation                                   |
+| ------------------------------ | --------------------------------------------------- |
+| Begin authentication           | `GET /apirest.php/initSession/`                     |
+| Resolve GLPI objects           | `GET /apirest.php/search/:itemtype/` and item reads |
+| Create missing user            | `POST /apirest.php/User/`                           |
+| Create one missing assignment  | `POST /apirest.php/Profile_User/`                   |
+| Remove stale assignment        | `DELETE /apirest.php/Profile_User/:id`              |
+| End the request-scoped session | `GET /apirest.php/killSession/`                     |
 
 Authentication is request-scoped GLPI session authentication. The adapter
 starts a session with the configured least-privilege service account's

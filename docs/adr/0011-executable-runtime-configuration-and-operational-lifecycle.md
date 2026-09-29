@@ -23,15 +23,23 @@ contracts.
 
 ### Configuration delivery
 
-The executable loads exactly one UTF-8 JSON configuration document. Its path is
+The executable loads exactly one UTF-8 YAML configuration document. Its path is
 supplied by the required `PERMISSIONSYNC_CONFIG_FILE` environment variable.
 There are no layered file, environment-value, command-line, or remote
 configuration overrides, and no implicit environment substitution inside the
 document. The file is loaded once during startup; runtime reload is not
 supported.
 
-JSON is selected because Serde and `serde_json` are already used throughout the
-workspace, and one mounted document is simple for a container deployment.
+YAML is selected because it lets operators comment deployment configuration
+next to the values they manage while remaining one strict external document.
+Exactly one YAML document is parsed; multi-document streams, merging, includes,
+and environment-template syntax are not supported. Comments are allowed, carry
+no semantics, are not part of `RuntimeConfiguration`, are not retained as
+application state, and do not affect validation. This record selects the format,
+not a parsing crate: the implementation chooses a maintained, Serde-compatible
+parser with strict typed deserialization under the repository's exact-versioning
+and dependency policy.
+
 Secrets, credentials, and private trust material are supplied through this
 external runtime file and are never built into the binary or image. The
 executable neither requires nor understands Kubernetes Secrets, secret
@@ -48,8 +56,8 @@ projects Provider, GLPI, and target values into the existing semantic
 `RuntimeConfiguration`.
 
 Configuration failures are split into global and component-local. A global
-failure aborts startup: JSON that is malformed as a document, missing or
-malformed required top-level runtime structure, invalid authentication,
+failure aborts startup: a configuration document that is malformed YAML, missing
+or malformed required top-level runtime structure, invalid authentication,
 listener, deadline, admission, or capacity configuration, routing configuration
 that cannot form deterministic logical routes, invalid or duplicate logical
 targets, and any composition that is globally ambiguous or structurally
@@ -211,7 +219,10 @@ finish during the configured grace period. The grace period must be positive
 and at least the overall request deadline, so every compliant request accepted
 before shutdown has time to return. At grace expiry, remaining request contexts
 are cancelled, their tasks are terminated and awaited, and connections are
-closed. Reconciliation is never detached or continued after process exit. No
+closed. Reconciliation is never detached or continued after process exit. With
+tracing enabled, shutdown also requests a bounded flush and shutdown of the
+trace provider; that flush must not extend shutdown indefinitely, stays
+secondary to terminating the service safely, and may lose final telemetry. No
 lifecycle framework is introduced.
 
 ### Observability
@@ -222,9 +233,43 @@ standard error. Runtime configuration selects a bounded log-level threshold,
 while JSON format and redaction rules are fixed.
 
 Metrics use the `metrics` facade with `metrics-exporter-prometheus` and are
-exposed at `/metrics`. The bounded categories and prohibited dimensions in
-ADR-0006 remain authoritative. Distributed tracing is optional and is not
-required for this executable.
+exposed at `/metrics`. Structured JSON logs and Prometheus metrics are the
+required v1 channels and stay available. ADR-0006's bounded categories,
+prohibited dimensions, and observability data restrictions remain authoritative
+and apply equally to spans and span attributes, so spans use bounded values such
+as fixed route, stage, coarse outcome, changed or unchanged, targetless or
+selected-target, component category, and duration.
+
+Trace export is an additional optional channel, disabled by default and never
+required to run PermissionSync. When enabled, the runtime exports spans over
+OTLP/HTTP with protobuf encoding, so PermissionSync can join an
+OpenTelemetry-compatible pipeline. Instrumentation stays on `tracing`; enabling
+export connects it to the OpenTelemetry Rust SDK and OTLP exporter instead of
+adding a second instrumentation API.
+
+The optional tracing section configures whether export is enabled, the OTLP
+endpoint, a bounded export timeout, optional static exporter headers where the
+backend requires authentication, and trust material the selected HTTPS endpoint
+requires. Exporter headers and credentials are runtime configuration and never
+appear in logs, metrics, errors, or `Debug` output. Invalid local tracing
+configuration while export is explicitly enabled fails startup as global
+configuration; an unreachable backend afterwards does not.
+
+Telemetry is never part of synchronization correctness. Export is asynchronous,
+batched, and bounded, so an unavailable, slow, or failing backend must not fail
+`/api/sync-user`, change an outcome, make readiness false, consume
+synchronization capacity, block Provider or Adapter work, create an application
+retry, or grow queues or memory without bound; bounded exporter behavior drops
+telemetry instead of backpressuring synchronization work.
+
+With tracing enabled the runtime accepts W3C `traceparent` and `tracestate`
+request headers, continuing a valid inbound context and otherwise starting its
+own root trace. Trace context is transport metadata, so it adds no field to the
+fixed ADR-0001 body, and a malformed value counts only as missing telemetry
+context, never affecting authentication or synchronization outcomes. Exported
+spans cover PermissionSync's own processing and add no trace-context headers to
+Provider or Target Adapter outbound requests, whose wire contracts belong to
+ADR-0008 and ADR-0009; outbound propagation needs its own review.
 
 ### Non-goals
 
@@ -237,7 +282,12 @@ ADR-0006, OCI image construction details, or CI/CD pipelines.
 
 - **Layered file, environment, and command-line overrides:** rejected because
   precedence and partial overrides make sensitive configuration harder to
-  reason about. One external JSON document provides one inspectable input.
+  reason about. One external YAML document provides one inspectable input.
+
+- **A JSON configuration document:** rejected for the executable configuration
+  because YAML keeps one strict external document while letting operators
+  comment non-obvious deployment choices. JSON remains correct for the
+  unchanged inbound, Provider, and GLPI wire contracts.
 
 - **A hand-written Hyper server:** rejected because it would recreate routing,
   extraction, body-limit, graceful-shutdown, and test-support facilities that
@@ -251,22 +301,31 @@ ADR-0006, OCI image construction details, or CI/CD pipelines.
   transient downstream outages must not remove otherwise functioning replicas
   or cause restart loops. Readiness represents safe caller verification only.
 
+- **Mandatory OTLP export, or none at all:** rejected in both directions. Logs
+  and metrics alone cannot follow one request across stages, while a required
+  exporter would make telemetry infrastructure a synchronization precondition.
+
 - **Dynamic component discovery:** rejected because Provider and Adapter
   composition is explicit and adapters are statically linked. Discovery would
   add hidden configuration, lifecycle, and trust paths.
 
 ## Consequences
 
-PermissionSync has one runtime delivery model and keeps deployment values,
-secrets, and private trust outside the image. Invalid local global
+PermissionSync has one runtime delivery model: a single external YAML file that
+keeps deployment values, secrets, and private trust outside the image and that
+operators can document with comments beside the values they manage. Invalid
+local global
 configuration fails deterministically, while transient authentication metadata
 or downstream outages do not create startup crash loops.
 
 A fixed body limit, bounded inbound admission, one absolute deadline, and
 bounded local concurrency protect the process from unbounded request work.
-Readiness reports authentication safety rather than downstream health. Later
-Kubernetes-focused packaging can supply the external file and probes without
-coupling application semantics to Kubernetes APIs.
+Readiness reports authentication safety rather than downstream health.
+Structured logs and Prometheus metrics stay always available, while optional
+OTLP traces can place PermissionSync inside an OpenTelemetry observability
+pipeline without letting a telemetry backend affect service correctness or
+readiness. Later Kubernetes-focused packaging can supply the external file and
+probes without coupling application semantics to Kubernetes APIs.
 
 ## References
 
@@ -275,5 +334,7 @@ coupling application semantics to Kubernetes APIs.
 - [ADR-0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md)
 - [ADR-0006](0006-runtime-configuration-oci-and-observability.md)
 - [ADR-0007](0007-compile-time-rust-target-adapters.md)
+- [ADR-0008](0008-generic-rest-permission-provider-wire-and-transport-contract.md)
+- [ADR-0009](0009-glpi-target-adapter.md)
 - [ADR-0010](0010-runtime-target-configuration-and-composition-root.md)
 - [ADR index](README.md)

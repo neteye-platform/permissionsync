@@ -311,13 +311,13 @@ least:
 
 A. Reconcile the desired state -> `changed`.
 B. Reconcile the same desired state again -> `unchanged`, with no duplicate or
-   unintended additional effects.
+unintended additional effects.
 C. Simulate a recoverable partial failure after an observable target mutation
-   -> a later legitimate reconciliation observes the current target state,
-   converges to the desired state, and produces no duplicate or unintended
-   additional effect.
+-> a later legitimate reconciliation observes the current target state,
+converges to the desired state, and produces no duplicate or unintended
+additional effect.
 D. Simulate a downstream timeout/cancellation -> the adapter returns within its
-   bounded contract, and no detached or background reconciliation continues.
+bounded contract, and no detached or background reconciliation continues.
 
 These tests use deterministic, hermetic fakes and require no real downstream
 service in PR CI. They assume no automatic caller retry and provide no
