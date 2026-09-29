@@ -131,14 +131,14 @@ the selected Adapter may manufacture a successful selected-target `200` or
 After successful authentication and structural scope validation, the public
 scope-selection outcomes are:
 
-| PermissionSync scope count | Fixed body | Result |
-| --- | --- | --- |
-| 0 | valid | Targetless `204`; no target work |
-| 0 | invalid | `400` |
-| 1, valid suffix | valid | Target path: `200` or Adapter `204` |
-| 1, valid suffix | invalid | `400` |
-| 1, invalid suffix | any | `403` |
-| More than 1 | any | `403` |
+| PermissionSync scope count | Fixed body | Result                              |
+| -------------------------- | ---------- | ----------------------------------- |
+| 0                          | valid      | Targetless `204`; no target work    |
+| 0                          | invalid    | `400`                               |
+| 1, valid suffix            | valid      | Target path: `200` or Adapter `204` |
+| 1, valid suffix            | invalid    | `400`                               |
+| 1, invalid suffix          | any        | `403`                               |
+| More than 1                | any        | `403`                               |
 
 More than one PermissionSync scope plus a malformed body returns `403`, because
 cardinality rejection precedes body validation. Exactly one PermissionSync scope
