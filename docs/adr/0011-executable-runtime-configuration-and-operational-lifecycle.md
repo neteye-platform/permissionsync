@@ -265,11 +265,18 @@ OpenTelemetry-compatible pipeline. Instrumentation stays on `tracing`; enabling
 export connects it to the OpenTelemetry Rust SDK and OTLP exporter instead of
 adding a second instrumentation API.
 
-The optional tracing section configures whether export is enabled, the OTLP
-endpoint, a bounded export timeout, optional static exporter headers where the
-backend requires authentication, and trust material the selected HTTPS endpoint
-requires. Exporter headers and credentials are runtime configuration and never
-appear in logs, metrics, errors, or `Debug` output. Invalid local tracing
+The optional tracing section configures whether export is enabled, one absolute
+HTTPS OTLP endpoint, a bounded export timeout, optional static exporter headers
+where the backend requires authentication, and trust material that endpoint
+requires. Export uses certificate and hostname validation, which must not be
+disabled, and there is no plaintext fallback. The exporter follows no HTTP
+redirect: a `3xx` response is an export failure whose `Location` is not
+requested, so no redirect or remote response can expand the configured trust
+boundary. Configured headers and credentials are sent only to the configured
+endpoint origin, meaning its scheme, host, and effective port, and there is no
+endpoint discovery, redirect allowlist, or same-origin redirect exception.
+Exporter headers and credentials are runtime configuration and never appear in
+logs, metrics, errors, or `Debug` output. Invalid local tracing
 configuration while export is explicitly enabled fails startup as global
 configuration; an unreachable backend afterwards does not.
 
