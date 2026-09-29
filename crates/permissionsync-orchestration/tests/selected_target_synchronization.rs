@@ -489,7 +489,7 @@ fn successful_changed_path_invokes_every_stage_exactly_once() {
     let context = SynchronizationContext::new(not_deadline(), &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
     let outcome = poll_ready(synchronizer.synchronize(request)).unwrap();
 
     assert_eq!(outcome, ReconciliationOutcome::Changed);
@@ -515,7 +515,7 @@ fn separate_identical_submissions_are_independent_attempts_not_retries() {
     let bearer = TechnicalCallerBearerToken::new("bearer-token".to_owned());
     let cancellation = NeverCancelled;
     let deadline = not_deadline();
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
 
     let first_request = SelectedTargetSynchronizationRequest::new(
         &ident,
@@ -561,7 +561,7 @@ fn successful_path_propagates_the_same_context_to_every_stage() {
     let context = SynchronizationContext::new(deadline, &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
     let outcome = poll_ready(synchronizer.synchronize(request)).unwrap();
 
     let capacity_context = capacity.take_context_observation();
@@ -580,7 +580,9 @@ fn successful_path_propagates_the_same_context_to_every_stage() {
 /// 15.2 Successful Unchanged path: Adapter alone determines the outcome.
 #[test]
 fn successful_unchanged_path_returns_exactly_adapter_outcome() {
-    let adapter = FakeAdapter::new(ReconciliationOutcome::Unchanged, false);
+    let external_calls: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+    let mut adapter = FakeAdapter::new(ReconciliationOutcome::Unchanged, false);
+    adapter.external_calls = Some(external_calls);
     let router = one_route_router("target-a", "adapter-a", Box::new(adapter));
     let provider = FakeProvider::new("{\"role\":\"operator\"}", false);
     let capacity = FakeCapacity::new(false);
@@ -592,11 +594,13 @@ fn successful_unchanged_path_returns_exactly_adapter_outcome() {
     let context = SynchronizationContext::new(not_deadline(), &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
     let outcome = poll_ready(synchronizer.synchronize(request)).unwrap();
 
     assert_eq!(outcome, ReconciliationOutcome::Unchanged);
+    assert_eq!(capacity.calls(), 1);
     assert_eq!(provider.calls(), 1);
+    assert_eq!(external_calls.load(Ordering::SeqCst), 1);
 }
 
 /// 15.16 Adapter outcome is authoritative regardless of Provider payload.
@@ -618,7 +622,7 @@ fn adapter_alone_decides_changed_vs_unchanged_for_identical_provider_output() {
         let context = SynchronizationContext::new(not_deadline(), &cancellation);
         let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-        let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+        let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
         let result = poll_ready(synchronizer.synchronize(request)).unwrap();
 
         assert_eq!(result, outcome);
@@ -629,7 +633,6 @@ fn adapter_alone_decides_changed_vs_unchanged_for_identical_provider_output() {
 #[test]
 fn unknown_target_starts_no_downstream_work() {
     let router = TargetRouter::new(Vec::new(), Vec::new()).unwrap();
-    let provider = PanicOnResolve;
     let capacity = PanicOnAcquire;
 
     let target = logical_target("target-x");
@@ -639,7 +642,7 @@ fn unknown_target_starts_no_downstream_work() {
     let context = SynchronizationContext::new(not_deadline(), &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, None, &capacity);
     let error = poll_ready(synchronizer.synchronize(request)).unwrap_err();
 
     assert!(matches!(
@@ -659,7 +662,6 @@ fn recognized_target_with_unavailable_adapter_starts_no_downstream_work() {
         Vec::new(),
     )
     .unwrap();
-    let provider = PanicOnResolve;
     let capacity = PanicOnAcquire;
 
     let target = logical_target("target-b");
@@ -669,7 +671,7 @@ fn recognized_target_with_unavailable_adapter_starts_no_downstream_work() {
     let context = SynchronizationContext::new(not_deadline(), &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, None, &capacity);
     let error = poll_ready(synchronizer.synchronize(request)).unwrap_err();
 
     assert!(matches!(
@@ -679,6 +681,30 @@ fn recognized_target_with_unavailable_adapter_starts_no_downstream_work() {
     for rendered in [error.to_string(), format!("{error:?}")] {
         assert!(!rendered.contains("sensitive-adapter-identifier"));
     }
+}
+
+/// A usable target with no composed Provider fails before capacity acquisition
+/// or Adapter invocation.
+#[test]
+fn unavailable_provider_starts_no_capacity_or_adapter_work() {
+    let adapter = PanicOnReconcile;
+    let router = one_route_router("target-a", "adapter-a", Box::new(adapter));
+    let capacity = PanicOnAcquire;
+
+    let target = logical_target("target-a");
+    let ident = identity("jdoe", &[]);
+    let bearer = TechnicalCallerBearerToken::new("bearer-token".to_owned());
+    let cancellation = NeverCancelled;
+    let context = SynchronizationContext::new(not_deadline(), &cancellation);
+    let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
+
+    let synchronizer = SelectedTargetSynchronizer::new(&router, None, &capacity);
+    let error = poll_ready(synchronizer.synchronize(request)).unwrap_err();
+
+    assert!(matches!(
+        error,
+        SelectedTargetSynchronizationError::ProviderFailed
+    ));
 }
 
 /// 15.5 Capacity failure starts no Provider/Adapter work.
@@ -696,7 +722,7 @@ fn capacity_failure_starts_no_provider_or_adapter_work() {
     let context = SynchronizationContext::new(not_deadline(), &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
     let error = poll_ready(synchronizer.synchronize(request)).unwrap_err();
 
     assert!(matches!(
@@ -721,7 +747,7 @@ fn provider_failure_invokes_no_adapter_and_releases_permit() {
     let context = SynchronizationContext::new(not_deadline(), &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
     let error = poll_ready(synchronizer.synchronize(request)).unwrap_err();
 
     assert!(matches!(
@@ -759,7 +785,7 @@ fn adapter_failure_holds_permit_during_call_and_releases_after_return() {
     let context = SynchronizationContext::new(not_deadline(), &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, capacity_static);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), capacity_static);
     let error = poll_ready(synchronizer.synchronize(request)).unwrap_err();
 
     assert!(matches!(
@@ -794,7 +820,7 @@ fn provider_receives_exact_selected_target_inputs() {
     let context = SynchronizationContext::new(deadline, &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
     let _ = poll_ready(synchronizer.synchronize(request));
 
     let observation = provider.observation.lock().unwrap().take().unwrap();
@@ -836,7 +862,7 @@ fn adapter_receives_the_same_identity_as_provider_independent_of_payload() {
     let context = SynchronizationContext::new(deadline, &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
     let outcome = poll_ready(synchronizer.synchronize(request)).unwrap();
     assert_eq!(outcome, ReconciliationOutcome::Unchanged);
 
@@ -892,7 +918,7 @@ fn envelope_is_forwarded_to_adapter_without_interpretation() {
     let context = SynchronizationContext::new(not_deadline(), &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
     let outcome = poll_ready(synchronizer.synchronize(request)).unwrap();
 
     assert_eq!(outcome, ReconciliationOutcome::Changed);
@@ -919,7 +945,7 @@ fn pre_cancelled_context_starts_no_work() {
     let context = SynchronizationContext::new(not_deadline(), &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
     let error = poll_ready(synchronizer.synchronize(request)).unwrap_err();
 
     assert!(matches!(
@@ -943,7 +969,7 @@ fn already_expired_deadline_starts_no_work() {
     let context = SynchronizationContext::new(expired_deadline(), &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
     let error = poll_ready(synchronizer.synchronize(request)).unwrap_err();
 
     assert!(matches!(
@@ -968,7 +994,7 @@ fn cancellation_between_provider_and_adapter_prevents_adapter_call() {
     let context = SynchronizationContext::new(not_deadline(), flip);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
     let error = poll_ready(synchronizer.synchronize(request)).unwrap_err();
 
     assert!(matches!(
@@ -1001,7 +1027,7 @@ fn cancellation_after_successful_adapter_return_fails_overall_result() {
     let context = SynchronizationContext::new(not_deadline(), flip);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, capacity_static);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), capacity_static);
     let error = poll_ready(synchronizer.synchronize(request)).unwrap_err();
 
     assert!(matches!(
@@ -1044,7 +1070,7 @@ fn errors_do_not_leak_sensitive_downstream_details() {
     let context = SynchronizationContext::new(not_deadline(), &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
     let error = poll_ready(synchronizer.synchronize(request)).unwrap_err();
 
     assert!(matches!(
@@ -1103,7 +1129,7 @@ fn unknown_target_never_activates_capacity() {
     let context = SynchronizationContext::new(not_deadline(), &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
     let _ = poll_ready(synchronizer.synchronize(request));
 
     assert_eq!(capacity.calls(), 0);
@@ -1129,7 +1155,7 @@ fn cancellation_observed_after_routing_starts_no_capacity_work() {
     let context = SynchronizationContext::new(not_deadline(), &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
     let error = poll_ready(synchronizer.synchronize(request)).unwrap_err();
 
     assert!(matches!(
@@ -1159,7 +1185,7 @@ fn cancellation_observed_after_capacity_starts_no_provider_work() {
     let context = SynchronizationContext::new(not_deadline(), &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, &capacity);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
     let error = poll_ready(synchronizer.synchronize(request)).unwrap_err();
 
     assert!(matches!(
@@ -1260,7 +1286,7 @@ fn capacity_permit_remains_active_while_adapter_future_is_pending() {
     let context = SynchronizationContext::new(not_deadline(), &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, capacity_static);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), capacity_static);
     let mut future = Box::pin(synchronizer.synchronize(request));
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
@@ -1308,7 +1334,7 @@ fn dropping_pending_synchronization_drops_adapter_future_and_releases_capacity()
     let context = SynchronizationContext::new(not_deadline(), &cancellation);
     let request = SelectedTargetSynchronizationRequest::new(&ident, &target, &bearer, context);
 
-    let synchronizer = SelectedTargetSynchronizer::new(&router, &provider, capacity_static);
+    let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), capacity_static);
     let mut future = Box::pin(synchronizer.synchronize(request));
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);

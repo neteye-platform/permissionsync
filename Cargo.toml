@@ -32,6 +32,7 @@ publish.workspace = true
 [dependencies]
 permissionsync-adapter-glpi = { path = "crates/permissionsync-adapter-glpi", version = "=0.1.0" }
 permissionsync-core = { path = "crates/permissionsync-core", version = "=0.1.0" }
+permissionsync-orchestration = { path = "crates/permissionsync-orchestration", version = "=0.1.0" }
 permissionsync-provider-generic-rest = { path = "crates/permissionsync-provider-generic-rest", version = "=0.1.0" }
 permissionsync-routing = { path = "crates/permissionsync-routing", version = "=0.1.0" }
 

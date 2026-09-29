@@ -19,15 +19,21 @@ use crate::{
 /// consumes the existing Core ports and the existing [`TargetRouter`].
 pub struct SelectedTargetSynchronizer<'a> {
     router: &'a TargetRouter,
-    provider: &'a dyn PermissionProvider,
+    provider: Option<&'a dyn PermissionProvider>,
     capacity: &'a dyn SynchronizationCapacity,
 }
 
 impl<'a> SelectedTargetSynchronizer<'a> {
-    /// Creates a synchronizer over an existing router, Provider, and capacity port.
+    /// Creates a synchronizer over an existing router, optional Provider, and capacity port.
+    ///
+    /// `None` means no locally usable Permission Provider was supplied to this
+    /// orchestration. Selected-target synchronization then returns
+    /// [`SelectedTargetSynchronizationError::ProviderFailed`] before acquiring
+    /// capacity. This crate owns neither runtime configuration nor composition,
+    /// so it does not interpret why no usable Provider is available.
     pub fn new(
         router: &'a TargetRouter,
-        provider: &'a dyn PermissionProvider,
+        provider: Option<&'a dyn PermissionProvider>,
         capacity: &'a dyn SynchronizationCapacity,
     ) -> Self {
         Self {
@@ -67,6 +73,10 @@ impl<'a> SelectedTargetSynchronizer<'a> {
                 return Err(SelectedTargetSynchronizationError::Cancelled);
             }
 
+            let Some(provider) = self.provider else {
+                return Err(SelectedTargetSynchronizationError::ProviderFailed);
+            };
+
             let _permit = self
                 .capacity
                 .acquire(request.context())
@@ -84,8 +94,7 @@ impl<'a> SelectedTargetSynchronizer<'a> {
                 copy_context(request.context()),
             );
 
-            let desired_state = self
-                .provider
+            let desired_state = provider
                 .resolve(provider_request)
                 .await
                 .map_err(|_| SelectedTargetSynchronizationError::ProviderFailed)?;

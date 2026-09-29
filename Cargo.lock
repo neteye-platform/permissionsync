@@ -946,6 +946,7 @@ version = "0.1.0"
 dependencies = [
  "permissionsync-adapter-glpi",
  "permissionsync-core",
+ "permissionsync-orchestration",
  "permissionsync-provider-generic-rest",
  "permissionsync-routing",
 ]
