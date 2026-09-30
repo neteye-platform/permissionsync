@@ -22,7 +22,10 @@ use axum::{
     Router,
     body::Body,
     extract::State,
-    http::{HeaderMap, Request, Response, StatusCode, header::CONTENT_TYPE},
+    http::{
+        HeaderMap, HeaderValue, Request, Response, StatusCode,
+        header::{CONNECTION, CONTENT_TYPE},
+    },
     routing::{get, post},
 };
 use http_body_util::BodyExt;
@@ -42,7 +45,7 @@ use tracing::{Instrument, Span, field::Empty, info_span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::runtime::{
-    admission::InboundAdmission,
+    admission::{Admission, InboundAdmission},
     capacity::SemaphoreCapacity,
     lifecycle::{Lifecycle, RequestCancellation},
     observability::{
@@ -267,12 +270,26 @@ async fn handle_synchronization(
 
     // Admission precedes body collection, so no body is buffered and no
     // authentication is attempted for a request that was not admitted.
-    let Some(_admitted) = state.admission.admit(deadline, state.lifecycle()).await else {
-        return finish(
-            accepted_at,
-            HttpOutcome::CancelledOrExpired,
-            Stage::Admission,
-        );
+    let _admitted = match state.admission.admit(deadline, state.lifecycle()).await {
+        Admission::Admitted(admitted) => admitted,
+        Admission::NotAdmitted => {
+            return finish(
+                accepted_at,
+                HttpOutcome::CancelledOrExpired,
+                Stage::Admission,
+            );
+        }
+        // The bounded waiting population was full, so this request was refused
+        // without being parked anywhere. Closing the connection turns the
+        // refusal into transport backpressure instead of letting a client keep
+        // a connection to retry on immediately.
+        Admission::RefusedWithoutWaiting => {
+            return close_connection(finish(
+                accepted_at,
+                HttpOutcome::CancelledOrExpired,
+                Stage::Admission,
+            ));
+        }
     };
 
     let collected = collect_body(body, deadline, &cancellation).await;
@@ -333,6 +350,18 @@ fn finish(accepted_at: Instant, outcome: HttpOutcome, stage: Stage) -> Response<
         StatusCode::from_u16(outcome.status_code())
             .expect("every HttpOutcome status is a valid HTTP status code"),
     )
+}
+
+/// Marks a response as the last one on its connection.
+///
+/// The caller-facing status and empty body are unchanged; only the HTTP/1
+/// connection disposition differs, which is what makes saturation pushback
+/// reach the client's transport.
+fn close_connection(mut response: Response<Body>) -> Response<Body> {
+    response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
+    response
 }
 
 fn empty_response(status: StatusCode) -> Response<Body> {

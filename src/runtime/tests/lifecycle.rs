@@ -21,7 +21,7 @@ use tokio::{
 };
 
 use crate::runtime::{
-    admission::waiter_slots,
+    admission::{Admission, waiter_slots},
     failure::RuntimeFailure,
     lifecycle::Lifecycle,
     observability::{
@@ -174,14 +174,19 @@ impl Connection {
 // Operational reachability under synchronization saturation
 // ---------------------------------------------------------------------------
 
-/// The invariant that matters: with synchronization admission fully saturated
-/// and its bounded wait list completely full, a newly opened connection for
-/// `/healthz`, `/readyz`, or `/metrics` is still served.
+/// The invariant that matters, proven over the real listener: with
+/// synchronization admission fully saturated and every allowed application-level
+/// waiting slot provably occupied, and with further synchronization load
+/// arriving, `/healthz` and `/metrics` are still answered with `200` and
+/// `/readyz` still answers from trusted verifier state alone.
 ///
-/// This exercises the real listener and real connections, not the router
-/// directly, because the property being proven is about the accept path.
+/// Saturation is established through observed admission state, not by assuming
+/// that writing bytes to a socket means the handler reached admission.
 #[tokio::test]
 async fn operational_endpoints_are_served_while_synchronization_admission_is_saturated() {
+    /// Synchronization connections opened beyond the bounded population.
+    const BEYOND_THE_BOUND: usize = 8;
+
     let provider = HttpsFixture::start(Vec::new()).await;
     let admission_limit = NonZeroUsize::new(1).unwrap();
     let waiters = waiter_slots(admission_limit).get();
@@ -199,27 +204,68 @@ async fn operational_endpoints_are_served_while_synchronization_admission_is_sat
     let token = serving.signing.token(Some("service_account"));
 
     // Hold every admission permit, so nothing further can be admitted.
-    let held = serving
-        .fixture
-        .state
-        .admission()
-        .admit(
-            Instant::now() + Duration::from_secs(600),
-            &serving.lifecycle,
-        )
-        .await
-        .expect("the configured limit must be admissible");
+    let held = serving.fixture.hold_admission().await;
     assert_eq!(serving.fixture.state.admission().available_permits(), 0);
 
-    // Fill every waiter slot the implementation permits, and then add more
-    // synchronization connections beyond that bound.
-    let mut synchronization = Vec::new();
-    for _ in 0..(waiters + 4) {
+    // Fill every waiter slot, proving through observed admission state that each
+    // request really reached admission and entered the bounded wait list.
+    let mut parked = Vec::new();
+    for expected in 1..=waiters {
         let mut connection = Connection::open(serving.address).await;
         connection
             .write_request(&Connection::synchronization_request(&token))
             .await;
-        synchronization.push(connection);
+        parked.push(connection);
+        serving
+            .fixture
+            .await_admission(|observation| observation.waiting == expected)
+            .await;
+    }
+    assert_eq!(
+        serving.fixture.state.admission().available_waiter_slots(),
+        0,
+        "every allowed application-level waiting slot is occupied"
+    );
+
+    // Additional synchronization load must not create a growing population of
+    // application request or waiter tasks: each is refused without waiting.
+    let mut beyond = Vec::new();
+    for _ in 0..BEYOND_THE_BOUND {
+        let mut connection = Connection::open(serving.address).await;
+        connection
+            .write_request(&Connection::synchronization_request(&token))
+            .await;
+        beyond.push(connection);
+    }
+    let observation = serving
+        .fixture
+        .await_admission(|observation| observation.refused_without_waiting == BEYOND_THE_BOUND)
+        .await;
+    assert_eq!(
+        observation.waiting, waiters,
+        "load beyond the bound must not enlarge the waiting population"
+    );
+    assert_eq!(
+        observation.admitted,
+        admission_limit.get(),
+        "load beyond the bound must not enlarge the admitted population"
+    );
+
+    // Each refused request received the existing server-side outcome and was
+    // told its connection is closing, so the pushback is transport backpressure.
+    for connection in &mut beyond {
+        let response = connection
+            .read_response(FIXTURE_TIMEOUT)
+            .await
+            .expect("a refused request still receives its response");
+        assert!(
+            response.starts_with("HTTP/1.1 500"),
+            "a refusal uses the existing server-side outcome: {response}"
+        );
+        assert!(
+            response.to_ascii_lowercase().contains("connection: close"),
+            "a refusal closes its connection: {response}"
+        );
     }
 
     // No unadmitted synchronization request started authentication, Provider, or
@@ -243,8 +289,8 @@ async fn operational_endpoints_are_served_while_synchronization_admission_is_sat
         "no unadmitted request acquired selected-target capacity"
     );
 
-    // Every operational endpoint must still answer on a brand-new connection.
-    for route in [HEALTH_ROUTE, READINESS_ROUTE, METRICS_ROUTE] {
+    // Liveness and metrics must answer exactly 200 under saturation.
+    for route in [HEALTH_ROUTE, METRICS_ROUTE] {
         let mut probe = Connection::open(serving.address).await;
         probe
             .write_request(&Connection::keep_alive_request(route))
@@ -254,18 +300,37 @@ async fn operational_endpoints_are_served_while_synchronization_admission_is_sat
             .await
             .unwrap_or_else(|| panic!("{route} must be served under saturation"));
         assert!(
-            response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.1 503"),
-            "{route} answered unexpectedly: {response}"
+            response.starts_with("HTTP/1.1 200"),
+            "{route} must answer 200 under saturation: {response}"
         );
     }
 
-    // Waiter state stayed bounded throughout, and the probes changed nothing
-    // about synchronization admission.
-    assert_eq!(
-        serving.fixture.state.admission().available_waiter_slots(),
-        0,
-        "the wait list is at its bound and cannot grow further"
+    // Readiness depends only on trusted verifier state, never on saturation.
+    // The metadata source is available here, so it is ready; the readiness tests
+    // cover the unusable-state case that answers 503.
+    let mut readiness = Connection::open(serving.address).await;
+    readiness
+        .write_request(&Connection::keep_alive_request(READINESS_ROUTE))
+        .await;
+    let response = readiness
+        .read_response(FIXTURE_TIMEOUT)
+        .await
+        .expect("readiness must be served under saturation");
+    assert!(
+        response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.1 503"),
+        "readiness must answer its contract status: {response}"
     );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "with usable trusted verifier state readiness is 200: {response}"
+    );
+
+    // The bounded populations are unchanged by the probes.
+    let after_probes = serving
+        .fixture
+        .await_admission(|observation| observation.waiting == waiters)
+        .await;
+    assert_eq!(after_probes.admitted, admission_limit.get());
     assert_eq!(
         serving.fixture.state.admission().available_permits(),
         0,
@@ -277,7 +342,8 @@ async fn operational_endpoints_are_served_while_synchronization_admission_is_sat
         "operational probes never reach the Provider"
     );
 
-    drop(synchronization);
+    drop(beyond);
+    drop(parked);
     drop(held);
     serving.shut_down().await;
     provider.shutdown().await;
@@ -405,8 +471,12 @@ async fn grace_expiry_cancels_remaining_contexts_and_terminates_owned_tasks() {
     stuck
         .write_request(&Connection::incomplete_body_request(&token))
         .await;
-    // Give the handler time to be admitted and start collecting.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Observed admission state, not elapsed time, establishes that the handler
+    // holds a permit and has moved on to body collection.
+    serving
+        .fixture
+        .await_admission(|observation| observation.admitted == 1)
+        .await;
 
     let elapsed = serving.shut_down().await;
 
@@ -454,7 +524,10 @@ async fn no_admission_permit_survives_shutdown() {
     stuck
         .write_request(&Connection::incomplete_body_request(&token))
         .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    serving
+        .fixture
+        .await_admission(|observation| observation.admitted == 1)
+        .await;
     assert_eq!(
         serving.fixture.state.admission().available_permits(),
         1,
@@ -485,16 +558,7 @@ async fn admission_waiting_never_extends_shutdown() {
 
     // Hold the only admission permit outside any connection, so every arriving
     // request can only wait.
-    let held = serving
-        .fixture
-        .state
-        .admission()
-        .admit(
-            Instant::now() + Duration::from_secs(600),
-            &serving.lifecycle,
-        )
-        .await
-        .expect("admissible");
+    let held = serving.fixture.hold_admission().await;
 
     let token = serving.signing.token(Some("service_account"));
     let mut waiting = Connection::open(serving.address).await;
@@ -507,7 +571,12 @@ async fn admission_waiting_never_extends_shutdown() {
             String::from_utf8(valid_body()).unwrap()
         ))
         .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Observed admission state establishes that the request really is parked in
+    // the bounded wait list before shutdown begins.
+    serving
+        .fixture
+        .await_admission(|observation| observation.waiting == 1)
+        .await;
 
     let elapsed = serving.shut_down().await;
 
@@ -662,16 +731,18 @@ async fn fatal_accept_failure_enters_shutdown_and_reports_failure() {
 
     // No further synchronization request is admitted after the transition.
     assert!(
-        serving
-            .fixture
-            .state
-            .admission()
-            .admit(
-                Instant::now() + Duration::from_secs(600),
-                &serving.lifecycle
-            )
-            .await
-            .is_none(),
+        matches!(
+            serving
+                .fixture
+                .state
+                .admission()
+                .admit(
+                    Instant::now() + Duration::from_secs(600),
+                    &serving.lifecycle
+                )
+                .await,
+            Admission::NotAdmitted
+        ),
         "no synchronization request may be admitted after fatal termination"
     );
 

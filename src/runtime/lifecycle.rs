@@ -95,11 +95,29 @@ impl CancellationSignal for RequestCancellation<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        future::{Future, poll_fn},
+        pin::Pin,
+        task::Poll,
+        time::Duration,
+    };
 
     use permissionsync_core::CancellationSignal;
 
     use super::{Lifecycle, RequestCancellation};
+
+    /// A bound that only fires when the implementation is wrong; it never
+    /// establishes ordering.
+    const DEADLOCK_BOUND: Duration = Duration::from_secs(10);
+
+    /// Polls a future exactly once, so a test can register a waiter
+    /// deterministically instead of assuming the scheduler ran a spawned task.
+    async fn poll_once<F>(future: &mut Pin<Box<F>>) -> Poll<F::Output>
+    where
+        F: Future,
+    {
+        poll_fn(|context| Poll::Ready(future.as_mut().poll(context))).await
+    }
 
     #[test]
     fn a_new_lifecycle_is_serving_and_uncancelled() {
@@ -126,22 +144,25 @@ mod tests {
         assert!(RequestCancellation::new(&lifecycle).is_cancelled());
     }
 
+    /// A waiter that registered before shutdown began must still be woken.
+    ///
+    /// Polling the waiter once registers it deterministically, so the ordering
+    /// this test depends on is established by the poll rather than by giving the
+    /// scheduler a chance to run a spawned task.
     #[tokio::test]
     async fn shutdown_started_resolves_for_a_waiter_registered_first() {
-        let lifecycle = Arc::new(Lifecycle::new());
-        let waiting = {
-            let lifecycle = Arc::clone(&lifecycle);
-            tokio::spawn(async move { lifecycle.shutdown_started().await })
-        };
+        let lifecycle = Lifecycle::new();
+        let mut waiting = Box::pin(lifecycle.shutdown_started());
 
-        // Yield so the waiter is registered, then start shutdown.
-        tokio::task::yield_now().await;
+        assert!(
+            poll_once(&mut waiting).await.is_pending(),
+            "the waiter must register and not be ready before shutdown begins"
+        );
         lifecycle.begin_shutdown();
 
-        tokio::time::timeout(Duration::from_secs(5), waiting)
+        tokio::time::timeout(DEADLOCK_BOUND, waiting)
             .await
-            .expect("waiter must be woken")
-            .expect("waiter task must not panic");
+            .expect("waiter must be woken");
     }
 
     #[tokio::test]
@@ -149,30 +170,31 @@ mod tests {
         let lifecycle = Lifecycle::new();
         lifecycle.begin_shutdown();
 
-        tokio::time::timeout(Duration::from_secs(5), lifecycle.shutdown_started())
-            .await
-            .expect("an already-shut-down lifecycle must resolve immediately");
+        let mut waiting = Box::pin(lifecycle.shutdown_started());
+        assert!(
+            poll_once(&mut waiting).await.is_ready(),
+            "an already-shut-down lifecycle must resolve on its first poll"
+        );
     }
 
     #[tokio::test]
     async fn many_waiters_are_all_released_by_one_shutdown() {
-        let lifecycle = Arc::new(Lifecycle::new());
-        let mut waiters = Vec::new();
-        for _ in 0..16 {
-            let lifecycle = Arc::clone(&lifecycle);
-            waiters.push(tokio::spawn(
-                async move { lifecycle.shutdown_started().await },
-            ));
-        }
+        let lifecycle = Lifecycle::new();
+        let mut waiters: Vec<_> = (0..16)
+            .map(|_| Box::pin(lifecycle.shutdown_started()))
+            .collect();
 
-        tokio::task::yield_now().await;
+        // Every waiter is registered by an explicit poll, so all of them are
+        // provably in the notify list before shutdown begins.
+        for waiter in &mut waiters {
+            assert!(poll_once(waiter).await.is_pending());
+        }
         lifecycle.begin_shutdown();
 
         for waiter in waiters {
-            tokio::time::timeout(Duration::from_secs(5), waiter)
+            tokio::time::timeout(DEADLOCK_BOUND, waiter)
                 .await
-                .expect("every waiter must be released")
-                .expect("waiter task must not panic");
+                .expect("every waiter must be released");
         }
     }
 }

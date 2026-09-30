@@ -212,16 +212,7 @@ async fn readiness_answers_while_synchronization_is_saturated() {
     })
     .await;
 
-    let held = scenario
-        .fixture
-        .state
-        .admission()
-        .admit(
-            std::time::Instant::now() + Duration::from_secs(600),
-            &scenario.fixture.lifecycle,
-        )
-        .await
-        .expect("the configured limit must be admissible");
+    let held = scenario.fixture.hold_admission().await;
     assert_eq!(scenario.fixture.state.admission().available_permits(), 0);
 
     assert_eq!(scenario.readiness().await, StatusCode::OK);

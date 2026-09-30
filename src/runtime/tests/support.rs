@@ -59,7 +59,7 @@ use tokio_native_tls::TlsAcceptor;
 use tower::ServiceExt;
 
 use crate::runtime::{
-    admission::InboundAdmission,
+    admission::{Admission, AdmissionObservation, AdmittedRequest, InboundAdmission},
     capacity::SemaphoreCapacity,
     lifecycle::Lifecycle,
     transport::{RuntimeState, router},
@@ -650,6 +650,50 @@ impl RuntimeFixture {
     /// Renders the Prometheus text exposition.
     pub(super) fn rendered_metrics(&self) -> String {
         self.handle.render()
+    }
+
+    /// Holds one admission permit for as long as the returned guard lives.
+    pub(super) async fn hold_admission(&self) -> AdmittedRequest {
+        let deadline = std::time::Instant::now() + Duration::from_secs(600);
+        match self
+            .state
+            .admission()
+            .admit(deadline, &self.lifecycle)
+            .await
+        {
+            Admission::Admitted(admitted) => admitted,
+            Admission::NotAdmitted | Admission::RefusedWithoutWaiting => {
+                panic!("the configured admission limit must be admissible")
+            }
+        }
+    }
+
+    /// Fills every admission permit and returns the held guards.
+    pub(super) async fn saturate_admission(&self) -> Vec<AdmittedRequest> {
+        let limit = self.state.admission().limit().get();
+        let mut held = Vec::with_capacity(limit);
+        for _ in 0..limit {
+            held.push(self.hold_admission().await);
+        }
+        assert_eq!(self.state.admission().available_permits(), 0);
+        held
+    }
+
+    /// Waits until the bounded admission populations reach an expected shape.
+    ///
+    /// This is the synchronization mechanism the tests rely on: it observes real
+    /// admission state rather than assuming any scheduling order. The timeout is
+    /// only a deadlock guard and never establishes ordering.
+    pub(super) async fn await_admission(
+        &self,
+        expected: impl FnMut(&AdmissionObservation) -> bool,
+    ) -> AdmissionObservation {
+        let mut observation = self.state.admission().observe();
+        let reached = timeout(FIXTURE_TIMEOUT, observation.wait_for(expected))
+            .await
+            .expect("the expected admission state must be reached")
+            .expect("the observation channel stays open");
+        *reached
     }
 
     /// Calls the router directly, with no socket involved.

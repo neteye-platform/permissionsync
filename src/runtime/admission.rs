@@ -7,43 +7,53 @@
 //! buffering and concurrent pre-selected-target work such as authentication
 //! and validation.
 //!
-//! # How application-owned waiter state stays bounded
+//! # The bound on application-owned synchronization waiting state
 //!
-//! A permit count alone would not bound waiter state: without a second bound,
-//! an unlimited number of served connections could each park one request task
-//! in the permit semaphore's wait list. Admission therefore owns two bounds:
+//! Two semaphores together define one finite population, and a synchronization
+//! request is only ever allowed to wait inside it:
 //!
 //! - `permits` bounds admitted synchronization requests to the configured
 //!   `inbound_admission_limit`;
 //! - `waiters` bounds how many further synchronization requests may be parked
-//!   in that wait list at once, to [`waiter_slots`], which is derived from the
-//!   same configured limit.
+//!   in the `permits` wait list, to [`waiter_slots`], derived from the same
+//!   configured limit.
 //!
-//! A waiter slot is taken without waiting. A request that obtains one parks on
-//! `permits`, bounded by its own absolute deadline. A request that does not
-//! obtain one is never enqueued at all: it waits only on its own absolute
-//! deadline and on shutdown, so the wait list can never grow past its bound and
-//! no second queue of queued requests appears anywhere.
+//! Both slots are taken without waiting. A request that obtains a waiter slot
+//! parks on `permits` and is woken as soon as a permit frees, so a legitimate
+//! waiter can still proceed inside its own budget.
 //!
-//! Total application-owned synchronization request state is therefore at most
-//! `inbound_admission_limit + waiter_slots(inbound_admission_limit)`, and at
-//! most `inbound_admission_limit` bodies can be buffered. Saturation adds no
-//! caller-facing status: a wait that outlives the request's own deadline ends
-//! through the existing server-side deadline path.
+//! A request that obtains neither is refused immediately. It is never parked,
+//! never sleeps to its deadline, and never occupies any other application
+//! waiting area, so saturation cannot create a second population outside these
+//! two bounds. The refusal ends through the existing server-side deadline and
+//! cancellation semantics and adds no caller-facing status, and the transport
+//! closes that connection so the pushback reaches the client's transport rather
+//! than accumulating as application state.
 //!
-//! # Why operational endpoints stay observable
+//! The complete invariant is therefore: at any instant the number of
+//! synchronization requests that are admitted or waiting anywhere in this
+//! process is at most `inbound_admission_limit +
+//! waiter_slots(inbound_admission_limit)`, and at most
+//! `inbound_admission_limit` request bodies can be buffered. That bound does
+//! not depend on how many connections are open, because a request that cannot
+//! join the population does not wait at all.
+//!
+//! # Why operational endpoints cannot be starved
 //!
 //! `GET /healthz`, `GET /readyz`, and `GET /metrics` take neither a permit nor
-//! a waiter slot, and the accept loop gates no connection behind either
-//! semaphore. Nothing a saturated synchronization workload holds can therefore
-//! keep an operational request from being accepted and answered. That property
-//! is structural rather than a reserved share of a shared connection budget: a
-//! shared budget cannot be reserved for a class of request that is only
-//! identifiable after the request head has been read.
+//! a waiter slot, and no connection is gated behind either semaphore. Nothing a
+//! saturated synchronization workload holds is on their path, and a refused
+//! synchronization request releases its connection immediately instead of
+//! holding one. That reservation is structural rather than a share of a shared
+//! connection budget, which could not work here: a request's class is only
+//! known after its head has been read, so a budget taken at accept time cannot
+//! be reserved for a class of request that has not been identified yet.
 
 use std::{num::NonZeroUsize, sync::Arc, time::Instant};
 
 use metrics::{counter, gauge};
+#[cfg(test)]
+use tokio::sync::watch;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{Instant as TokioInstant, sleep_until},
@@ -52,7 +62,7 @@ use tokio::{
 use crate::runtime::{
     lifecycle::Lifecycle,
     observability::{
-        ADMISSION_ABANDONED_TOTAL, ADMISSION_QUEUE_FULL_TOTAL, ADMISSION_SATURATED_TOTAL,
+        ADMISSION_ABANDONED_TOTAL, ADMISSION_REFUSED_TOTAL, ADMISSION_SATURATED_TOTAL,
         ADMISSION_WAITERS, REQUESTS_IN_FLIGHT,
     },
 };
@@ -98,6 +108,20 @@ pub(crate) fn max_inbound_admission_limit() -> NonZeroUsize {
     NonZeroUsize::new(Semaphore::MAX_PERMITS).expect("MAX_PERMITS is positive")
 }
 
+/// The result of one admission attempt.
+#[must_use]
+pub(crate) enum Admission {
+    /// The request was admitted. The permit is held for its complete handling.
+    Admitted(AdmittedRequest),
+    /// The request waited inside the bounded population within its own budget
+    /// and was not admitted, or shutdown released its wait.
+    NotAdmitted,
+    /// The bounded population was already full, so the request was refused
+    /// without ever being parked. The transport closes the connection, so the
+    /// pushback is transport backpressure rather than application state.
+    RefusedWithoutWaiting,
+}
+
 /// The bounded process-wide inbound admission limit.
 pub(crate) struct InboundAdmission {
     permits: Arc<Semaphore>,
@@ -108,6 +132,9 @@ pub(crate) struct InboundAdmission {
     /// authoritative bounds at runtime.
     #[cfg(test)]
     limit: NonZeroUsize,
+    /// Test-only structural observation of the bounded populations.
+    #[cfg(test)]
+    observer: Observer,
 }
 
 impl InboundAdmission {
@@ -124,6 +151,8 @@ impl InboundAdmission {
             waiters: Arc::new(Semaphore::new(waiting)),
             #[cfg(test)]
             limit,
+            #[cfg(test)]
+            observer: Observer::new(),
         })
     }
 
@@ -145,6 +174,15 @@ impl InboundAdmission {
         self.waiters.available_permits()
     }
 
+    /// Subscribes to the test-only observation of the bounded populations.
+    ///
+    /// Tests use this to establish, structurally rather than by timing, that a
+    /// request has actually reached admission and which population it entered.
+    #[cfg(test)]
+    pub(crate) fn observe(&self) -> watch::Receiver<AdmissionObservation> {
+        self.observer.subscribe()
+    }
+
     /// Admits one synchronization request, or reports that it was not admitted.
     ///
     /// Waiting is bounded by the request's own absolute `deadline`; it creates
@@ -161,52 +199,63 @@ impl InboundAdmission {
     /// Dropping the returned future removes the waiter, releases its waiter
     /// slot, and returns any permit already assigned to it, so an abandoned
     /// admission owns nothing.
-    pub(crate) async fn admit(
-        &self,
-        deadline: Instant,
-        lifecycle: &Lifecycle,
-    ) -> Option<AdmittedRequest> {
+    pub(crate) async fn admit(&self, deadline: Instant, lifecycle: &Lifecycle) -> Admission {
         if lifecycle.is_shutting_down() || Instant::now() >= deadline {
             counter!(ADMISSION_ABANDONED_TOTAL).increment(1);
-            return None;
+            return Admission::NotAdmitted;
         }
 
         let permits = Arc::clone(&self.permits);
         if let Ok(permit) = permits.clone().try_acquire_owned() {
-            return Some(AdmittedRequest::new(permit));
+            return Admission::Admitted(self.admitted(permit));
         }
 
         counter!(ADMISSION_SATURATED_TOTAL).increment(1);
-        let admitted = match Arc::clone(&self.waiters).try_acquire_owned() {
-            // A bounded place in the wait list: park until a permit frees, the
-            // request's own deadline expires, or shutdown releases the wait.
-            Ok(waiter_slot) => {
-                let _waiting = WaitingGuard::new();
-                let admitted = tokio::select! {
-                    biased;
-                    () = lifecycle.shutdown_started() => None,
-                    permit = permits.acquire_owned() => permit.ok().map(AdmittedRequest::new),
-                    () = sleep_until(TokioInstant::from_std(deadline)) => None,
-                };
-                drop(waiter_slot);
-                admitted
-            }
-            // The wait list is already at its bound. Do not enqueue: wait only
-            // on this request's own budget, so no queue can grow past it.
-            Err(_) => {
-                counter!(ADMISSION_QUEUE_FULL_TOTAL).increment(1);
-                tokio::select! {
-                    biased;
-                    () = lifecycle.shutdown_started() => {}
-                    () = sleep_until(TokioInstant::from_std(deadline)) => {}
-                }
-                None
-            }
-        };
-        if admitted.is_none() {
+        let Ok(waiter_slot) = Arc::clone(&self.waiters).try_acquire_owned() else {
+            // The bounded population is full. Refuse now rather than parking
+            // this request anywhere: parking it outside the population is
+            // exactly the unbounded waiting area the bound exists to prevent.
+            counter!(ADMISSION_REFUSED_TOTAL).increment(1);
             counter!(ADMISSION_ABANDONED_TOTAL).increment(1);
+            #[cfg(test)]
+            self.observer.refused_without_waiting();
+            return Admission::RefusedWithoutWaiting;
+        };
+
+        // Inside the bounded population: park until a permit frees, this
+        // request's own deadline expires, or shutdown releases the wait.
+        let waiting = self.waiting();
+        let admitted = tokio::select! {
+            biased;
+            () = lifecycle.shutdown_started() => None,
+            permit = permits.acquire_owned() => permit.ok(),
+            () = sleep_until(TokioInstant::from_std(deadline)) => None,
+        };
+        drop(waiting);
+        drop(waiter_slot);
+
+        match admitted {
+            Some(permit) => Admission::Admitted(self.admitted(permit)),
+            None => {
+                counter!(ADMISSION_ABANDONED_TOTAL).increment(1);
+                Admission::NotAdmitted
+            }
         }
-        admitted
+    }
+
+    fn admitted(&self, permit: OwnedSemaphorePermit) -> AdmittedRequest {
+        AdmittedRequest::new(
+            permit,
+            #[cfg(test)]
+            self.observer.clone(),
+        )
+    }
+
+    fn waiting(&self) -> WaitingGuard {
+        WaitingGuard::new(
+            #[cfg(test)]
+            self.observer.clone(),
+        )
     }
 }
 
@@ -217,35 +266,109 @@ impl InboundAdmission {
 /// request that owns it.
 pub(crate) struct AdmittedRequest {
     _permit: OwnedSemaphorePermit,
+    #[cfg(test)]
+    observer: Observer,
 }
 
 impl AdmittedRequest {
-    fn new(permit: OwnedSemaphorePermit) -> Self {
+    fn new(permit: OwnedSemaphorePermit, #[cfg(test)] observer: Observer) -> Self {
         gauge!(REQUESTS_IN_FLIGHT).increment(1.0);
-        Self { _permit: permit }
+        #[cfg(test)]
+        observer.enter_admitted();
+        Self {
+            _permit: permit,
+            #[cfg(test)]
+            observer,
+        }
     }
 }
 
 impl Drop for AdmittedRequest {
     fn drop(&mut self) {
         gauge!(REQUESTS_IN_FLIGHT).decrement(1.0);
+        #[cfg(test)]
+        self.observer.leave_admitted();
     }
 }
 
 /// Keeps the admission-waiter gauge exact on every exit path, including a
 /// dropped request future.
-struct WaitingGuard;
+struct WaitingGuard {
+    #[cfg(test)]
+    observer: Observer,
+}
 
 impl WaitingGuard {
-    fn new() -> Self {
+    fn new(#[cfg(test)] observer: Observer) -> Self {
         gauge!(ADMISSION_WAITERS).increment(1.0);
-        Self
+        #[cfg(test)]
+        observer.enter_waiting();
+        Self {
+            #[cfg(test)]
+            observer,
+        }
     }
 }
 
 impl Drop for WaitingGuard {
     fn drop(&mut self) {
         gauge!(ADMISSION_WAITERS).decrement(1.0);
+        #[cfg(test)]
+        self.observer.leave_waiting();
+    }
+}
+
+/// Test-only structural observation of the bounded admission populations.
+///
+/// It exists so tests can prove that a request actually reached admission and
+/// which population it entered, instead of inferring it from timing. It is
+/// compiled only for tests and is never part of a release artifact.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AdmissionObservation {
+    /// Requests currently holding an admission permit.
+    pub(crate) admitted: usize,
+    /// Requests currently parked in the bounded wait list.
+    pub(crate) waiting: usize,
+    /// Requests refused because the bounded population was already full.
+    pub(crate) refused_without_waiting: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct Observer(Arc<watch::Sender<AdmissionObservation>>);
+
+#[cfg(test)]
+impl Observer {
+    fn new() -> Self {
+        Self(Arc::new(
+            watch::Sender::new(AdmissionObservation::default()),
+        ))
+    }
+
+    fn subscribe(&self) -> watch::Receiver<AdmissionObservation> {
+        self.0.subscribe()
+    }
+
+    fn enter_admitted(&self) {
+        self.0.send_modify(|observation| observation.admitted += 1);
+    }
+
+    fn leave_admitted(&self) {
+        self.0.send_modify(|observation| observation.admitted -= 1);
+    }
+
+    fn enter_waiting(&self) {
+        self.0.send_modify(|observation| observation.waiting += 1);
+    }
+
+    fn leave_waiting(&self) {
+        self.0.send_modify(|observation| observation.waiting -= 1);
+    }
+
+    fn refused_without_waiting(&self) {
+        self.0
+            .send_modify(|observation| observation.refused_without_waiting += 1);
     }
 }
 
@@ -260,9 +383,14 @@ mod tests {
     use tokio::sync::Semaphore;
 
     use super::{
-        InboundAdmission, derived_semaphore_sizes, max_inbound_admission_limit, waiter_slots,
+        Admission, AdmissionObservation, AdmittedRequest, InboundAdmission,
+        derived_semaphore_sizes, max_inbound_admission_limit, waiter_slots,
     };
     use crate::runtime::lifecycle::Lifecycle;
+
+    /// A bound that only ever fires when the implementation is wrong; it never
+    /// establishes ordering, which the observation channel does.
+    const DEADLOCK_BOUND: Duration = Duration::from_secs(10);
 
     fn nonzero(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).expect("test values are positive")
@@ -274,6 +402,32 @@ mod tests {
 
     fn far_future() -> Instant {
         Instant::now() + Duration::from_secs(3600)
+    }
+
+    /// Admits one request, requiring success.
+    async fn admit(admission: &InboundAdmission, lifecycle: &Lifecycle) -> AdmittedRequest {
+        match admission.admit(far_future(), lifecycle).await {
+            Admission::Admitted(admitted) => admitted,
+            Admission::NotAdmitted | Admission::RefusedWithoutWaiting => {
+                panic!("the configured limit must be admissible")
+            }
+        }
+    }
+
+    /// Waits until the bounded populations reach an expected shape.
+    ///
+    /// This is the synchronization mechanism the tests rely on: it observes real
+    /// admission state rather than assuming a scheduling order.
+    async fn await_observation(
+        admission: &InboundAdmission,
+        expected: impl FnMut(&AdmissionObservation) -> bool,
+    ) -> AdmissionObservation {
+        let mut observation = admission.observe();
+        let reached = tokio::time::timeout(DEADLOCK_BOUND, observation.wait_for(expected))
+            .await
+            .expect("the expected admission state must be reached")
+            .expect("the observation channel stays open");
+        *reached
     }
 
     /// The wait list is bounded by a value derived from the configured limit, so
@@ -332,24 +486,102 @@ mod tests {
         let admission = admission(2);
         let lifecycle = Lifecycle::new();
 
-        let first = admission
-            .admit(far_future(), &lifecycle)
-            .await
-            .expect("first");
-        let second = admission
-            .admit(far_future(), &lifecycle)
-            .await
-            .expect("second");
+        let first = admit(&admission, &lifecycle).await;
+        let second = admit(&admission, &lifecycle).await;
         assert_eq!(admission.available_permits(), 0);
 
         let third = admission
             .admit(Instant::now() + Duration::from_millis(20), &lifecycle)
             .await;
-        assert!(third.is_none(), "a third request must not be admitted");
+        assert!(
+            matches!(third, Admission::NotAdmitted),
+            "a third request must not be admitted"
+        );
 
         drop(first);
         drop(second);
         assert_eq!(admission.available_permits(), 2);
+    }
+
+    /// Once both bounded populations are full, a further request is refused
+    /// immediately instead of parking anywhere, and it says so, so the transport
+    /// can turn the refusal into transport backpressure.
+    #[tokio::test]
+    async fn a_request_beyond_the_bounded_population_is_refused_without_waiting() {
+        let admission = Arc::new(admission(1));
+        let lifecycle = Arc::new(Lifecycle::new());
+        let held = admit(&admission, &lifecycle).await;
+
+        // Occupy the single waiter slot, and prove structurally that the waiting
+        // request really is parked in the bounded population.
+        let waiting = {
+            let admission = Arc::clone(&admission);
+            let lifecycle = Arc::clone(&lifecycle);
+            tokio::spawn(async move {
+                matches!(
+                    admission.admit(far_future(), &lifecycle).await,
+                    Admission::Admitted(_)
+                )
+            })
+        };
+        await_observation(&admission, |observation| observation.waiting == 1).await;
+
+        // A further request must be refused immediately: it never becomes a
+        // waiter and never sleeps to its deadline.
+        for _ in 0..8 {
+            let refused = admission.admit(far_future(), &lifecycle).await;
+            assert!(
+                matches!(refused, Admission::RefusedWithoutWaiting),
+                "a request beyond the bounded population must be refused"
+            );
+        }
+        let observation = await_observation(&admission, |observation| {
+            observation.refused_without_waiting == 8
+        })
+        .await;
+        assert_eq!(
+            observation.waiting, 1,
+            "refused requests must not enlarge the waiting population"
+        );
+        assert_eq!(observation.admitted, 1);
+
+        // The legitimate waiter still proceeds once the permit frees.
+        drop(held);
+        assert!(
+            tokio::time::timeout(DEADLOCK_BOUND, waiting)
+                .await
+                .expect("the waiter must be woken by the freed permit")
+                .expect("waiter task must not panic"),
+            "a waiting request proceeds when capacity becomes available"
+        );
+        assert_eq!(admission.available_permits(), 1);
+        assert_eq!(admission.available_waiter_slots(), 1);
+    }
+
+    /// A refusal must never consume a permit or a waiter slot.
+    #[tokio::test]
+    async fn a_refused_request_holds_nothing() {
+        let admission = Arc::new(admission(1));
+        let lifecycle = Arc::new(Lifecycle::new());
+        let held = admit(&admission, &lifecycle).await;
+
+        let waiting = {
+            let admission = Arc::clone(&admission);
+            let lifecycle = Arc::clone(&lifecycle);
+            tokio::spawn(async move { admission.admit(far_future(), &lifecycle).await })
+        };
+        await_observation(&admission, |observation| observation.waiting == 1).await;
+
+        assert!(matches!(
+            admission.admit(far_future(), &lifecycle).await,
+            Admission::RefusedWithoutWaiting
+        ));
+        assert_eq!(admission.available_permits(), 0);
+        assert_eq!(admission.available_waiter_slots(), 0);
+
+        drop(held);
+        let _ = tokio::time::timeout(DEADLOCK_BOUND, waiting).await;
+        assert_eq!(admission.available_waiter_slots(), 1);
     }
 
     /// An admission wait consumes the request's own budget and nothing more.
@@ -357,13 +589,13 @@ mod tests {
     async fn a_saturated_wait_ends_at_the_request_deadline() {
         let admission = admission(1);
         let lifecycle = Lifecycle::new();
-        let held = admission
-            .admit(far_future(), &lifecycle)
-            .await
-            .expect("held");
+        let held = admit(&admission, &lifecycle).await;
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        assert!(admission.admit(deadline, &lifecycle).await.is_none());
+        assert!(matches!(
+            admission.admit(deadline, &lifecycle).await,
+            Admission::NotAdmitted
+        ));
 
         drop(held);
         assert_eq!(admission.available_permits(), 1);
@@ -374,12 +606,12 @@ mod tests {
         let admission = admission(1);
         let lifecycle = Lifecycle::new();
 
-        assert!(
+        assert!(matches!(
             admission
                 .admit(Instant::now() - Duration::from_secs(1), &lifecycle)
-                .await
-                .is_none()
-        );
+                .await,
+            Admission::NotAdmitted
+        ));
         assert_eq!(admission.available_permits(), 1);
     }
 
@@ -389,7 +621,10 @@ mod tests {
         let lifecycle = Lifecycle::new();
         lifecycle.begin_shutdown();
 
-        assert!(admission.admit(far_future(), &lifecycle).await.is_none());
+        assert!(matches!(
+            admission.admit(far_future(), &lifecycle).await,
+            Admission::NotAdmitted
+        ));
         assert_eq!(admission.available_permits(), 1);
     }
 
@@ -399,20 +634,24 @@ mod tests {
     async fn shutdown_releases_a_pending_admission_wait() {
         let admission = Arc::new(admission(1));
         let lifecycle = Arc::new(Lifecycle::new());
-        let held = admission
-            .admit(far_future(), &lifecycle)
-            .await
-            .expect("held");
+        let held = admit(&admission, &lifecycle).await;
 
         let waiting = {
             let admission = Arc::clone(&admission);
             let lifecycle = Arc::clone(&lifecycle);
-            tokio::spawn(async move { admission.admit(far_future(), &lifecycle).await.is_some() })
+            tokio::spawn(async move {
+                matches!(
+                    admission.admit(far_future(), &lifecycle).await,
+                    Admission::Admitted(_)
+                )
+            })
         };
-        tokio::task::yield_now().await;
+        // Observed admission state, not a scheduling assumption, establishes
+        // that the waiter is really parked before shutdown begins.
+        await_observation(&admission, |observation| observation.waiting == 1).await;
 
         lifecycle.begin_shutdown();
-        let admitted = tokio::time::timeout(Duration::from_secs(5), waiting)
+        let admitted = tokio::time::timeout(DEADLOCK_BOUND, waiting)
             .await
             .expect("shutdown must release the pending wait")
             .expect("waiter task must not panic");
@@ -420,6 +659,7 @@ mod tests {
         assert!(!admitted, "a released wait is not an admission");
         drop(held);
         assert_eq!(admission.available_permits(), 1);
+        assert_eq!(admission.available_waiter_slots(), 1);
     }
 
     /// Dropping the admission future, as happens when a request is abandoned
@@ -428,10 +668,7 @@ mod tests {
     async fn dropping_an_unfinished_admission_leaves_no_reservation() {
         let admission = admission(1);
         let lifecycle = Lifecycle::new();
-        let held = admission
-            .admit(far_future(), &lifecycle)
-            .await
-            .expect("held");
+        let held = admit(&admission, &lifecycle).await;
 
         let mut abandoned = Box::pin(admission.admit(far_future(), &lifecycle));
         assert!(
@@ -444,6 +681,10 @@ mod tests {
         drop(held);
 
         assert_eq!(admission.available_permits(), 1);
-        assert!(admission.admit(far_future(), &lifecycle).await.is_some());
+        assert_eq!(admission.available_waiter_slots(), 1);
+        assert!(matches!(
+            admission.admit(far_future(), &lifecycle).await,
+            Admission::Admitted(_)
+        ));
     }
 }

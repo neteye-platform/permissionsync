@@ -25,8 +25,9 @@ use http_body::{Body as HttpBody, Frame, SizeHint};
 use crate::runtime::{
     admission::waiter_slots,
     tests::support::{
-        GLPI, HttpsFixture, RuntimeFixture, RuntimeFixtureOptions, SigningMaterial, authenticator,
-        glpi_configuration, jwks_fixture, provider_configuration, target, valid_body,
+        FIXTURE_TIMEOUT, GLPI, HttpsFixture, RuntimeFixture, RuntimeFixtureOptions,
+        SigningMaterial, authenticator, glpi_configuration, jwks_fixture, provider_configuration,
+        target, valid_body,
     },
     transport::{HEALTH_ROUTE, METRICS_ROUTE, READINESS_ROUTE, SYNCHRONIZATION_ROUTE},
 };
@@ -113,25 +114,6 @@ impl Scenario {
     }
 }
 
-/// Fills admission completely and returns the held permits.
-async fn saturate(fixture: &RuntimeFixture) -> Vec<crate::runtime::admission::AdmittedRequest> {
-    let limit = fixture.state.admission().limit().get();
-    let deadline = std::time::Instant::now() + Duration::from_secs(600);
-    let mut held = Vec::with_capacity(limit);
-    for _ in 0..limit {
-        held.push(
-            fixture
-                .state
-                .admission()
-                .admit(deadline, &fixture.lifecycle)
-                .await
-                .expect("the configured limit must be admissible"),
-        );
-    }
-    assert_eq!(fixture.state.admission().available_permits(), 0);
-    held
-}
-
 // ---------------------------------------------------------------------------
 // Ordering: admission precedes body collection
 // ---------------------------------------------------------------------------
@@ -146,7 +128,7 @@ async fn the_body_is_not_collected_before_admission() {
     })
     .await;
     let token = scenario.token();
-    let held = saturate(&scenario.fixture).await;
+    let held = scenario.fixture.saturate_admission().await;
     let (body, polled, _) = ObservedBody::new(valid_body());
 
     let status = scenario
@@ -199,7 +181,7 @@ async fn no_provider_or_adapter_work_begins_without_admission() {
     })
     .await;
     let token = scenario.signing.token(Some("permissionsync:glpi"));
-    let held = saturate(&scenario.fixture).await;
+    let held = scenario.fixture.saturate_admission().await;
 
     let status = scenario
         .fixture
@@ -292,7 +274,7 @@ async fn a_released_permit_admits_a_waiting_request_within_its_own_budget() {
         .await,
     );
     let token = scenario.token();
-    let held = saturate(&scenario.fixture).await;
+    let held = scenario.fixture.saturate_admission().await;
 
     let waiting = {
         let scenario = Arc::clone(&scenario);
@@ -304,7 +286,12 @@ async fn a_released_permit_admits_a_waiting_request_within_its_own_budget() {
                 .await
         })
     };
-    tokio::task::yield_now().await;
+    // Observed admission state, not a scheduling assumption, establishes that
+    // the request is really parked before the permit is released.
+    scenario
+        .fixture
+        .await_admission(|observation| observation.waiting == 1)
+        .await;
 
     drop(held);
     let status = tokio::time::timeout(Duration::from_secs(10), waiting)
@@ -333,7 +320,7 @@ async fn operational_endpoints_consume_no_admission_capacity() {
         options.inbound_admission_limit = NonZeroUsize::new(1).unwrap();
     })
     .await;
-    let held = saturate(&scenario.fixture).await;
+    let held = scenario.fixture.saturate_admission().await;
 
     assert_eq!(
         scenario.fixture.get(HEALTH_ROUTE).await.status(),
@@ -376,7 +363,7 @@ async fn an_abandoned_request_releases_its_pending_admission_wait() {
     })
     .await;
     let token = scenario.token();
-    let held = saturate(&scenario.fixture).await;
+    let held = scenario.fixture.saturate_admission().await;
 
     let mut abandoned = Box::pin(
         scenario.fixture.call(
@@ -423,7 +410,7 @@ async fn shutdown_releases_pending_admission_without_body_or_authentication_work
         .await,
     );
     let token = scenario.token();
-    let held = saturate(&scenario.fixture).await;
+    let held = scenario.fixture.saturate_admission().await;
     let (body, polled, _) = ObservedBody::new(valid_body());
 
     let waiting = {
@@ -444,7 +431,12 @@ async fn shutdown_releases_pending_admission_without_body_or_authentication_work
                 .status()
         })
     };
-    tokio::task::yield_now().await;
+    // Observed admission state establishes that the request is really parked
+    // before shutdown begins.
+    scenario
+        .fixture
+        .await_admission(|observation| observation.waiting == 1)
+        .await;
 
     scenario.fixture.lifecycle.begin_shutdown();
     let status = tokio::time::timeout(Duration::from_secs(10), waiting)
@@ -515,7 +507,7 @@ async fn saturation_introduces_no_new_caller_facing_status() {
     })
     .await;
     let token = scenario.token();
-    let held = saturate(&scenario.fixture).await;
+    let held = scenario.fixture.saturate_admission().await;
 
     for _ in 0..4 {
         let status = scenario
@@ -533,75 +525,82 @@ async fn saturation_introduces_no_new_caller_facing_status() {
     scenario.finish().await;
 }
 
-/// Application-owned waiter state is bounded by admission's own derived waiter
-/// bound, not by how many connections happen to be served.
+/// The complete invariant: the number of synchronization requests that are
+/// admitted or waiting anywhere is bounded, and load beyond that bound does not
+/// enlarge either population.
 ///
-/// Requests beyond that bound are never enqueued: they wait only on their own
-/// deadline, so the wait list cannot grow past it.
-#[tokio::test(start_paused = true)]
-async fn the_admission_wait_list_cannot_grow_past_its_derived_bound() {
+/// A request beyond the bound is refused immediately rather than parked, so no
+/// second waiting area can appear outside the two bounded populations.
+#[tokio::test]
+async fn the_admitted_and_waiting_populations_cannot_grow_past_their_bound() {
     let limit = NonZeroUsize::new(2).unwrap();
     let slots = waiter_slots(limit).get();
-    let scenario = Scenario::build(|options| {
-        options.inbound_admission_limit = limit;
-        options.overall_request_deadline = Duration::from_secs(600);
-    })
-    .await;
-    let token = scenario.token();
-    let held = saturate(&scenario.fixture).await;
-
-    // Park exactly as many requests as the wait list allows.
-    let mut parked = Vec::new();
-    for _ in 0..slots {
-        let mut request = Box::pin(
-            scenario.fixture.call(
-                Request::builder()
-                    .method("POST")
-                    .uri(SYNCHRONIZATION_ROUTE)
-                    .header("authorization", format!("Bearer {token}"))
-                    .body(Body::from(valid_body()))
-                    .unwrap(),
-            ),
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut request)
-                .await
-                .is_err(),
-            "a saturated request must still be waiting"
-        );
-        parked.push(request);
-    }
-    assert_eq!(
-        scenario.fixture.state.admission().available_waiter_slots(),
-        0,
-        "the wait list is at its bound"
+    let scenario = Arc::new(
+        Scenario::build(|options| {
+            options.inbound_admission_limit = limit;
+            options.overall_request_deadline = Duration::from_secs(600);
+        })
+        .await,
     );
+    let token = scenario.token();
+    let held = scenario.fixture.saturate_admission().await;
 
-    // Further requests must not enlarge the wait list.
-    let mut beyond = Vec::new();
-    for _ in 0..4 {
-        let mut request = Box::pin(
-            scenario.fixture.call(
-                Request::builder()
-                    .method("POST")
-                    .uri(SYNCHRONIZATION_ROUTE)
-                    .header("authorization", format!("Bearer {token}"))
-                    .body(Body::from(valid_body()))
-                    .unwrap(),
-            ),
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut request)
-                .await
-                .is_err(),
-            "a request beyond the wait list still waits on its own deadline"
-        );
-        beyond.push(request);
+    // Park exactly as many requests as the bounded wait list allows, and prove
+    // through observed admission state that each really reached admission.
+    let mut parked = Vec::new();
+    for expected in 1..=slots {
+        parked.push({
+            let scenario = Arc::clone(&scenario);
+            let token = token.clone();
+            tokio::spawn(async move {
+                scenario
+                    .fixture
+                    .synchronize(Some(&token), Body::from(valid_body()))
+                    .await
+            })
+        });
+        scenario
+            .fixture
+            .await_admission(|observation| observation.waiting == expected)
+            .await;
     }
+
+    // Load beyond the bound is refused immediately: it neither parks nor
+    // enlarges either population.
+    const BEYOND: usize = 8;
+    let mut refused = Vec::new();
+    for _ in 0..BEYOND {
+        refused.push(
+            scenario
+                .fixture
+                .synchronize(Some(&token), Body::from(valid_body()))
+                .await,
+        );
+    }
+    let observation = scenario
+        .fixture
+        .await_admission(|observation| observation.refused_without_waiting == BEYOND)
+        .await;
+
+    assert!(
+        refused
+            .iter()
+            .all(|status| *status == StatusCode::INTERNAL_SERVER_ERROR),
+        "a refusal uses the existing server-side outcome, adding no new status"
+    );
+    assert_eq!(
+        observation.waiting, slots,
+        "refused requests must not enlarge the waiting population"
+    );
+    assert_eq!(
+        observation.admitted,
+        limit.get(),
+        "refused requests must not enlarge the admitted population"
+    );
+    assert_eq!(scenario.fixture.state.admission().available_permits(), 0);
     assert_eq!(
         scenario.fixture.state.admission().available_waiter_slots(),
-        0,
-        "the wait list stayed at its bound"
+        0
     );
     assert_eq!(
         scenario.jwks.request_count(),
@@ -609,10 +608,103 @@ async fn the_admission_wait_list_cannot_grow_past_its_derived_bound() {
         "no unadmitted request reached authentication"
     );
 
-    drop(beyond);
-    drop(parked);
+    // A legitimately waiting request still proceeds once capacity frees.
     drop(held);
-    scenario.finish().await;
+    for waiting in parked {
+        let status = tokio::time::timeout(FIXTURE_TIMEOUT, waiting)
+            .await
+            .expect("a waiting request must be woken by the freed permits")
+            .expect("request task must not panic");
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "a waiting request completes normally once it is admitted"
+        );
+    }
+
+    Arc::try_unwrap(scenario)
+        .map_err(|_| "scenario is still shared")
+        .unwrap()
+        .finish()
+        .await;
+}
+
+/// A request refused because the bounded population was full must not collect a
+/// body, must use the existing server-side outcome, and must be told that its
+/// connection is closing so the pushback reaches the client's transport.
+#[tokio::test]
+async fn a_refused_request_collects_no_body_and_closes_its_connection() {
+    let scenario = Arc::new(
+        Scenario::build(|options| {
+            options.inbound_admission_limit = NonZeroUsize::new(1).unwrap();
+            options.overall_request_deadline = Duration::from_secs(600);
+        })
+        .await,
+    );
+    let token = scenario.token();
+    let held = scenario.fixture.saturate_admission().await;
+
+    // Occupy the single waiter slot.
+    let parked = {
+        let scenario = Arc::clone(&scenario);
+        let token = token.clone();
+        tokio::spawn(async move {
+            scenario
+                .fixture
+                .synchronize(Some(&token), Body::from(valid_body()))
+                .await
+        })
+    };
+    scenario
+        .fixture
+        .await_admission(|observation| observation.waiting == 1)
+        .await;
+
+    let (body, polled, polls) = ObservedBody::new(valid_body());
+    let response = scenario
+        .fixture
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri(SYNCHRONIZATION_ROUTE)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::new(body))
+                .unwrap(),
+        )
+        .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a refusal adds no new caller-facing status"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONNECTION)
+            .and_then(|value| value.to_str().ok()),
+        Some("close"),
+        "a refusal closes the connection, making the pushback transport backpressure"
+    );
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "a refused request must not collect its body"
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    assert!(
+        crate::runtime::tests::support::body_bytes(response)
+            .await
+            .is_empty(),
+        "the synchronization contract has an empty response body"
+    );
+
+    drop(held);
+    let _ = tokio::time::timeout(FIXTURE_TIMEOUT, parked).await;
+    Arc::try_unwrap(scenario)
+        .map_err(|_| "scenario is still shared")
+        .unwrap()
+        .finish()
+        .await;
 }
 
 /// A request that finds the wait list full still ends through the existing
@@ -625,7 +717,7 @@ async fn a_request_beyond_the_wait_list_ends_through_the_existing_deadline_path(
     })
     .await;
     let token = scenario.token();
-    let held = saturate(&scenario.fixture).await;
+    let held = scenario.fixture.saturate_admission().await;
 
     // Occupy the single waiter slot.
     let mut parked = Box::pin(

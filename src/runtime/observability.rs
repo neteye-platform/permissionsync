@@ -47,8 +47,9 @@ pub(crate) const ADMISSION_SATURATED_TOTAL: &str =
     "permissionsync_inbound_admission_saturated_total";
 pub(crate) const ADMISSION_ABANDONED_TOTAL: &str =
     "permissionsync_inbound_admission_abandoned_total";
-pub(crate) const ADMISSION_QUEUE_FULL_TOTAL: &str =
-    "permissionsync_inbound_admission_queue_full_total";
+/// Synchronization requests refused because the bounded admitted-plus-waiting
+/// population was already full, so they were never parked.
+pub(crate) const ADMISSION_REFUSED_TOTAL: &str = "permissionsync_inbound_admission_refused_total";
 pub(crate) const CAPACITY_IN_USE: &str = "permissionsync_synchronization_capacity_in_use";
 pub(crate) const CAPACITY_SATURATED_TOTAL: &str =
     "permissionsync_synchronization_capacity_saturated_total";

@@ -96,11 +96,17 @@ or internal errors, and there is no general status or configuration endpoint.
 
 `inbound_admission_limit` bounds two things: how many synchronization requests
 may be admitted at once, and — through a value derived from it — how many further
-synchronization requests may be waiting for admission. A request beyond both
-bounds is never queued: it waits only on its own overall deadline and then
-returns the ordinary server-side deadline outcome. Saturation therefore adds no
-`429`, `503`, or other caller-facing status, and no application queue can grow
-with the number of open connections.
+synchronization requests may be parked waiting for admission. Together those two
+values are the complete bound on synchronization requests that are admitted or
+waiting anywhere in the process, and only admitted requests buffer a body.
+
+A parked request is woken as soon as a permit frees, so it can still succeed
+inside its own overall deadline. A request that arrives when both bounds are full
+is refused immediately instead of being parked somewhere else: it returns the
+ordinary server-side outcome and its connection is closed, so the pushback
+reaches the client's transport. Saturation therefore adds no `429`, `503`, or
+other caller-facing status, and it cannot accumulate waiting requests, buffered
+bodies, or permits beyond those two bounds however many connections are open.
 
 The inbound synchronization body has a fixed one-mebibyte product limit. It is
 not configurable, and exceeding it is a body-validation outcome in the fixed

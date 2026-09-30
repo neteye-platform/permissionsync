@@ -10,7 +10,7 @@ use axum::{body::Body, http::Request, http::StatusCode};
 
 use crate::runtime::{
     observability::{
-        ADMISSION_ABANDONED_TOTAL, ADMISSION_QUEUE_FULL_TOTAL, ADMISSION_SATURATED_TOTAL,
+        ADMISSION_ABANDONED_TOTAL, ADMISSION_REFUSED_TOTAL, ADMISSION_SATURATED_TOTAL,
         ADMISSION_WAITERS, CAPACITY_IN_USE, CAPACITY_SATURATED_TOTAL, CAPACITY_UNAVAILABLE_TOTAL,
         COMPONENT_AVAILABLE, READY, REQUEST_DURATION_SECONDS, REQUEST_STAGE_TOTAL,
         REQUESTS_IN_FLIGHT, REQUESTS_TOTAL,
@@ -218,16 +218,7 @@ async fn the_in_flight_gauge_tracks_admitted_requests() {
     let guard = scenario.fixture.recorder_guard();
 
     // One held admission makes the gauge non-zero.
-    let held = scenario
-        .fixture
-        .state
-        .admission()
-        .admit(
-            std::time::Instant::now() + Duration::from_secs(600),
-            &scenario.fixture.lifecycle,
-        )
-        .await
-        .expect("admissible");
+    let held = scenario.fixture.hold_admission().await;
     let during = scenario.fixture.rendered_metrics();
     assert_contains(&during, &format!("{REQUESTS_IN_FLIGHT} 1"));
 
@@ -260,16 +251,7 @@ async fn inbound_admission_saturation_is_represented() {
     .await;
     let guard = scenario.fixture.recorder_guard();
 
-    let held = scenario
-        .fixture
-        .state
-        .admission()
-        .admit(
-            std::time::Instant::now() + Duration::from_secs(600),
-            &scenario.fixture.lifecycle,
-        )
-        .await
-        .expect("admissible");
+    let held = scenario.fixture.hold_admission().await;
     let token = scenario.signing.token(Some("service_account"));
     assert_eq!(
         scenario
@@ -302,16 +284,7 @@ async fn a_full_admission_wait_list_is_represented() {
     .await;
     let guard = scenario.fixture.recorder_guard();
 
-    let held = scenario
-        .fixture
-        .state
-        .admission()
-        .admit(
-            std::time::Instant::now() + Duration::from_secs(600),
-            &scenario.fixture.lifecycle,
-        )
-        .await
-        .expect("admissible");
+    let held = scenario.fixture.hold_admission().await;
     let token = scenario.signing.token(Some("service_account"));
 
     // The first request occupies the single waiter slot and keeps it while it
@@ -350,7 +323,7 @@ async fn a_full_admission_wait_list_is_represented() {
     let exposition = scenario.fixture.rendered_metrics();
 
     assert_contains(&exposition, &format!("{ADMISSION_SATURATED_TOTAL} 2"));
-    assert_contains(&exposition, &format!("{ADMISSION_QUEUE_FULL_TOTAL} 1"));
+    assert_contains(&exposition, &format!("{ADMISSION_REFUSED_TOTAL} 1"));
     assert_contains(&exposition, &format!("{ADMISSION_WAITERS} 0"));
     assert_no_sentinels(&exposition);
 
