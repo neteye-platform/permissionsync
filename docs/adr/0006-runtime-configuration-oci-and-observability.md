@@ -151,6 +151,16 @@ V1 is stateless: any healthy replica can handle a request. There is no shared
 persistence, distributed lock, persistent delivery queue, or idempotency
 database unless a future ADR accepts one.
 
+These properties are deliberate and have a direct consequence for adapters:
+because concurrent requests for one synchronized identity may be handled by
+different replicas, PermissionSync provides no identity-level serialization and
+no process-local mechanism could provide one. Bounded synchronization
+concurrency is a resource bound, not an ordering or exclusion primitive.
+Target Adapters are therefore responsible for concurrency-safe reconciliation
+under [ADR 0007](0007-compile-time-rust-target-adapters.md), and repeated
+legitimate requests may overlap under
+[ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md).
+
 Each request has one runtime-configurable overall deadline starting when the
 request is accepted and covering all PermissionSync application processing
 until the response outcome is ready to emit: authentication, JWKS or discovery,

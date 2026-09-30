@@ -169,6 +169,15 @@ Capacity is independent of inbound admission: admission is taken at the
 transport boundary for every synchronization request, while capacity is acquired
 later and only for selected-target work.
 
+Capacity is a resource bound and nothing more. It intentionally allows
+concurrent selected-target reconciliations, including reconciliations of the
+same synchronized identity on the same backend, and it provides no ordering and
+no exclusion by identity or target. It is not a keyed semaphore, a per-user
+mutex, or distributed capacity, and multiple PermissionSync replicas remain
+valid, so no process-local bound could provide such a guarantee. Target
+Adapters are responsible for concurrency-safe reconciliation under
+[ADR 0007](0007-compile-time-rust-target-adapters.md).
+
 ### Authentication, health, and readiness
 
 The executable converts the authentication section into

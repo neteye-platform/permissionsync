@@ -50,6 +50,20 @@ impl Plan {
     }
 }
 
+/// Whether `current` is already exactly the canonical physical state for
+/// `desired`.
+///
+/// This is the ADR 0009 canonical-final-state predicate, expressed through the
+/// very function that owns the contract: a state is canonical exactly when
+/// reconciling it toward `desired` would require no mutation at all. It
+/// therefore rejects a missing desired pair, an undesired pair, a duplicate
+/// physical row, and a noncanonical `is_recursive` value alike, instead of
+/// comparing normalized semantic access, which would accept several physical
+/// rows that together grant the same permissions.
+pub(crate) fn is_canonical(current: &[CurrentRow], desired: &[DesiredAssignment]) -> bool {
+    compute(current, desired).is_empty()
+}
+
 /// Computes the deterministic plan for the given current rows and canonical
 /// desired assignments.
 pub(crate) fn compute(current: &[CurrentRow], desired: &[DesiredAssignment]) -> Plan {
@@ -120,7 +134,7 @@ pub(crate) fn compute(current: &[CurrentRow], desired: &[DesiredAssignment]) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{Addition, CurrentRow, DesiredAssignment, compute};
+    use super::{Addition, CurrentRow, DesiredAssignment, compute, is_canonical};
 
     fn row(id: u64, entity: u64, profile: u64, recursive: bool) -> CurrentRow {
         CurrentRow {
@@ -555,5 +569,66 @@ mod tests {
                 recursive: true,
             }]
         );
+    }
+
+    /// The canonical-state predicate the final authoritative verification uses.
+    ///
+    /// Every divergence class ADR 0009 owns must make it false, including a
+    /// duplicate physical row whose normalized semantic access is identical.
+    #[test]
+    fn the_canonical_state_predicate_accepts_only_the_exact_canonical_physical_state() {
+        let desired = [desired(10, 20, true), desired(30, 40, false)];
+
+        // Exactly one canonical physical row per desired pair.
+        assert!(is_canonical(
+            &[row(1, 10, 20, true), row(2, 30, 40, false)],
+            &desired
+        ));
+        // Row order and id values are irrelevant.
+        assert!(is_canonical(
+            &[row(9, 30, 40, false), row(4, 10, 20, true)],
+            &desired
+        ));
+        // An empty desired state is canonical only with no rows at all.
+        assert!(is_canonical(&[], &[]));
+        assert!(!is_canonical(&[row(1, 10, 20, true)], &[]));
+
+        for (label, current) in [
+            ("a missing desired pair", vec![row(1, 10, 20, true)]),
+            (
+                "an undesired pair",
+                vec![
+                    row(1, 10, 20, true),
+                    row(2, 30, 40, false),
+                    row(3, 50, 60, true),
+                ],
+            ),
+            (
+                "a duplicate physical row with identical semantic access",
+                vec![
+                    row(1, 10, 20, true),
+                    row(2, 10, 20, true),
+                    row(3, 30, 40, false),
+                ],
+            ),
+            (
+                "a noncanonical recursive value",
+                vec![row(1, 10, 20, false), row(2, 30, 40, false)],
+            ),
+            (
+                "a canonical row accompanied by its opposite recursive row",
+                vec![
+                    row(1, 10, 20, true),
+                    row(2, 10, 20, false),
+                    row(3, 30, 40, false),
+                ],
+            ),
+            ("no rows at all", Vec::new()),
+        ] {
+            assert!(
+                !is_canonical(&current, &desired),
+                "{label} must not be canonical"
+            );
+        }
     }
 }

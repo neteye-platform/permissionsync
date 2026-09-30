@@ -138,6 +138,17 @@ behind a short backoff, already-established work continues, and the process does
 not terminate. A deployment that must bound the population should enforce a
 connection limit in front of PermissionSync.
 
+Concurrent synchronization requests are allowed, including requests for the same
+synchronized user on the same target. PermissionSync assigns them no ordering
+and serializes nothing by identity — `synchronization_capacity` bounds resource
+use, not exclusion — so a successful response means the Target Adapter
+authoritatively verified its desired state immediately before returning, not
+that the target still holds that state afterwards. A caller that needs a settled
+outcome for one user must sequence its own deliveries. The exact semantics are
+in [ADR-0003](docs/adr/0003-at-most-once-delivery-and-idempotent-reconciliation.md),
+[ADR-0007](docs/adr/0007-compile-time-rust-target-adapters.md), and
+[ADR-0009](docs/adr/0009-glpi-target-adapter.md).
+
 ### Observability
 
 Ordinary runtime events are structured JSON on standard output; startup and

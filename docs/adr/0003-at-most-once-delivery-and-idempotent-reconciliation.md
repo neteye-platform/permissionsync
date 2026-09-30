@@ -25,6 +25,18 @@ PermissionSync cannot control all callers. If any caller submits the same
 logical synchronization again, PermissionSync processes it as a new legitimate
 request.
 
+Those repeated legitimate requests may also overlap in time, including requests
+for the same adapter, the same backend, and the same synchronized identity.
+PermissionSync allows that overlap and assigns no ordering between them. It
+neither deduplicates nor merges nor serializes them: no request identity, no
+username-and-target tuple, no caller identity, and no body fingerprint is used
+as an exclusion key, and Core does not serialize logical delivery attempts by
+identity. There is no "last request wins" rule and no request that owns the
+resulting durable state. Configured synchronization concurrency bounds resource
+consumption only; it is not an ordering or exclusion primitive, and
+[ADR 0006](0006-runtime-configuration-oci-and-observability.md)'s stateless
+multiple-replica model means no process-local mechanism could provide one.
+
 For each inbound request, PermissionSync invokes Permission Provider resolution
 at most once and selected Target Adapter reconciliation at most once. It does
 not replay work or deduplicate requests. It must never merge requests by
@@ -47,10 +59,21 @@ each Target Adapter reconciles toward the desired state idempotently, comparing
 current target state with desired state rather than making blind additive
 changes, so that repeated legitimate desired-state synchronizations converge the
 target to the desired state. Adapters must tolerate uncertain downstream effects
-from a previous attempt. This convergence contract does not create any delivery
-or exactly-once guarantee, and it does not add automatic retry; see
-[ADR 0007](0007-compile-time-rust-target-adapters.md) for how the contract
-applies to adapter reconciliation.
+from a previous attempt and concurrent effects of another legitimate
+reconciliation running at the same time, and a later reconciliation must still
+converge from any safely representable intermediate state either of those left
+behind. This convergence contract does not create any delivery, ordering, or
+exactly-once guarantee, and it does not add automatic retry; see
+[ADR 0007](0007-compile-time-rust-target-adapters.md) for the concurrency
+requirements this places on adapter reconciliation, including the authoritative
+final-state verification a successful reconciliation must perform.
+
+Allowing overlap does not weaken the at-most-once invocation rule above. One
+inbound request still causes at most one Provider resolution and at most one
+Target Adapter reconciliation invocation. Resolving the outcome of a target
+mutation the adapter itself performed, re-reading authoritative target state,
+and verifying the final state belong to that one invocation and are not
+retries.
 
 ## Alternatives considered
 
@@ -60,7 +83,13 @@ No material alternatives were recorded for this decision.
 
 This keeps latency low and state simple, but failed work can be lost.
 
-Adapters still need to reconcile safely when a downstream effect is uncertain.
+Adapters still need to reconcile safely when a downstream effect is uncertain,
+and now also when another legitimate reconciliation is mutating the same target
+subject concurrently. A successful reconciliation states what the adapter
+authoritatively verified before returning, not that the target still holds that
+state afterwards; a concurrent legitimate request may change it immediately
+after. Callers that need a settled outcome for one identity must sequence their
+own deliveries.
 
 ## References
 

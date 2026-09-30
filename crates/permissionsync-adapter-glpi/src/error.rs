@@ -24,6 +24,13 @@ pub(crate) enum GlpiFailure {
     MalformedReference,
     UserCreationFailed,
     MutationFailed,
+    /// The final authoritative read did not show this request's canonical
+    /// desired assignment set.
+    ///
+    /// This is an internal category only. Like every other variant it renders
+    /// as fixed text and maps outward to the one existing adapter-failure
+    /// outcome, so it adds no observability dimension.
+    VerificationFailed,
     CleanupFailed,
 }
 

@@ -41,7 +41,9 @@ request:
   inbound_admission_limit: 64
 
   # How many selected-target synchronizations may run concurrently. Must be
-  # positive and at most 1024.
+  # positive and at most 1024. This bounds resource use only: it is not an
+  # ordering or exclusion primitive, and concurrent requests for the same user
+  # are allowed and unordered.
   synchronization_capacity: 16
 
 shutdown:
