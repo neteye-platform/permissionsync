@@ -126,6 +126,18 @@ is a fixed product value rather than a deployment knob, and it is unrelated to
 the configured overall request deadline, which starts only once a
 synchronization request reaches the transport handler.
 
+The *number* of simultaneously accepted connections is not bounded inside the
+process. A bound taken when a connection is accepted could not keep the
+operational endpoints reachable, because a connection's route is unknown until
+its first request head has been read and HTTP/1 keep-alive lets one connection
+change route between requests, so no share can be reserved for a class of
+request that has not been identified yet. What limits the accepted population is
+the process descriptor limit together with the request-head window above.
+Descriptor exhaustion is handled rather than fatal: accepting is retried
+behind a short backoff, already-established work continues, and the process does
+not terminate. A deployment that must bound the population should enforce a
+connection limit in front of PermissionSync.
+
 ### Observability
 
 Ordinary runtime events are structured JSON on standard output; startup and

@@ -7,12 +7,15 @@
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use axum::{body::Body, http::StatusCode};
+use tokio::time::timeout;
 
 use crate::runtime::{
+    observability::READY,
     tests::support::{
-        GLPI, HttpsFixture, RefusingEndpoint, RuntimeFixture, RuntimeFixtureOptions,
-        ScriptedResponse, SigningMaterial, authenticator, body_bytes, glpi_configuration,
-        jwks_fixture, provider_configuration, target, unavailable_jwks_fixture, valid_body,
+        FIXTURE_TIMEOUT, GLPI, GatedHttpsFixture, HttpsFixture, RefusingEndpoint, RuntimeFixture,
+        RuntimeFixtureOptions, ScriptedResponse, SigningMaterial, authenticator, body_bytes,
+        glpi_configuration, jwks_fixture, provider_configuration, target, unavailable_jwks_fixture,
+        valid_body,
     },
     transport::READINESS_ROUTE,
 };
@@ -248,6 +251,142 @@ async fn readiness_is_false_immediately_when_shutdown_begins() {
     );
 
     scenario.finish().await;
+}
+
+/// The decisive readiness/shutdown race: a readiness evaluation that is already
+/// waiting on the trusted metadata source must answer `503` as soon as shutdown
+/// begins, even when the retrieval it was waiting for then *succeeds*.
+///
+/// Checking the shutdown flag only once, before awaiting, would let a probe that
+/// started while the process was still serving answer `200` after shutdown had
+/// already begun, because the refresh it was waiting for finally installed
+/// usable trusted state. ADR 0011 requires readiness to be false from the start
+/// of shutdown.
+///
+/// The race is established structurally, never by timing. The test itself
+/// decides both when shutdown begins and when the retrieval would have
+/// succeeded:
+///
+/// - the authenticator holds no usable cached state, so the evaluation *must*
+///   consult the metadata source;
+/// - the metadata source reports the arriving request and then answers nothing,
+///   so receiving that report proves retrieval really started;
+/// - shutdown begins next, and only then is a valid JWKS released, so the
+///   refresh would succeed if anything still awaited it;
+/// - the probe future is driven on this task rather than spawned, so no
+///   scheduling order is assumed.
+#[tokio::test]
+async fn a_readiness_evaluation_already_awaiting_metadata_turns_false_at_shutdown() {
+    let signing = SigningMaterial::new("readiness-race-key");
+    let (jwks, mut arrivals) =
+        GatedHttpsFixture::start(ScriptedResponse::jwks(signing.jwks())).await;
+    let fixture = RuntimeFixture::new(
+        authenticator(jwks.endpoint("/keys"), jwks.trust_anchor_pem().to_vec()),
+        RuntimeFixtureOptions::default(),
+    );
+    let guard = fixture.recorder_guard();
+
+    let mut probe = Box::pin(fixture.get(READINESS_ROUTE));
+
+    // Driving the probe here is what makes it reach metadata retrieval; the
+    // fixture's report is what proves it did.
+    tokio::select! {
+        _ = &mut probe => panic!("readiness must not answer while retrieval is still blocked"),
+        arrived = arrivals.recv() => {
+            arrived.expect("the metadata source must report the arriving request");
+        }
+    }
+    assert_eq!(
+        jwks.request_count(),
+        1,
+        "the evaluation must really be waiting on the trusted metadata source"
+    );
+
+    // Shutdown begins while that retrieval is still outstanding, and only then
+    // is the retrieval allowed to succeed. Anything still awaiting it would now
+    // observe usable trusted state.
+    fixture.lifecycle.begin_shutdown();
+    jwks.release();
+
+    let readiness = timeout(FIXTURE_TIMEOUT, probe)
+        .await
+        .expect("readiness must answer at shutdown, not when the backend finally answers");
+    assert_eq!(
+        readiness.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an in-flight readiness evaluation must become unready at shutdown, even though the \
+         refresh it was waiting for succeeded"
+    );
+
+    drop(guard);
+    let exposition = fixture.rendered_metrics();
+    assert!(
+        exposition.contains(&format!("{READY} 0")),
+        "the readiness gauge must report unready:\n{exposition}"
+    );
+    assert!(
+        !exposition.contains(&format!("{READY} 1")),
+        "readiness must never briefly report ready while draining:\n{exposition}"
+    );
+}
+
+/// The same probe, with shutdown never beginning, must still become ready once
+/// the retrieval is released.
+///
+/// This proves the shutdown race is what ends the evaluation above, rather than
+/// the gated fixture simply being unable to produce usable trusted state.
+#[tokio::test]
+async fn the_same_gated_evaluation_becomes_ready_when_shutdown_never_begins() {
+    let signing = SigningMaterial::new("readiness-race-key");
+    let (jwks, mut arrivals) =
+        GatedHttpsFixture::start(ScriptedResponse::jwks(signing.jwks())).await;
+    let fixture = RuntimeFixture::new(
+        authenticator(jwks.endpoint("/keys"), jwks.trust_anchor_pem().to_vec()),
+        RuntimeFixtureOptions::default(),
+    );
+
+    let mut probe = Box::pin(fixture.get(READINESS_ROUTE));
+    tokio::select! {
+        _ = &mut probe => panic!("readiness must not answer while retrieval is still blocked"),
+        arrived = arrivals.recv() => {
+            arrived.expect("the metadata source must report the arriving request");
+        }
+    }
+
+    jwks.release();
+
+    let readiness = timeout(FIXTURE_TIMEOUT, probe)
+        .await
+        .expect("readiness must answer once the metadata source does");
+    assert_eq!(
+        readiness.status(),
+        StatusCode::OK,
+        "a released retrieval installs usable trusted state and reports ready"
+    );
+}
+
+/// Shutdown that begins before the probe arrives must likewise answer `503`
+/// without any retrieval at all, even with no usable cached state.
+#[tokio::test]
+async fn a_readiness_probe_during_draining_consults_no_metadata_source() {
+    let signing = SigningMaterial::new("readiness-draining-key");
+    let (jwks, _arrivals) = GatedHttpsFixture::start(ScriptedResponse::jwks(signing.jwks())).await;
+    let fixture = RuntimeFixture::new(
+        authenticator(jwks.endpoint("/keys"), jwks.trust_anchor_pem().to_vec()),
+        RuntimeFixtureOptions::default(),
+    );
+
+    fixture.lifecycle.begin_shutdown();
+
+    let readiness = timeout(FIXTURE_TIMEOUT, fixture.get(READINESS_ROUTE))
+        .await
+        .expect("a draining process must answer readiness without any retrieval");
+    assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        jwks.request_count(),
+        0,
+        "a shutting-down process must not consult the metadata source"
+    );
 }
 
 // ---------------------------------------------------------------------------

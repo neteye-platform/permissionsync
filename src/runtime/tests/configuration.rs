@@ -316,9 +316,17 @@ fn the_largest_expressible_configured_durations_still_form_absolute_deadlines() 
             configuration.metadata_operation_timeout,
         ),
     ] {
+        let deadline = now
+            .checked_add(duration)
+            .unwrap_or_else(|| panic!("the {name} must form a representable absolute deadline"));
+        // Tokio converts an absolute deadline to a timer tick by rounding it up
+        // to the end of a millisecond with an unchecked addition, so the
+        // converted instant has to stay representable too.
         assert!(
-            now.checked_add(duration).is_some(),
-            "the {name} must form a representable absolute deadline"
+            deadline
+                .checked_add(Duration::from_nanos(999_999))
+                .is_some(),
+            "the {name} must stay representable after Tokio rounds it to a tick"
         );
     }
 }

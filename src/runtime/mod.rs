@@ -349,6 +349,20 @@ fn spawn_verifier_warm_up(
 /// are reaped each iteration, so nothing is detached and the owned set tracks
 /// only live connections.
 ///
+/// The *number* of simultaneously accepted connections is deliberately not
+/// bounded here. ADR 0011 bounds the application-owned populations — admitted
+/// synchronization requests, admission waiters, aggregate body buffering, and
+/// selected-target capacity — and requires the operational endpoints to stay
+/// reachable under synchronization saturation, which a bound taken at accept time
+/// cannot preserve: a connection's route is unknown until its first request head
+/// has been read, so no share can be reserved for a class of request that has not
+/// been identified yet. What limits the accepted population is therefore the
+/// descriptor limit of the process together with [`HEADER_READ_TIMEOUT`], and
+/// descriptor exhaustion degrades through
+/// [`AcceptFailure::ResourcePressure`] rather than through fatal termination.
+/// Bounding the population itself needs an architectural decision ADR 0011 does
+/// not make, so it is not invented here.
+///
 /// `serving_started` is signalled once, immediately before the first accept, so
 /// anything that must not precede serving can wait on it.
 async fn serve(
@@ -437,22 +451,33 @@ async fn serve(
     Ok(())
 }
 
-/// Linux `errno` values for the `accept(2)` conditions `std` does not expose as
-/// a stable [`ErrorKind`].
+/// The `accept(2)` conditions that need raw `errno` inspection, because `std`
+/// exposes no stable [`ErrorKind`] that names them exactly.
 ///
-/// ADR 0011 fixes a Linux runtime, and these are the `asm-generic/errno.h`
-/// values shared by the Linux targets PermissionSync is built for. They are kept
-/// here, named and isolated, rather than adding a dependency for five integers;
-/// every other condition below is classified through `std`'s own portable
-/// mapping.
+/// Every value comes from `libc`, which resolves it for the target
+/// architecture. ADR 0011 requires Linux but not one specific Linux
+/// architecture, and the numbers genuinely differ: `ENOBUFS` is 105 on
+/// `asm-generic` targets, 55 on SPARC, and 132 on MIPS, and SPARC's `EHOSTDOWN`
+/// is 64, which is `ENONET` on `asm-generic`. Hard-coding integers here would
+/// therefore not merely miss a condition on those targets but actively
+/// misclassify a different one.
+///
+/// Every other condition below is classified through `std`'s own portable
+/// mapping instead.
 mod accept_errno {
-    pub(super) const ENFILE: i32 = 23;
-    pub(super) const EMFILE: i32 = 24;
-    pub(super) const ENONET: i32 = 64;
-    pub(super) const EPROTO: i32 = 71;
-    pub(super) const ENOPROTOOPT: i32 = 92;
-    pub(super) const ENOBUFS: i32 = 105;
-    pub(super) const EHOSTDOWN: i32 = 112;
+    /// Local resource pressure: no descriptor, socket buffer, or memory is
+    /// available for a new connection right now.
+    pub(super) const RESOURCE_PRESSURE: [i32; 3] = [libc::EMFILE, libc::ENFILE, libc::ENOBUFS];
+
+    /// Errors `accept(2)` documents as already-pending network conditions on the
+    /// new connection, to be retried like `EAGAIN`, and that `std` leaves
+    /// uncategorized.
+    pub(super) const PENDING_NETWORK: [i32; 4] = [
+        libc::ENONET,
+        libc::EPROTO,
+        libc::ENOPROTOOPT,
+        libc::EHOSTDOWN,
+    ];
 }
 
 /// How one `TcpListener::accept()` failure has to be handled.
@@ -486,36 +511,33 @@ pub(crate) enum AcceptFailure {
 /// an unrecognized failure still reaches the existing fatal lifecycle rather
 /// than being retried forever.
 fn classify_accept_failure(error: &io::Error) -> AcceptFailure {
-    match error.raw_os_error() {
-        // `std` maps none of these to a stable `ErrorKind` this code can match.
-        Some(accept_errno::EMFILE | accept_errno::ENFILE | accept_errno::ENOBUFS) => {
-            AcceptFailure::ResourcePressure
+    if let Some(errno) = error.raw_os_error() {
+        if accept_errno::RESOURCE_PRESSURE.contains(&errno) {
+            return AcceptFailure::ResourcePressure;
         }
-        Some(
-            accept_errno::ENONET
-            | accept_errno::EPROTO
-            | accept_errno::ENOPROTOOPT
-            | accept_errno::EHOSTDOWN,
-        ) => AcceptFailure::Transient,
-        _ => match error.kind() {
-            // `ENOMEM`.
-            ErrorKind::OutOfMemory => AcceptFailure::ResourcePressure,
-            // `ECONNABORTED`, `ECONNRESET`, `EINTR`, `EAGAIN`, `ETIMEDOUT`,
-            // `EPERM`, `ENETDOWN`, `ENETUNREACH`, `EHOSTUNREACH`, and
-            // `EOPNOTSUPP`: all about one connection or the network, never about
-            // a listener this process bound itself as a TCP stream socket.
-            ErrorKind::ConnectionAborted
-            | ErrorKind::ConnectionReset
-            | ErrorKind::Interrupted
-            | ErrorKind::WouldBlock
-            | ErrorKind::TimedOut
-            | ErrorKind::PermissionDenied
-            | ErrorKind::NetworkDown
-            | ErrorKind::NetworkUnreachable
-            | ErrorKind::HostUnreachable
-            | ErrorKind::Unsupported => AcceptFailure::Transient,
-            _ => AcceptFailure::ListenerUnusable,
-        },
+        if accept_errno::PENDING_NETWORK.contains(&errno) {
+            return AcceptFailure::Transient;
+        }
+    }
+
+    match error.kind() {
+        // `ENOMEM`.
+        ErrorKind::OutOfMemory => AcceptFailure::ResourcePressure,
+        // `ECONNABORTED`, `ECONNRESET`, `EINTR`, `EAGAIN`, `ETIMEDOUT`, `EPERM`,
+        // `ENETDOWN`, `ENETUNREACH`, `EHOSTUNREACH`, and `EOPNOTSUPP`: all about
+        // one connection or the network, never about a listener this process
+        // bound itself as a TCP stream socket.
+        ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::Interrupted
+        | ErrorKind::WouldBlock
+        | ErrorKind::TimedOut
+        | ErrorKind::PermissionDenied
+        | ErrorKind::NetworkDown
+        | ErrorKind::NetworkUnreachable
+        | ErrorKind::HostUnreachable
+        | ErrorKind::Unsupported => AcceptFailure::Transient,
+        _ => AcceptFailure::ListenerUnusable,
     }
 }
 

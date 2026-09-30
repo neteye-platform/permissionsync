@@ -24,9 +24,11 @@ use opentelemetry_otlp::{
     Protocol as OtlpProtocol, RetryPolicy, SpanExporter, WithExportConfig, WithHttpConfig,
 };
 use opentelemetry_sdk::{
-    Resource, runtime,
+    Resource,
+    resource::TelemetryResourceDetector,
+    runtime,
     trace::{
-        BatchConfigBuilder, SdkTracerProvider,
+        BatchConfigBuilder, Sampler, SdkTracerProvider,
         span_processor_with_async_runtime::BatchSpanProcessor,
     },
 };
@@ -243,30 +245,50 @@ impl Observability {
 /// Requests a final flush and shutdown of the trace provider, bounded by
 /// `flush_budget`.
 ///
-/// The Tokio-runtime batch span processor answers a shutdown request by blocking
-/// the calling thread until its own worker task replies, and it ignores the
-/// timeout it is handed, so the bound has to be applied here. The blocking call
-/// therefore runs on its own thread — never on a runtime worker, which that
-/// worker task needs in order to reply — and this function stops waiting at the
+/// # Why the blocking call is moved off the runtime
+///
+/// The Tokio-runtime batch span processor answers both a shutdown request and a
+/// provider that is merely dropped by blocking the calling thread until its own
+/// worker task replies, and its shutdown ignores the timeout it is handed. Doing
+/// that on a runtime thread is a deadlock in the making: the reply can only come
+/// from the worker task, which needs a runtime thread to run on. The blocking
+/// call therefore runs on its own thread, and this function stops waiting at the
 /// budget.
 ///
 /// Abandoning the wait loses final telemetry, which ADR 0011 prefers over
-/// extending shutdown: the abandoned thread owns nothing but the provider, holds
-/// no request state, and cannot affect any synchronization outcome.
+/// extending shutdown. The abandoned thread owns nothing but the provider: no
+/// permit, no waiter, no request task, and no reconciliation, so it cannot affect
+/// any synchronization outcome, and the process discards it at exit.
+///
+/// This consumes the provider, so it is owned exactly once: after this returns,
+/// no other handle exists that could run the same blocking path again.
 pub(crate) async fn shutdown_tracer_provider(provider: SdkTracerProvider, flush_budget: Duration) {
     let (finished, flushed) = tokio::sync::oneshot::channel();
-    if std::thread::Builder::new()
+    // A second handle to the same provider, kept only to decide what happens if
+    // the flush thread cannot be created at all.
+    let retained = provider.clone();
+    let flush = std::thread::Builder::new()
         .name("permissionsync-trace-flush".to_owned())
         .spawn(move || {
             let _ = provider.shutdown_with_timeout(flush_budget);
             let _ = finished.send(());
-        })
-        .is_err()
-    {
-        // No thread was available for the final flush. Final telemetry is lost,
-        // which never affects terminating the service.
+        });
+
+    if flush.is_err() {
+        // No thread was available, so final telemetry is lost, which never
+        // affects terminating the service. The rejected closure took its handle
+        // down with it, so this is the last one, and letting it drop here would
+        // run the provider's own `Drop` on this runtime thread — the same
+        // blocking wait, answerable only by a worker task that itself needs a
+        // runtime thread. Retaining the handle instead keeps that wait from ever
+        // starting; the process is exiting immediately after.
+        std::mem::forget(retained);
         return;
     }
+
+    // The flush thread owns the provider now, so this handle performs nothing
+    // and the blocking path runs exactly once, on that thread.
+    drop(retained);
     let _ = tokio::time::timeout(flush_budget, flushed).await;
 }
 
@@ -369,12 +391,41 @@ pub(crate) fn build_tracer_provider(
 
     Ok(SdkTracerProvider::builder()
         .with_span_processor(processor)
-        .with_resource(
-            Resource::builder()
-                .with_service_name(env!("CARGO_PKG_NAME"))
-                .build(),
-        )
+        // Every value the SDK would otherwise take from the ambient process
+        // environment is set here instead. ADR 0011 defines exactly one
+        // configuration source, the YAML document, and rejects environment-value
+        // overrides; `TracerProviderBuilder`'s own default configuration reads
+        // `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG`, and the
+        // `OTEL_SPAN_*_COUNT_LIMIT` variables, and `Resource::builder()` runs
+        // detectors for `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`.
+        // Overriding each one makes the environment irrelevant rather than
+        // merely unlikely to be set.
+        .with_resource(permissionsync_resource())
+        // The SDK's own default sampling behaviour, stated explicitly.
+        .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
+        .with_max_attributes_per_span(MAX_SPAN_ATTRIBUTES)
+        .with_max_events_per_span(MAX_SPAN_EVENTS)
+        .with_max_links_per_span(MAX_SPAN_LINKS)
+        .with_max_attributes_per_event(MAX_ATTRIBUTES_PER_SPAN_EVENT)
+        .with_max_attributes_per_link(MAX_ATTRIBUTES_PER_SPAN_LINK)
         .build())
+}
+
+/// The exported span resource: exactly the fixed PermissionSync service name
+/// plus the SDK's own fixed telemetry identity.
+///
+/// Built from an empty resource on purpose. `Resource::builder()` would add
+/// `SdkProvidedResourceDetector` and `EnvResourceDetector`, which read
+/// `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`; the latter accepts an
+/// arbitrary attribute list, so ambient environment could attach arbitrary
+/// values — including deployment detail PermissionSync never configured — to
+/// every exported span. Only the telemetry-SDK detector is kept, because its
+/// attributes are fixed compile-time values and read no environment at all.
+fn permissionsync_resource() -> Resource {
+    Resource::builder_empty()
+        .with_detector(Box::new(TelemetryResourceDetector))
+        .with_service_name(env!("CARGO_PKG_NAME"))
+        .build()
 }
 
 /// The bounded span queue. Spans are dropped once it is full, which is
@@ -387,6 +438,18 @@ pub(crate) const SPAN_EXPORT_INTERVAL: Duration = Duration::from_secs(5);
 /// How many export requests may be in flight at once. Telemetry never fans out
 /// into concurrent outbound work.
 pub(crate) const BOUNDED_CONCURRENT_EXPORTS: usize = 1;
+
+/// Finite per-span limits, set explicitly so no `OTEL_SPAN_*_COUNT_LIMIT`
+/// environment value can widen or narrow them.
+///
+/// They are comfortably above what PermissionSync's fixed instrumentation emits
+/// — a handful of bounded fields per span — and below the SDK's own defaults, so
+/// a larger limit can never become a reason to attach more data to a span.
+pub(crate) const MAX_SPAN_ATTRIBUTES: u32 = 32;
+pub(crate) const MAX_SPAN_EVENTS: u32 = 64;
+pub(crate) const MAX_SPAN_LINKS: u32 = 8;
+pub(crate) const MAX_ATTRIBUTES_PER_SPAN_EVENT: u32 = 32;
+pub(crate) const MAX_ATTRIBUTES_PER_SPAN_LINK: u32 = 8;
 
 #[cfg(test)]
 mod tests {

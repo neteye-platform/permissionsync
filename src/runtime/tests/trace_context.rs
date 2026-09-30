@@ -15,7 +15,12 @@ use axum::{
 use opentelemetry_http::{Bytes, HttpClient};
 
 use crate::runtime::{
-    observability::{TracingConfiguration, build_tracer_provider, shutdown_tracer_provider},
+    observability::{
+        BOUNDED_CONCURRENT_EXPORTS, BOUNDED_EXPORT_BATCH, BOUNDED_SPAN_QUEUE,
+        MAX_ATTRIBUTES_PER_SPAN_EVENT, MAX_ATTRIBUTES_PER_SPAN_LINK, MAX_SPAN_ATTRIBUTES,
+        MAX_SPAN_EVENTS, MAX_SPAN_LINKS, TracingConfiguration, build_tracer_provider,
+        shutdown_tracer_provider,
+    },
     tests::support::{
         GLPI, HttpsFixture, RefusingEndpoint, RuntimeFixture, RuntimeFixtureOptions,
         ScriptedResponse, SigningMaterial, authenticator, emit_one_span, glpi_configuration,
@@ -547,6 +552,184 @@ async fn only_configured_and_protocol_headers_reach_the_backend() {
     );
 
     backend.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Trace configuration comes only from the configuration document
+// ---------------------------------------------------------------------------
+
+/// The OpenTelemetry environment variables the SDK would otherwise consume.
+///
+/// `Resource::builder()` runs detectors for the first two,
+/// `TracerProviderBuilder`'s default configuration reads the sampler pair, and
+/// the same default reads the three span-limit variables. Every value here is
+/// deliberately hostile: a foreign service identity, an injected resource
+/// attribute, sampling turned off, and span limits reduced to one.
+const AMBIENT_OTEL_ENVIRONMENT: [(&str, &str); 7] = [
+    ("OTEL_SERVICE_NAME", "sentinel-ambient-service"),
+    (
+        "OTEL_RESOURCE_ATTRIBUTES",
+        "sentinel.key=sentinel-ambient-attribute,service.namespace=sentinel-ambient-namespace",
+    ),
+    ("OTEL_TRACES_SAMPLER", "always_off"),
+    ("OTEL_TRACES_SAMPLER_ARG", "0.0"),
+    ("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", "1"),
+    ("OTEL_SPAN_EVENT_COUNT_LIMIT", "1"),
+    ("OTEL_SPAN_LINK_COUNT_LIMIT", "1"),
+];
+
+/// The distinctive parts of [`AMBIENT_OTEL_ENVIRONMENT`] that must never appear
+/// in the trace configuration.
+const AMBIENT_SENTINELS: [&str; 4] = [
+    "sentinel-ambient-service",
+    "sentinel-ambient-attribute",
+    "sentinel-ambient-namespace",
+    "sentinel.key",
+];
+
+/// Marks the re-executed child of the ambient-environment test.
+const AMBIENT_ENVIRONMENT_CHILD: &str = "PERMISSIONSYNC_TEST_AMBIENT_OTEL_CHILD";
+
+/// Asserts that a built provider's configuration is exactly the fixed
+/// PermissionSync configuration.
+///
+/// The provider renders its own sampler, span limits, and resource, so this
+/// inspects what the SDK will actually apply rather than what the builder was
+/// asked for.
+async fn assert_trace_configuration_is_exactly_pinned() {
+    let configuration = TracingConfiguration::new(
+        "https://otlp.example.test/v1/traces".to_owned(),
+        Duration::from_secs(5),
+        BTreeMap::new(),
+        Vec::new(),
+    )
+    .expect("a valid enabled tracing configuration");
+    let provider = build_tracer_provider(&configuration).expect("the provider builds locally");
+    // The provider renders the configuration the SDK will actually apply.
+    let rendered = format!("{provider:?}");
+    // Shut it down through the production path rather than dropping it: an
+    // un-shut-down provider's own `Drop` blocks the calling thread waiting for
+    // its batch worker to answer, which on a current-thread runtime is the very
+    // thread that worker needs.
+    shutdown_tracer_provider(provider, Duration::from_secs(10)).await;
+
+    // The SDK default behaviour, stated explicitly so `OTEL_TRACES_SAMPLER`
+    // cannot replace it.
+    assert!(
+        rendered.contains("sampler: ParentBased(AlwaysOn)"),
+        "unexpected sampler in {rendered}"
+    );
+
+    for (field, expected) in [
+        ("max_attributes_per_span", MAX_SPAN_ATTRIBUTES),
+        ("max_events_per_span", MAX_SPAN_EVENTS),
+        ("max_links_per_span", MAX_SPAN_LINKS),
+        ("max_attributes_per_event", MAX_ATTRIBUTES_PER_SPAN_EVENT),
+        ("max_attributes_per_link", MAX_ATTRIBUTES_PER_SPAN_LINK),
+    ] {
+        assert!(expected > 0, "{field} must be a finite positive limit");
+        assert!(
+            rendered.contains(&format!("{field}: {expected}")),
+            "{field} must be exactly {expected} in {rendered}"
+        );
+    }
+
+    // The exported resource is exactly the fixed service name plus the SDK's own
+    // fixed telemetry identity, and nothing else.
+    let attributes = rendered
+        .split_once("attrs: {")
+        .and_then(|(_, rest)| rest.split_once('}'))
+        .map(|(attributes, _)| attributes)
+        .expect("the rendered provider names its resource attributes");
+    for expected in [
+        "\"service.name\"",
+        "\"telemetry.sdk.name\"",
+        "\"telemetry.sdk.language\"",
+        "\"telemetry.sdk.version\"",
+    ] {
+        assert!(
+            attributes.contains(expected),
+            "{expected} must be a resource attribute in {attributes}"
+        );
+    }
+    assert_eq!(
+        attributes.matches("): ").count(),
+        4,
+        "the resource must carry exactly the four fixed attributes: {attributes}"
+    );
+    assert!(
+        rendered.contains("\"service.name\"): String(Static(\"permissionsync\"))"),
+        "the service name must be the fixed package name in {rendered}"
+    );
+
+    // No distinctive ambient value may appear anywhere. The numeric ambient
+    // values are not checked as substrings, because digits occur throughout the
+    // rendering; their effect is excluded by the exact sampler and span-limit
+    // assertions above, and by this one.
+    for sentinel in AMBIENT_SENTINELS {
+        assert!(
+            !rendered.contains(sentinel),
+            "the ambient environment leaked {sentinel} into the trace configuration: {rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains("AlwaysOff"),
+        "OTEL_TRACES_SAMPLER must not be able to disable sampling: {rendered}"
+    );
+}
+
+/// The trace configuration the runtime applies is exactly the fixed
+/// PermissionSync configuration.
+#[tokio::test]
+async fn the_trace_configuration_is_exactly_pinned() {
+    assert_trace_configuration_is_exactly_pinned().await;
+}
+
+/// Ambient OpenTelemetry environment variables cannot change any of it.
+///
+/// ADR 0011 defines one configuration source and rejects environment-value
+/// overrides, but the SDK's own defaults read `OTEL_SERVICE_NAME`,
+/// `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG`,
+/// and the `OTEL_SPAN_*_COUNT_LIMIT` variables.
+///
+/// The hostile environment is applied to a re-executed child process rather than
+/// to this one. Setting variables on a child requires no `unsafe`, which this
+/// crate forbids, and mutates nothing that this or any concurrent test can
+/// observe, so the test stays hermetic.
+#[tokio::test]
+async fn ambient_opentelemetry_environment_cannot_change_the_trace_configuration() {
+    if std::env::var_os(AMBIENT_ENVIRONMENT_CHILD).is_some() {
+        // The re-executed child, running with every hostile value set.
+        assert_trace_configuration_is_exactly_pinned().await;
+        return;
+    }
+
+    let status = std::process::Command::new(
+        std::env::current_exe().expect("the running test binary has a path"),
+    )
+    .args([
+        "--exact",
+        "--nocapture",
+        "runtime::tests::trace_context::ambient_opentelemetry_environment_cannot_change_the_trace_configuration",
+    ])
+    .env(AMBIENT_ENVIRONMENT_CHILD, "1")
+    .envs(AMBIENT_OTEL_ENVIRONMENT)
+    .status()
+    .expect("the test binary must be re-executable");
+
+    assert!(
+        status.success(),
+        "the trace configuration changed under ambient OpenTelemetry environment variables"
+    );
+}
+
+/// The batch values stay the fixed product values too, so no `OTEL_BSP_*`
+/// variable can widen the queue, the batch, or the export fan-out.
+#[test]
+fn the_batch_configuration_is_bounded_and_explicit() {
+    const { assert!(BOUNDED_SPAN_QUEUE > 0) };
+    const { assert!(BOUNDED_EXPORT_BATCH > 0 && BOUNDED_EXPORT_BATCH <= BOUNDED_SPAN_QUEUE) };
+    const { assert!(BOUNDED_CONCURRENT_EXPORTS == 1) };
 }
 
 // ---------------------------------------------------------------------------

@@ -464,19 +464,36 @@ async fn health() -> StatusCode {
 /// the authenticator's own ADR 0002 cache rules, so still-usable cached state
 /// stays ready during a temporary metadata outage, and evaluation may initiate
 /// at most one bounded refresh when no usable state exists.
+///
+/// # Why the evaluation is raced against shutdown
+///
+/// The bounded refresh this may start can be waiting on the trusted metadata
+/// source when shutdown begins. Checking the flag once up front would then let a
+/// probe that started while the process was still serving answer `200` after
+/// shutdown had already begun, because the refresh it was waiting for finally
+/// succeeded. ADR 0011 requires readiness to be false from the start of
+/// shutdown, so the evaluation is raced against
+/// [`Lifecycle::shutdown_started`](crate::runtime::lifecycle::Lifecycle::shutdown_started)
+/// with shutdown biased ahead of it: an in-flight probe abandons the refresh and
+/// answers `503` instead of waiting for it.
+///
+/// The request cancellation signal cannot serve this purpose: it is raised only
+/// when the shutdown grace period expires, which is deliberately much later.
 async fn readiness(State(state): State<Arc<RuntimeState>>) -> StatusCode {
-    if state.lifecycle().is_shutting_down() {
-        gauge!(READY).set(0.0);
-        return StatusCode::SERVICE_UNAVAILABLE;
-    }
-
     let cancellation = RequestCancellation::new(state.lifecycle());
     let context =
         SynchronizationContext::new(Instant::now() + state.readiness_budget(), &cancellation);
-    let ready = state
+    let evaluate = state
         .authenticator()
-        .ensure_trusted_verifier_state(&context)
-        .await;
+        .ensure_trusted_verifier_state(&context);
+
+    // `shutdown_started` resolves immediately when shutdown already began, so
+    // the biased branch also covers the probe that arrives during draining.
+    let ready = tokio::select! {
+        biased;
+        () = state.lifecycle().shutdown_started() => TrustedVerifierState::Unusable,
+        ready = evaluate => ready,
+    };
 
     match ready {
         TrustedVerifierState::Usable => {

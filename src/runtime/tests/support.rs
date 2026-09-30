@@ -513,6 +513,125 @@ impl Drop for StalledEndpoint {
     }
 }
 
+/// A local HTTPS endpoint that reports every arriving request and answers only
+/// when the test releases it.
+///
+/// It gives a deterministic *blocked* peer whose retrieval can still be made to
+/// succeed later: the TLS handshake completes and the request is fully read, so
+/// receiving the report proves retrieval really started, and no response is
+/// written until [`Self::release`] is called. That is what makes a race against
+/// shutdown expressible without any timing assumption — the test decides both
+/// when shutdown begins and when the retrieval would have succeeded.
+///
+/// An unreleased fixture answers nothing at all, which models a metadata source
+/// that simply never replies.
+pub(super) struct GatedHttpsFixture {
+    base_uri: String,
+    trust_anchor_pem: Vec<u8>,
+    requests: Arc<AtomicUsize>,
+    release: tokio::sync::watch::Sender<bool>,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl GatedHttpsFixture {
+    /// Starts the endpoint and returns it with the channel on which each
+    /// arriving request is reported.
+    ///
+    /// Every released request is answered with `response`.
+    pub(super) async fn start(
+        response: ScriptedResponse,
+    ) -> (Self, tokio::sync::mpsc::Receiver<()>) {
+        let identity = build_identity("127.0.0.1");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_uri = format!("https://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (shutdown, mut shutdown_receiver) = oneshot::channel();
+        let (arrived, arrivals) = tokio::sync::mpsc::channel(16);
+        let (release, released) = tokio::sync::watch::channel(false);
+        let acceptor = TlsAcceptor::from(identity.acceptor);
+
+        let task_requests = Arc::clone(&requests);
+        let task = tokio::spawn(async move {
+            // Connection tasks are owned here, so nothing is detached and a
+            // dropped fixture takes its blocked connections with it.
+            let mut held = Vec::new();
+            loop {
+                let accepted = tokio::select! {
+                    _ = &mut shutdown_receiver => break,
+                    accepted = listener.accept() => accepted,
+                };
+                let Ok((stream, _)) = accepted else { break };
+                let acceptor = acceptor.clone();
+                let requests = Arc::clone(&task_requests);
+                let arrived = arrived.clone();
+                let response = response.clone();
+                let mut released = released.clone();
+                held.push(tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let Ok(_request) = read_request(&mut stream).await else {
+                        return;
+                    };
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    // Reported only after the request was fully read, so a
+                    // receiver learns that retrieval really started.
+                    let _ = arrived.send(()).await;
+                    // Answer nothing until the test releases this endpoint.
+                    if released.wait_for(|released| *released).await.is_err() {
+                        return;
+                    }
+                    write_response(&mut stream, &response).await;
+                }));
+            }
+            for connection in held {
+                connection.abort();
+            }
+        });
+
+        (
+            Self {
+                base_uri,
+                trust_anchor_pem: identity.trust_anchor_pem,
+                requests,
+                release,
+                shutdown: Some(shutdown),
+                task: Some(task),
+            },
+            arrivals,
+        )
+    }
+
+    /// Lets every arrived and every future request be answered.
+    pub(super) fn release(&self) {
+        let _ = self.release.send(true);
+    }
+
+    pub(super) fn endpoint(&self, path: &str) -> String {
+        format!("{}{}", self.base_uri, path)
+    }
+
+    pub(super) fn trust_anchor_pem(&self) -> &[u8] {
+        &self.trust_anchor_pem
+    }
+
+    pub(super) fn request_count(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for GatedHttpsFixture {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 /// Emits exactly one finished, sampled span through a provider's own tracer.
 ///
 /// This is what makes a test exercise the configured span processor and exporter
@@ -636,6 +755,10 @@ pub(super) struct RuntimeFixtureOptions {
     pub(super) overall_request_deadline: Duration,
     pub(super) inbound_admission_limit: NonZeroUsize,
     pub(super) synchronization_capacity: NonZeroUsize,
+    /// The bounded readiness and warm-up budget. A test raises it when it needs
+    /// a readiness evaluation that cannot possibly end by expiring, so that any
+    /// answer it does produce must have come from somewhere else.
+    pub(super) readiness_budget: Duration,
     pub(super) trace_context_enabled: bool,
 }
 
@@ -648,6 +771,7 @@ impl Default for RuntimeFixtureOptions {
             overall_request_deadline: Duration::from_secs(30),
             inbound_admission_limit: NonZeroUsize::new(8).unwrap(),
             synchronization_capacity: NonZeroUsize::new(4).unwrap(),
+            readiness_budget: Duration::from_secs(5),
             trace_context_enabled: false,
         }
     }
@@ -693,7 +817,7 @@ impl RuntimeFixture {
             Arc::clone(&lifecycle),
             handle.clone(),
             options.overall_request_deadline,
-            Duration::from_secs(5),
+            options.readiness_budget,
             options.trace_context_enabled,
         ));
         let router = router(Arc::clone(&state));

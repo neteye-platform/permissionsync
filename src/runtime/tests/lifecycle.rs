@@ -830,9 +830,14 @@ fn the_fatal_accept_category_is_value_free() {
 /// The accept-failure classification, stated exhaustively over the Linux
 /// conditions `accept(2)` documents.
 ///
-/// This is checked against constructed `io::Error` values rather than by
-/// exhausting the test process's real descriptors, which would be neither
-/// deterministic nor isolated.
+/// Every condition is named through `libc`, so the expectations hold on every
+/// Linux architecture rather than only on the `asm-generic` numbering: `ENOBUFS`
+/// is 105 on x86-64, 55 on SPARC, and 132 on MIPS, and SPARC's `EHOSTDOWN` is
+/// the number `asm-generic` uses for `ENONET`.
+///
+/// The classification is checked against constructed `io::Error` values rather
+/// than by exhausting the test process's real descriptors, which would be
+/// neither deterministic nor isolated.
 #[test]
 fn accept_failures_are_classified_by_what_they_say_about_the_listener() {
     fn classify(errno: i32) -> AcceptFailure {
@@ -842,10 +847,10 @@ fn accept_failures_are_classified_by_what_they_say_about_the_listener() {
     // Local resource pressure: no descriptor, buffer, or memory right now. The
     // listener is healthy, so these are retried behind a fixed backoff.
     for (errno, name) in [
-        (23, "ENFILE"),
-        (24, "EMFILE"),
-        (105, "ENOBUFS"),
-        (12, "ENOMEM"),
+        (libc::ENFILE, "ENFILE"),
+        (libc::EMFILE, "EMFILE"),
+        (libc::ENOBUFS, "ENOBUFS"),
+        (libc::ENOMEM, "ENOMEM"),
     ] {
         assert_eq!(
             classify(errno),
@@ -857,20 +862,20 @@ fn accept_failures_are_classified_by_what_they_say_about_the_listener() {
     // Per-connection and already-pending network errors. `accept(2)` documents
     // these as retryable like `EAGAIN`.
     for (errno, name) in [
-        (103, "ECONNABORTED"),
-        (104, "ECONNRESET"),
-        (4, "EINTR"),
-        (11, "EAGAIN"),
-        (1, "EPERM"),
-        (64, "ENONET"),
-        (71, "EPROTO"),
-        (92, "ENOPROTOOPT"),
-        (95, "EOPNOTSUPP"),
-        (100, "ENETDOWN"),
-        (101, "ENETUNREACH"),
-        (110, "ETIMEDOUT"),
-        (112, "EHOSTDOWN"),
-        (113, "EHOSTUNREACH"),
+        (libc::ECONNABORTED, "ECONNABORTED"),
+        (libc::ECONNRESET, "ECONNRESET"),
+        (libc::EINTR, "EINTR"),
+        (libc::EAGAIN, "EAGAIN"),
+        (libc::EPERM, "EPERM"),
+        (libc::ENONET, "ENONET"),
+        (libc::EPROTO, "EPROTO"),
+        (libc::ENOPROTOOPT, "ENOPROTOOPT"),
+        (libc::EOPNOTSUPP, "EOPNOTSUPP"),
+        (libc::ENETDOWN, "ENETDOWN"),
+        (libc::ENETUNREACH, "ENETUNREACH"),
+        (libc::ETIMEDOUT, "ETIMEDOUT"),
+        (libc::EHOSTDOWN, "EHOSTDOWN"),
+        (libc::EHOSTUNREACH, "EHOSTUNREACH"),
     ] {
         assert_eq!(
             classify(errno),
@@ -880,7 +885,11 @@ fn accept_failures_are_classified_by_what_they_say_about_the_listener() {
     }
 
     // Only these say the listener itself stopped working.
-    for (errno, name) in [(9, "EBADF"), (22, "EINVAL"), (88, "ENOTSOCK")] {
+    for (errno, name) in [
+        (libc::EBADF, "EBADF"),
+        (libc::EINVAL, "EINVAL"),
+        (libc::ENOTSOCK, "ENOTSOCK"),
+    ] {
         assert_eq!(
             classify(errno),
             AcceptFailure::ListenerUnusable,
@@ -888,12 +897,61 @@ fn accept_failures_are_classified_by_what_they_say_about_the_listener() {
         );
     }
 
-    // An unrecognized failure is evidence about the listener, not an invitation
-    // to retry forever.
+    // An error carrying no `errno` at all is evidence about the listener, not an
+    // invitation to retry forever.
     assert_eq!(
         crate::runtime::classify_accept_failure_for_test(&std::io::Error::other("unknown")),
         AcceptFailure::ListenerUnusable
     );
+}
+
+/// No condition may be classified as both recoverable and fatal, and the two
+/// raw-`errno` sets must stay disjoint on the target architecture.
+///
+/// This is what would catch a future addition that happens to collide with an
+/// existing value on some Linux architecture.
+#[test]
+fn the_accept_failure_categories_are_disjoint() {
+    let resource: Vec<i32> = vec![libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM];
+    let transient: Vec<i32> = vec![
+        libc::ECONNABORTED,
+        libc::ECONNRESET,
+        libc::EINTR,
+        libc::EAGAIN,
+        libc::EPERM,
+        libc::ENONET,
+        libc::EPROTO,
+        libc::ENOPROTOOPT,
+        libc::EOPNOTSUPP,
+        libc::ENETDOWN,
+        libc::ENETUNREACH,
+        libc::ETIMEDOUT,
+        libc::EHOSTDOWN,
+        libc::EHOSTUNREACH,
+    ];
+    let unusable: Vec<i32> = vec![libc::EBADF, libc::EINVAL, libc::ENOTSOCK];
+
+    for errno in &resource {
+        assert!(!transient.contains(errno) && !unusable.contains(errno));
+    }
+    for errno in &transient {
+        assert!(!unusable.contains(errno));
+    }
+
+    // Classification really is a total function into one category per value.
+    for errno in resource.iter().chain(&transient).chain(&unusable) {
+        let classified = crate::runtime::classify_accept_failure_for_test(
+            &std::io::Error::from_raw_os_error(*errno),
+        );
+        let expected = if resource.contains(errno) {
+            AcceptFailure::ResourcePressure
+        } else if transient.contains(errno) {
+            AcceptFailure::Transient
+        } else {
+            AcceptFailure::ListenerUnusable
+        };
+        assert_eq!(classified, expected, "errno {errno} changed category");
+    }
 }
 
 /// Recoverable accept failures must never advance the fatal-listener count, so
@@ -904,8 +962,16 @@ fn only_listener_unusable_failures_advance_the_fatal_count() {
     let mut consecutive = 0_u32;
 
     // Far more recoverable failures than the threshold, none of them counted:
-    // the loop only calls the counter for `ListenerUnusable`.
-    for errno in [24, 23, 105, 12, 103, 4, 100] {
+    // the accept loop only calls the counter for `ListenerUnusable`.
+    for errno in [
+        libc::EMFILE,
+        libc::ENFILE,
+        libc::ENOBUFS,
+        libc::ENOMEM,
+        libc::ECONNABORTED,
+        libc::EINTR,
+        libc::ENETDOWN,
+    ] {
         let failure = crate::runtime::classify_accept_failure_for_test(
             &std::io::Error::from_raw_os_error(errno),
         );
