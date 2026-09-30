@@ -4,21 +4,125 @@ PermissionSync is an architecture-first service for synchronizing a user's
 desired permissions with a selected target. The active constraints are recorded
 in the [ADR index](docs/adr/README.md).
 
-The Rust workspace currently contains target-neutral Core domain contracts,
-deterministic runtime target routing, a concrete Generic REST Permission
-Provider, selected-target synchronization orchestration, and an internal
-`permissionsync-auth` boundary for technical-caller JWT verification and scope
-target selection, plus framework-neutral inbound HTTP request processing with
-authentication/authorization integration and a concrete GLPI Target Adapter
-implementing the selected GLPI V1 reconciliation contract, plus typed runtime
-configuration and deterministic application composition, with semantic
-application wiring from composed runtime state through selected-target
-orchestration to inbound request processing. Configuration delivery/loading,
-concrete runtime infrastructure and an actual HTTP server/listener with
-framework route registration, operational lifecycle (health/readiness,
-shutdown), observability, supported-Keycloak deployment contract tests, and
-OCI/runtime deployment integration remain future work; the internal auth-crate
-tests are not a deployment claim.
+The Rust workspace contains target-neutral Core domain contracts, deterministic
+runtime target routing, a concrete Generic REST Permission Provider,
+selected-target synchronization orchestration, an internal `permissionsync-auth`
+boundary for technical-caller JWT verification and scope target selection,
+framework-neutral inbound HTTP request processing, a concrete GLPI Target
+Adapter implementing the selected GLPI V1 reconciliation contract, typed runtime
+configuration with deterministic application composition, and the executable
+service runtime described below: YAML configuration delivery, an Axum listener,
+bounded inbound admission and synchronization capacity, health, readiness and
+metrics endpoints, graceful shutdown, structured logging, Prometheus metrics,
+and optional OTLP trace export.
+
+Supported-Keycloak deployment contract tests and OCI/Kubernetes packaging remain
+future work; the internal auth-crate tests are not a deployment claim.
+
+## Running the service
+
+The executable loads exactly one UTF-8 YAML configuration document. Its path
+comes only from the required `PERMISSIONSYNC_CONFIG_FILE` environment variable:
+
+```sh
+PERMISSIONSYNC_CONFIG_FILE=/etc/permissionsync/permissionsync.yaml permissionsync
+```
+
+There are no layered configuration files, command-line overrides, per-value
+environment overrides, environment substitution inside the document, include or
+merge mechanisms, or runtime reload. Comments are allowed and carry no
+semantics. Unknown or misspelled fields are rejected rather than ignored.
+
+A documented example with placeholder values only is in
+[docs/permissionsync.example.yaml](docs/permissionsync.example.yaml). Secrets
+and private trust material are supplied inline through that external file and
+are never built into the binary or image.
+
+### Configuration outline
+
+Every duration is an integer number of whole milliseconds, spelled with a
+`_milliseconds` field suffix. These top-level sections are required:
+
+| Section          | Contents                                                                                                                  |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `listener`       | `address` and a non-zero `port`                                                                                           |
+| `request`        | Overall deadline, inbound admission limit, synchronization capacity                                                       |
+| `shutdown`       | Grace period                                                                                                              |
+| `authentication` | Issuer, audience, algorithm allowlist, trusted source, cache policy, metadata timeout, clock skew, optional trust anchors |
+| `observability`  | Bounded `log_level`, optional `tracing`                                                                                   |
+| `targets`        | Logical target to adapter identifier routes                                                                               |
+
+The `provider` and `glpi` sections are optional. The Provider selects one
+supported implementation (`generic_rest`), and `glpi` configures the one
+process-wide GLPI backend.
+
+Startup aborts for a global defect: an unreadable, non-UTF-8, empty,
+multi-document, or malformed file; an unknown top-level field; an invalid
+listener, deadline, admission limit, or capacity; a synchronization capacity
+above the product ceiling of 1024; a shutdown grace below the overall deadline;
+invalid authentication configuration; invalid tracing configuration while export
+is explicitly enabled; a duplicate or grammar-invalid logical target; or a
+listener that cannot be bound.
+
+Startup does **not** abort because a component is unusable. An absent or invalid
+`provider` section leaves the Provider unavailable, and an absent or invalid
+`glpi` section leaves every configured route selecting `glpi` recognized but
+unavailable. Unrelated correctly configured routes stay serviceable, targetless
+requests keep working, and a temporarily unreachable Keycloak, Provider, GLPI, or
+telemetry backend never prevents startup.
+
+### Endpoints
+
+All four paths are served on the single configured listener:
+
+| Path             | Method | Behaviour                                                                             |
+| ---------------- | ------ | ------------------------------------------------------------------------------------- |
+| `/api/sync-user` | `POST` | The synchronization contract, with an empty response body                             |
+| `/healthz`       | `GET`  | `200` while the process and HTTP runtime are functioning                              |
+| `/readyz`        | `GET`  | `200` only while the authenticator has usable trusted verifier state, otherwise `503` |
+| `/metrics`       | `GET`  | Prometheus text exposition                                                            |
+
+Readiness means that PermissionSync can currently verify technical callers
+safely. It does not require current Keycloak connectivity while still-usable
+cached verification material exists, and it never depends on the Provider, GLPI,
+a target, or a telemetry backend. It turns false as soon as shutdown begins.
+
+The three operational endpoints need no inbound admission, so they stay
+observable while synchronization is saturated. They expose no secrets, URLs,
+targets, credentials, trust material, JWT details, or internal errors, and there
+is no general status or configuration endpoint.
+
+The inbound synchronization body has a fixed one-mebibyte product limit. It is
+not configurable, and exceeding it is a body-validation outcome in the fixed
+processing order rather than an immediate transport rejection.
+
+### Observability
+
+Ordinary runtime events are structured JSON on standard output; startup and
+fatal diagnostics go to standard error as fixed, value-free categories.
+Configuration selects only the bounded log-level threshold.
+
+Prometheus metrics are always available at `/metrics` and use only closed,
+low-cardinality label values. Trace export is an additional optional channel,
+disabled unless `observability.tracing.enabled` is `true`. When enabled, spans
+are exported over OTLP/HTTP with protobuf encoding to one absolute HTTPS
+endpoint, using mandatory certificate and hostname validation, refusing every
+redirect, and sending configured exporter credentials only to that endpoint's
+origin. Export is asynchronous, batched, and bounded: an unavailable, slow, or
+failing backend drops telemetry instead of affecting a synchronization outcome,
+readiness, or capacity. Inbound W3C `traceparent` and `tracestate` are accepted
+as transport metadata only; a malformed value counts as missing telemetry
+context and never changes an outcome. No trace-context header is added to
+Provider or Target Adapter requests.
+
+### Shutdown
+
+On `SIGTERM` or `SIGINT` the process marks readiness false, stops accepting,
+admits no further synchronization request and releases pending admission waits,
+lets already admitted requests finish within the configured grace period, then
+cancels the remaining request contexts, terminates and awaits its remaining
+tasks, and performs a bounded trace flush when tracing is enabled. Final
+telemetry may be lost if the exporter is still unavailable.
 
 ## Development
 

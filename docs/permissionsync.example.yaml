@@ -1,0 +1,156 @@
+# Example PermissionSync runtime configuration.
+#
+# This file contains placeholders only. Replace every REPLACE_WITH_* value and
+# every example host before use, and keep the real file outside the image with
+# permissions appropriate for the credentials and private trust material it
+# carries.
+#
+# The executable loads exactly one UTF-8 YAML document, whose path comes only
+# from the PERMISSIONSYNC_CONFIG_FILE environment variable. There are no layered
+# files, no command-line overrides, no per-value environment overrides, no
+# environment substitution inside this document, no include or merge mechanism,
+# and no runtime reload. Comments like these carry no semantics and are not
+# retained.
+#
+# Every duration is an integer number of whole milliseconds and is spelled with
+# a _milliseconds field suffix. There is no second duration syntax.
+#
+# Unknown or misspelled fields are rejected rather than ignored.
+
+# The single listener. Terminating TLS in front of PermissionSync is a
+# deployment concern.
+listener:
+  address: "0.0.0.0"
+  port: 8443
+
+request:
+  # The one absolute deadline for a synchronization request. It starts when the
+  # request is accepted and covers admission waiting, body collection,
+  # authentication, validation, routing, capacity, Provider, and Adapter work.
+  # Configure it below the caller's own HTTP timeout.
+  overall_deadline_milliseconds: 10000
+
+  # How many synchronization requests may be admitted concurrently. This bounds
+  # aggregate request-body buffering and pre-selected-target work. Operational
+  # endpoints need no admission.
+  inbound_admission_limit: 64
+
+  # How many selected-target synchronizations may run concurrently. Must be
+  # positive and at most 1024.
+  synchronization_capacity: 16
+
+shutdown:
+  # Must be positive and at least request.overall_deadline_milliseconds, so
+  # every compliant request accepted before shutdown has time to return.
+  grace_milliseconds: 20000
+
+authentication:
+  # The trusted Keycloak issuer, matched exactly.
+  issuer: "https://keycloak.example.test/realms/neteye"
+
+  # The audience PermissionSync requires in the caller's token. Additional
+  # audience values are permitted.
+  audience: "permissionsync"
+
+  # The signing-algorithm allowlist. Use the smallest set the deployment issues.
+  algorithms: ["RS256"]
+
+  # Exactly one trusted verification source. Use oidc_discovery_uri to discover
+  # the JWKS URI, or jwks_uri to name it directly. Both must be HTTPS.
+  source:
+    oidc_discovery_uri: "https://keycloak.example.test/realms/neteye/.well-known/openid-configuration"
+    # jwks_uri: "https://keycloak.example.test/realms/neteye/protocol/openid-connect/certs"
+
+  cache:
+    # How long retained verification material counts as fresh.
+    freshness_milliseconds: 300000
+    # Additional bounded grace during which still-usable material may verify a
+    # token while the metadata source is unavailable. Readiness stays true for
+    # this whole window.
+    stale_if_error_milliseconds: 600000
+
+  # Bounded budget for one JWKS or discovery retrieval. Must be positive and no
+  # greater than request.overall_deadline_milliseconds.
+  metadata_operation_timeout_milliseconds: 3000
+
+  # Bounded clock skew allowance, at most 300000.
+  clock_skew_milliseconds: 30000
+
+  # Optional private trust anchors, in addition to the system roots. Each entry
+  # is an inline PEM bundle.
+  # additional_trust_anchors_pem:
+  #   - |
+  #     -----BEGIN CERTIFICATE-----
+  #     REPLACE_WITH_KEYCLOAK_CA_CERTIFICATE
+  #     -----END CERTIFICATE-----
+
+observability:
+  # One of: error, warn, info, debug, trace. Structured JSON on standard output
+  # and the redaction rules are fixed; only this threshold is configurable.
+  log_level: info
+
+  # Trace export is optional and disabled unless this section enables it.
+  # Structured logs and Prometheus metrics stay available either way, and an
+  # unavailable telemetry backend never affects a synchronization outcome or
+  # readiness.
+  # tracing:
+  #   enabled: true
+  #   # One absolute HTTPS endpoint. Certificate and hostname validation are
+  #   # mandatory, there is no plaintext fallback, and no redirect is followed.
+  #   endpoint: "https://otlp.example.test/v1/traces"
+  #   export_timeout_milliseconds: 5000
+  #   # Optional static exporter credentials. They are sent only to the
+  #   # endpoint origin above and never appear in logs, metrics, or errors.
+  #   headers:
+  #     authorization: "REPLACE_WITH_OTLP_EXPORTER_CREDENTIAL"
+  #   # additional_trust_anchors_pem:
+  #   #   - |
+  #   #     -----BEGIN CERTIFICATE-----
+  #   #     REPLACE_WITH_OTLP_CA_CERTIFICATE
+  #   #     -----END CERTIFICATE-----
+
+# The process-wide Permission Provider. This section is optional: when it is
+# absent or unusable, selected-target synchronization fails server-side while
+# targetless requests and the operational endpoints keep working.
+provider:
+  generic_rest:
+    # One complete HTTPS request URI, with no query or fragment.
+    endpoint: "https://provider.example.test/permissions"
+    # Must be positive and no greater than
+    # request.overall_deadline_milliseconds.
+    operation_timeout_milliseconds: 5000
+    # additional_trust_anchors_pem:
+    #   - |
+    #     -----BEGIN CERTIFICATE-----
+    #     REPLACE_WITH_PROVIDER_CA_CERTIFICATE
+    #     -----END CERTIFICATE-----
+
+# The one process-wide GLPI backend. This section is optional: when it is absent
+# or unusable, every configured route selecting the glpi adapter stays
+# recognized but unavailable, and unrelated routes keep working.
+glpi:
+  endpoint: "https://glpi.example.test/apirest.php"
+  app_token: "REPLACE_WITH_GLPI_APP_TOKEN"
+  user_token: "REPLACE_WITH_GLPI_SERVICE_ACCOUNT_USER_TOKEN"
+  # Must be positive and no greater than
+  # request.overall_deadline_milliseconds.
+  operation_timeout_milliseconds: 5000
+  # additional_trust_anchors_pem:
+  #   - |
+  #     -----BEGIN CERTIFICATE-----
+  #     REPLACE_WITH_GLPI_CA_CERTIFICATE
+  #     -----END CERTIFICATE-----
+  # The authentication source used when creating a missing GLPI user. Omit the
+  # whole section to rely on GLPI's own defaults; when present, both fields are
+  # required together.
+  # authentication_source:
+  #   authtype: 3
+  #   auths_id: 2
+
+# Configured logical target routes. A logical target is exactly the suffix of
+# the caller's permissionsync:<target> scope token, matched exactly. Each route
+# selects one adapter identifier; glpi is the GLPI adapter. Duplicate or
+# grammar-invalid logical targets fail startup.
+targets:
+  - logical_target: "glpi"
+    adapter: "glpi"

@@ -1,0 +1,285 @@
+//! `GET /readyz` behaviour.
+//!
+//! Readiness is evaluated against the real authenticator, never against a
+//! separate readiness flag, and depends only on whether usable trusted verifier
+//! state exists under ADR 0002.
+
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+
+use axum::{body::Body, http::StatusCode};
+
+use crate::runtime::{
+    tests::support::{
+        GLPI, HttpsFixture, RefusingEndpoint, RuntimeFixture, RuntimeFixtureOptions,
+        ScriptedResponse, SigningMaterial, authenticator, body_bytes, glpi_configuration,
+        jwks_fixture, provider_configuration, target, unavailable_jwks_fixture, valid_body,
+    },
+    transport::READINESS_ROUTE,
+};
+
+const UNREACHABLE_GLPI: &str = "https://127.0.0.1:1/apirest.php";
+
+struct Scenario {
+    jwks: HttpsFixture,
+    signing: SigningMaterial,
+    fixture: RuntimeFixture,
+}
+
+impl Scenario {
+    async fn with_metadata(
+        jwks: HttpsFixture,
+        signing: SigningMaterial,
+        options: impl FnOnce(&mut RuntimeFixtureOptions),
+    ) -> Self {
+        let mut fixture_options = RuntimeFixtureOptions::default();
+        options(&mut fixture_options);
+        let fixture = RuntimeFixture::new(
+            authenticator(jwks.endpoint("/keys"), jwks.trust_anchor_pem().to_vec()),
+            fixture_options,
+        );
+        Self {
+            jwks,
+            signing,
+            fixture,
+        }
+    }
+
+    async fn available(options: impl FnOnce(&mut RuntimeFixtureOptions)) -> Self {
+        let signing = SigningMaterial::new("readiness-test-key");
+        let jwks = jwks_fixture(&signing, 8).await;
+        Self::with_metadata(jwks, signing, options).await
+    }
+
+    async fn unavailable(options: impl FnOnce(&mut RuntimeFixtureOptions)) -> Self {
+        let signing = SigningMaterial::new("readiness-test-key");
+        let jwks = unavailable_jwks_fixture(8).await;
+        Self::with_metadata(jwks, signing, options).await
+    }
+
+    async fn readiness(&self) -> StatusCode {
+        self.fixture.get(READINESS_ROUTE).await.status()
+    }
+
+    async fn finish(self) {
+        self.jwks.shutdown().await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Trusted verifier state
+// ---------------------------------------------------------------------------
+
+/// With no usable trusted state and an unavailable metadata source, readiness is
+/// false. Exactly one bounded refresh is attempted per evaluation.
+#[tokio::test]
+async fn no_usable_trusted_state_is_not_ready() {
+    let scenario = Scenario::unavailable(|_| {}).await;
+
+    assert_eq!(scenario.readiness().await, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        scenario.jwks.request_count(),
+        1,
+        "readiness may initiate at most one bounded refresh"
+    );
+
+    scenario.finish().await;
+}
+
+/// A successful bounded warm-up through readiness makes the process ready, and
+/// a subsequent evaluation needs no further retrieval while the state is fresh.
+#[tokio::test]
+async fn a_successful_warm_up_makes_the_process_ready() {
+    let scenario = Scenario::available(|_| {}).await;
+
+    assert_eq!(scenario.readiness().await, StatusCode::OK);
+    assert_eq!(scenario.jwks.request_count(), 1);
+
+    assert_eq!(scenario.readiness().await, StatusCode::OK);
+    assert_eq!(
+        scenario.jwks.request_count(),
+        1,
+        "usable trusted state needs no further metadata retrieval"
+    );
+
+    scenario.finish().await;
+}
+
+/// Once usable trusted state exists, a metadata outage does not make the
+/// process unready: readiness means safe caller verification, not current
+/// Keycloak connectivity.
+#[tokio::test]
+async fn a_metadata_outage_after_warm_up_keeps_usable_cached_state_ready() {
+    let signing = SigningMaterial::new("readiness-test-key");
+    // One successful JWKS response, then the source fails.
+    let jwks = HttpsFixture::start(vec![
+        ScriptedResponse::jwks(signing.jwks()),
+        ScriptedResponse::empty(500),
+        ScriptedResponse::empty(500),
+    ])
+    .await;
+    let scenario = Scenario::with_metadata(jwks, signing, |_| {}).await;
+
+    assert_eq!(scenario.readiness().await, StatusCode::OK);
+    let after_warm_up = scenario.jwks.request_count();
+
+    // The source is now failing, but the cached state is still fresh.
+    assert_eq!(scenario.readiness().await, StatusCode::OK);
+    assert_eq!(
+        scenario.jwks.request_count(),
+        after_warm_up,
+        "a fresh cache is not refreshed just because a probe arrived"
+    );
+
+    scenario.finish().await;
+}
+
+/// Concurrent readiness evaluations reuse the authenticator's existing refresh
+/// serialization instead of each consulting the trusted source.
+#[tokio::test]
+async fn concurrent_readiness_evaluations_do_not_create_a_metadata_herd() {
+    let scenario = Arc::new(Scenario::available(|_| {}).await);
+    let mut probes = Vec::new();
+    for _ in 0..8 {
+        let scenario = Arc::clone(&scenario);
+        probes.push(tokio::spawn(async move { scenario.readiness().await }));
+    }
+
+    for probe in probes {
+        let status = tokio::time::timeout(Duration::from_secs(10), probe)
+            .await
+            .expect("every probe must answer")
+            .expect("probe task must not panic");
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(
+        scenario.jwks.request_count(),
+        1,
+        "concurrent evaluations must issue one metadata request"
+    );
+
+    Arc::try_unwrap(scenario)
+        .map_err(|_| "scenario is still shared")
+        .unwrap()
+        .finish()
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// Independence from everything else
+// ---------------------------------------------------------------------------
+
+/// An unavailable Provider, an unavailable GLPI adapter, an unavailable target,
+/// and no telemetry backend must all leave readiness untouched.
+#[tokio::test]
+async fn readiness_ignores_provider_glpi_target_and_telemetry_availability() {
+    let refusing = RefusingEndpoint::start().await;
+    let scenario = Scenario::available(|options| {
+        // A Provider endpoint that cannot be reached, a GLPI endpoint that
+        // cannot be reached, and a route whose adapter is unavailable.
+        options.provider = Some(provider_configuration(
+            &refusing.endpoint("/permissions"),
+            Vec::new(),
+        ));
+        options.glpi = Some(glpi_configuration(UNREACHABLE_GLPI));
+        options.targets = vec![target("glpi", GLPI), target("absent", "uncompiled-adapter")];
+    })
+    .await;
+
+    assert_eq!(scenario.readiness().await, StatusCode::OK);
+
+    // Drive a selected-target request that fails server-side, then confirm
+    // readiness is still unaffected.
+    let token = scenario.signing.token(Some("permissionsync:glpi"));
+    assert_eq!(
+        scenario
+            .fixture
+            .synchronize(Some(&token), Body::from(valid_body()))
+            .await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(scenario.readiness().await, StatusCode::OK);
+
+    scenario.finish().await;
+}
+
+/// Readiness is independent of synchronization saturation: it takes no
+/// admission permit and no synchronization capacity.
+#[tokio::test]
+async fn readiness_answers_while_synchronization_is_saturated() {
+    let scenario = Scenario::available(|options| {
+        options.inbound_admission_limit = NonZeroUsize::new(1).unwrap();
+        options.synchronization_capacity = NonZeroUsize::new(1).unwrap();
+    })
+    .await;
+
+    let held = scenario
+        .fixture
+        .state
+        .admission()
+        .admit(
+            std::time::Instant::now() + Duration::from_secs(600),
+            &scenario.fixture.lifecycle,
+        )
+        .await
+        .expect("the configured limit must be admissible");
+    assert_eq!(scenario.fixture.state.admission().available_permits(), 0);
+
+    assert_eq!(scenario.readiness().await, StatusCode::OK);
+    assert_eq!(
+        scenario.fixture.state.capacity().available_permits(),
+        1,
+        "readiness must not take selected-target capacity"
+    );
+
+    drop(held);
+    scenario.finish().await;
+}
+
+// ---------------------------------------------------------------------------
+// Shutdown
+// ---------------------------------------------------------------------------
+
+/// Readiness turns false immediately when shutdown begins, before anything else
+/// happens, and without consulting the metadata source again.
+#[tokio::test]
+async fn readiness_is_false_immediately_when_shutdown_begins() {
+    let scenario = Scenario::available(|_| {}).await;
+    assert_eq!(scenario.readiness().await, StatusCode::OK);
+    let before_shutdown = scenario.jwks.request_count();
+
+    scenario.fixture.lifecycle.begin_shutdown();
+
+    assert_eq!(scenario.readiness().await, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        scenario.jwks.request_count(),
+        before_shutdown,
+        "a shutting-down process reports unready without any further retrieval"
+    );
+
+    scenario.finish().await;
+}
+
+// ---------------------------------------------------------------------------
+// Disclosure
+// ---------------------------------------------------------------------------
+
+/// Readiness exposes no configuration, trust material, or internal detail.
+#[tokio::test]
+async fn readiness_responses_disclose_nothing() {
+    let scenario = Scenario::available(|options| {
+        options.glpi = Some(glpi_configuration(UNREACHABLE_GLPI));
+        options.targets = vec![target("glpi", GLPI)];
+    })
+    .await;
+
+    let ready = scenario.fixture.get(READINESS_ROUTE).await;
+    assert_eq!(ready.status(), StatusCode::OK);
+    let body = body_bytes(ready).await;
+
+    assert!(
+        body.is_empty(),
+        "readiness answers with a status, not with detail"
+    );
+
+    scenario.finish().await;
+}
