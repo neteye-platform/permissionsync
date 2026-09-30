@@ -2,8 +2,13 @@
 //!
 //! This crate accepts already-buffered HTTP request material but deliberately
 //! does not choose an HTTP server, listener, routing implementation, runtime
-//! configuration, or response-body format. It authenticates before examining
-//! the body and exposes only coarse, safe semantic outcomes.
+//! configuration, response-body format, or the numeric inbound body limit. It
+//! authenticates before examining the body and exposes only coarse, safe
+//! semantic outcomes.
+//!
+//! The transport owns bounded body collection and reports its result through
+//! [`InboundBody`], so an oversized body stays a body-validation outcome in
+//! ADR 0001 order rather than an immediate transport rejection.
 
 use std::time::Instant;
 
@@ -53,6 +58,29 @@ impl<'a> HeaderList<'a> {
     pub const fn new(fields: &'a [HeaderField<'a>]) -> Self {
         Self { fields }
     }
+}
+
+/// The result of bounded inbound synchronization-body collection.
+///
+/// The transport enforces the fixed product limit on the inbound body and
+/// reports the result here instead of buffering an unbounded body or rejecting
+/// an oversized one immediately. This boundary therefore keeps the ADR 0001
+/// processing order: authentication, structural scope validation, scope
+/// cardinality, and suffix validation still resolve first and keep their
+/// outcomes, and an exceeded bound becomes a body-validation failure only when
+/// processing reaches body validation.
+///
+/// This type carries the body bytes, so it intentionally has no formatting
+/// implementation.
+#[must_use]
+pub enum InboundBody<'a> {
+    /// The complete request body, collected within the transport's fixed bound.
+    Collected(&'a [u8]),
+    /// Collection stopped because the transport's fixed bound was exceeded.
+    ///
+    /// No body bytes are retained and nothing was parsed. This is distinct from
+    /// a malformed body: it states only that the bound was exceeded.
+    BoundExceeded,
 }
 
 /// A safe, bounded stage/category signal, not caller-facing response detail.
@@ -140,7 +168,7 @@ impl<'a> InboundHttpHandler<'a> {
     pub async fn handle<'request>(
         &self,
         headers: HeaderList<'request>,
-        body: &'request [u8],
+        body: InboundBody<'request>,
         context: SynchronizationContext<'request>,
     ) -> HttpOutcome {
         if context_unavailable(&context) {
@@ -173,7 +201,7 @@ impl<'a> InboundHttpHandler<'a> {
     async fn continue_after_authentication<'request>(
         &self,
         authentication: Result<AuthenticatedTechnicalCaller, AuthenticationError>,
-        body: &'request [u8],
+        body: InboundBody<'request>,
         context: SynchronizationContext<'request>,
     ) -> HttpOutcome {
         let authenticated = match authentication {
@@ -199,18 +227,24 @@ impl<'a> InboundHttpHandler<'a> {
         &self,
         bearer: &TechnicalCallerBearerToken,
         selected_target: Option<&permissionsync_core::LogicalTarget>,
-        body: &'request [u8],
+        body: InboundBody<'request>,
         context: SynchronizationContext<'request>,
     ) -> HttpOutcome {
+        // Body validation happens only here, after authentication and complete
+        // scope processing. An exceeded transport bound is parsed as nothing at
+        // all and resolves exactly like any other body-validation failure.
+        let parsed = match body {
+            InboundBody::Collected(bytes) => Some(serde_json::from_slice::<LoginBody>(bytes)),
+            InboundBody::BoundExceeded => None,
+        };
         // Preserve cancellation/deadline precedence over the body result: a
         // request that expires during parsing is a synchronization failure.
-        let parsed = serde_json::from_slice::<LoginBody>(body);
         if context_unavailable(&context) {
             return HttpOutcome::CancelledOrExpired;
         }
         let body = match parsed {
-            Ok(body) if body.event_type == "LOGIN" => body,
-            Ok(_) | Err(_) => return HttpOutcome::InvalidRequest,
+            Some(Ok(body)) if body.event_type == "LOGIN" => body,
+            Some(Ok(_) | Err(_)) | None => return HttpOutcome::InvalidRequest,
         };
         let identity = IdentityContext::new(body.username, body.groups);
 
@@ -366,7 +400,8 @@ mod tests {
     use tokio_native_tls::TlsAcceptor;
 
     use super::{
-        HeaderField, HeaderList, HttpOutcome, InboundHttpHandler, LoginBody, extract_bearer,
+        HeaderField, HeaderList, HttpOutcome, InboundBody, InboundHttpHandler, LoginBody,
+        extract_bearer,
     };
 
     struct NeverCancelled;
@@ -593,8 +628,11 @@ mod tests {
     fn context<'a>(cancellation: &'a dyn CancellationSignal) -> SynchronizationContext<'a> {
         SynchronizationContext::new(Instant::now() + Duration::from_secs(3600), cancellation)
     }
-    fn body() -> &'static [u8] {
-        br#"{"event_type":"LOGIN","username":"u","groups":["a","a"]}"#
+    fn body() -> InboundBody<'static> {
+        InboundBody::Collected(br#"{"event_type":"LOGIN","username":"u","groups":["a","a"]}"#)
+    }
+    fn collected(bytes: &[u8]) -> InboundBody<'_> {
+        InboundBody::Collected(bytes)
     }
     fn count(calls: &Calls) -> (usize, usize, usize) {
         (
@@ -936,7 +974,11 @@ mod tests {
         let handler = InboundHttpHandler::new(&authenticator, &sync);
         let fields = [HeaderField::new(b"authorization", b"Basic secret")];
         assert_outcome(
-            poll_ready(handler.handle(HeaderList::new(&fields), b"{", context(&NeverCancelled))),
+            poll_ready(handler.handle(
+                HeaderList::new(&fields),
+                collected(b"{"),
+                context(&NeverCancelled),
+            )),
             HttpOutcome::AuthenticationRejected,
             401,
         );
@@ -979,7 +1021,7 @@ mod tests {
             assert_outcome(
                 poll_ready(handler.continue_after_authentication(
                     Err(error),
-                    b"{",
+                    collected(b"{"),
                     context(&NeverCancelled),
                 )),
                 expected,
@@ -987,6 +1029,126 @@ mod tests {
             );
             assert_eq!(count(&calls), (0, 0, 0));
         }
+    }
+
+    /// An exceeded transport bound must not short-circuit ADR 0001 precedence:
+    /// every authentication and authorization outcome still resolves first.
+    #[test]
+    fn authentication_and_authorization_precede_an_exceeded_body_bound() {
+        let calls = Arc::new(Calls::default());
+        let router = selected_router(calls.clone(), ResultKind::Changed, true);
+        let provider = FakeProvider {
+            calls: calls.clone(),
+            kind: ResultKind::Changed,
+        };
+        let capacity = FakeCapacity {
+            calls: calls.clone(),
+            fails: false,
+        };
+        let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
+        let authenticator = auth();
+        let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
+        for (error, expected) in [
+            (
+                permissionsync_auth::AuthenticationError::Rejected,
+                HttpOutcome::AuthenticationRejected,
+            ),
+            (
+                permissionsync_auth::AuthenticationError::Forbidden,
+                HttpOutcome::AuthorizationForbidden,
+            ),
+            (
+                permissionsync_auth::AuthenticationError::VerifierUnavailable,
+                HttpOutcome::VerifierUnavailable,
+            ),
+        ] {
+            assert_outcome(
+                poll_ready(handler.continue_after_authentication(
+                    Err(error),
+                    InboundBody::BoundExceeded,
+                    context(&NeverCancelled),
+                )),
+                expected,
+                expected.status_code(),
+            );
+            assert_eq!(count(&calls), (0, 0, 0));
+        }
+    }
+
+    /// Once processing reaches body validation, an exceeded bound is exactly a
+    /// body-validation failure, for both the targetless and selected-target
+    /// paths, and it starts no target work.
+    #[test]
+    fn an_exceeded_body_bound_is_bad_request_at_body_validation() {
+        let calls = Arc::new(Calls::default());
+        let router = selected_router(calls.clone(), ResultKind::Changed, true);
+        let provider = FakeProvider {
+            calls: calls.clone(),
+            kind: ResultKind::Changed,
+        };
+        let capacity = FakeCapacity {
+            calls: calls.clone(),
+            fails: false,
+        };
+        let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
+        let authenticator = auth();
+        let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
+        let bearer = TechnicalCallerBearerToken::new("sentinel-bearer".to_owned());
+        let selected = target("target-a");
+
+        assert_outcome(
+            poll_ready(handler.handle_authenticated(
+                &bearer,
+                None,
+                InboundBody::BoundExceeded,
+                context(&NeverCancelled),
+            )),
+            HttpOutcome::InvalidRequest,
+            400,
+        );
+        assert_outcome(
+            poll_ready(handler.handle_authenticated(
+                &bearer,
+                Some(&selected),
+                InboundBody::BoundExceeded,
+                context(&NeverCancelled),
+            )),
+            HttpOutcome::InvalidRequest,
+            400,
+        );
+        assert_eq!(count(&calls), (0, 0, 0));
+    }
+
+    /// Deadline and cancellation keep precedence over the body result, so an
+    /// exceeded bound on an expired request stays a synchronization failure.
+    #[test]
+    fn cancellation_precedes_an_exceeded_body_bound() {
+        let calls = Arc::new(Calls::default());
+        let router = selected_router(calls.clone(), ResultKind::Changed, true);
+        let provider = FakeProvider {
+            calls: calls.clone(),
+            kind: ResultKind::Changed,
+        };
+        let capacity = FakeCapacity {
+            calls: calls.clone(),
+            fails: false,
+        };
+        let synchronizer = SelectedTargetSynchronizer::new(&router, Some(&provider), &capacity);
+        let authenticator = auth();
+        let handler = InboundHttpHandler::new(&authenticator, &synchronizer);
+        let bearer = TechnicalCallerBearerToken::new("sentinel-bearer".to_owned());
+
+        assert_outcome(
+            poll_ready(handler.handle_authenticated(
+                &bearer,
+                None,
+                InboundBody::BoundExceeded,
+                context(&Cancelled),
+            )),
+            HttpOutcome::CancelledOrExpired,
+            500,
+        );
+        assert_eq!(count(&calls), (0, 0, 0));
     }
 
     #[test]
@@ -1052,7 +1214,12 @@ mod tests {
         );
         assert_eq!(count(&calls), (0, 0, 0));
         assert_outcome(
-            poll_ready(handler.handle_authenticated(&bearer, None, b"{", context(&NeverCancelled))),
+            poll_ready(handler.handle_authenticated(
+                &bearer,
+                None,
+                collected(b"{"),
+                context(&NeverCancelled),
+            )),
             HttpOutcome::InvalidRequest,
             400,
         );
@@ -1060,7 +1227,7 @@ mod tests {
             poll_ready(handler.handle_authenticated(
                 &bearer,
                 Some(&target("target-a")),
-                b"{",
+                collected(b"{"),
                 context(&NeverCancelled),
             )),
             HttpOutcome::InvalidRequest,
@@ -1142,7 +1309,7 @@ mod tests {
                 poll_ready(handler.handle_authenticated(
                     &bearer,
                     Some(&selected),
-                    input,
+                    collected(input),
                     context(&NeverCancelled),
                 )),
                 HttpOutcome::InvalidRequest,
@@ -1177,7 +1344,7 @@ mod tests {
             poll_ready(handler.handle_authenticated(
                 &bearer,
                 Some(&selected),
-                request,
+                collected(request),
                 request_context,
             )),
             HttpOutcome::Changed,
@@ -1373,7 +1540,7 @@ mod tests {
             Duration::from_secs(10),
             handler.handle(
                 HeaderList::new(&headers),
-                body.as_bytes(),
+                collected(body.as_bytes()),
                 SynchronizationContext::new(deadline, &cancellation),
             ),
         )
@@ -1410,7 +1577,11 @@ mod tests {
         let headers = [HeaderField::new(b"Authorization", b"Bearer segment")];
         assert_outcome(
             handler
-                .handle(HeaderList::new(&headers), b"{", context(&NeverCancelled))
+                .handle(
+                    HeaderList::new(&headers),
+                    collected(b"{"),
+                    context(&NeverCancelled),
+                )
                 .await,
             HttpOutcome::AuthenticationRejected,
             401,
