@@ -576,6 +576,58 @@ impl TechnicalCallerAuthenticator {
         read_document(response.into_body(), declared, context, deadline).await
     }
 
+    /// Reports whether usable trusted verification state currently exists,
+    /// without performing any remote metadata retrieval.
+    ///
+    /// "Usable" is exactly the cache eligibility this authenticator already
+    /// applies when verifying a token: retained trusted material within the
+    /// configured freshness, or within the configured bounded stale-if-error
+    /// grace beyond it. Material with no retained state, or beyond that
+    /// bounded grace, is [`TrustedVerifierState::Unusable`].
+    ///
+    /// This exposes no cache contents, verification material, JWK structure,
+    /// or source URI, and it changes no authentication semantics. The supplied
+    /// context bounds the brief internal cache read; an expired or cancelled
+    /// context reports [`TrustedVerifierState::Unusable`] rather than waiting.
+    pub async fn trusted_verifier_state(
+        &self,
+        context: &SynchronizationContext<'_>,
+    ) -> TrustedVerifierState {
+        match self.classify_cache(context).await {
+            Ok((_, classification)) => classification.trusted_verifier_state(),
+            Err(_) => TrustedVerifierState::Unusable,
+        }
+    }
+
+    /// Ensures usable trusted verification state through at most one bounded
+    /// refresh, then reports the resulting state.
+    ///
+    /// When usable trusted state already exists this performs no remote
+    /// retrieval. Otherwise it performs exactly one bounded consultation of
+    /// the configured trusted source, reusing this authenticator's existing
+    /// source, cache, refresh serialization, and failure rules. Concurrent
+    /// callers therefore serialize on the same refresh lock and reuse a
+    /// preceding successful replacement instead of each issuing their own
+    /// metadata request.
+    ///
+    /// This performs no token verification, installs no separate verifier,
+    /// and reports no reason for an unusable outcome.
+    pub async fn ensure_trusted_verifier_state(
+        &self,
+        context: &SynchronizationContext<'_>,
+    ) -> TrustedVerifierState {
+        let Ok((observed_generation, classification)) = self.classify_cache(context).await else {
+            return TrustedVerifierState::Unusable;
+        };
+        if classification.trusted_verifier_state() == TrustedVerifierState::Usable {
+            return TrustedVerifierState::Usable;
+        }
+        if self.refresh(context, observed_generation).await.is_err() {
+            return TrustedVerifierState::Unusable;
+        }
+        self.trusted_verifier_state(context).await
+    }
+
     /// Test-only accessor to the authoritative cache lock, compiled only for
     /// `#[cfg(test)]` builds. Never present in a production/release artifact;
     /// not a public API. Used to prove the linearization property directly
@@ -590,6 +642,37 @@ enum CacheClassification {
     Fresh,
     Stale,
     ColdOrExpired,
+}
+
+impl CacheClassification {
+    /// Maps the internal cache-age category onto the public, contentless
+    /// trusted-verifier state. Fresh and bounded-stale material is exactly
+    /// what this authenticator may still verify a token against.
+    fn trusted_verifier_state(&self) -> TrustedVerifierState {
+        match self {
+            Self::Fresh | Self::Stale => TrustedVerifierState::Usable,
+            Self::ColdOrExpired => TrustedVerifierState::Unusable,
+        }
+    }
+}
+
+/// Whether the authenticator currently holds trusted verification state that
+/// it may still verify a technical caller's token against.
+///
+/// This is a closed, contentless category. It exposes no verification
+/// material, cache contents, key identifier, source URI, or failure reason,
+/// and it never reveals whether the configured trusted source is currently
+/// reachable: retained material within the configured bounded stale-if-error
+/// grace stays [`Self::Usable`] during a temporary source outage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum TrustedVerifierState {
+    /// Retained trusted verification material is within the configured
+    /// freshness or its bounded stale-if-error grace.
+    Usable,
+    /// No trusted verification material is retained, or the retained material
+    /// is beyond the configured bounded stale-if-error grace.
+    Unusable,
 }
 
 /// The cache-age eligibility and synchronous verification result are coupled:

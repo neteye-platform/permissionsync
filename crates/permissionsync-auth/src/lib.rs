@@ -50,7 +50,7 @@ pub(crate) const MAX_JWKS_KEYS: usize = 32;
 pub(crate) const MAX_PUBLIC_COMPONENT_BYTES: usize = 1366;
 pub(crate) const MAX_RSA_EXPONENT_BYTES: usize = 16;
 
-pub use authenticator::TechnicalCallerAuthenticator;
+pub use authenticator::{TechnicalCallerAuthenticator, TrustedVerifierState};
 pub use config::{
     AuthenticatorConfigurationError, JwtAlgorithm, TechnicalCallerAuthenticatorConfig,
     TrustedVerificationSource, VerificationCachePolicy,

@@ -2,6 +2,7 @@
 
 mod cache;
 mod jwt_claims;
+mod readiness;
 mod support;
 mod transport;
 
