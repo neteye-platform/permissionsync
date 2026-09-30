@@ -101,12 +101,18 @@ values are the complete bound on synchronization requests that are admitted or
 waiting anywhere in the process, and only admitted requests buffer a body.
 
 A parked request is woken as soon as a permit frees, so it can still succeed
-inside its own overall deadline. A request that arrives when both bounds are full
-is refused immediately instead of being parked somewhere else: it returns the
-ordinary server-side outcome and its connection is closed, so the pushback
-reaches the client's transport. Saturation therefore adds no `429`, `503`, or
-other caller-facing status, and it cannot accumulate waiting requests, buffered
-bodies, or permits beyond those two bounds however many connections are open.
+inside its own overall deadline, and a waiter whose own deadline really does
+expire returns the ordinary server-side deadline outcome.
+
+A request that arrives when both bounds are already full is different: it is
+never parked, never authenticated, never has its body collected, and receives no
+PermissionSync response at all. It was neither cancelled nor expired and was
+never processed, so inventing any outcome for it would change the precedence the
+synchronization contract fixes. Instead the connection is refused and terminated
+at the transport boundary. Saturation therefore adds no `429`, `503`, or other
+caller-facing status, and it cannot accumulate waiting requests, buffered bodies,
+or permits beyond those two bounds however many connections are open. Such
+refusals are counted by `permissionsync_inbound_admission_refused_total`.
 
 The inbound synchronization body has a fixed one-mebibyte product limit. It is
 not configurable, and exceeding it is a body-validation outcome in the fixed

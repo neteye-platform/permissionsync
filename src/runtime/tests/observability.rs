@@ -4,7 +4,7 @@
 //! local to the test thread, so tests never interfere with each other through
 //! global observability state.
 
-use std::{num::NonZeroUsize, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use axum::{body::Body, http::Request, http::StatusCode};
 
@@ -19,7 +19,7 @@ use crate::runtime::{
         GLPI, HttpsFixture, RuntimeFixture, RuntimeFixtureOptions, SigningMaterial, authenticator,
         glpi_configuration, jwks_fixture, provider_configuration, target, valid_body,
     },
-    transport::{METRICS_ROUTE, READINESS_ROUTE, SYNCHRONIZATION_ROUTE},
+    transport::{METRICS_ROUTE, READINESS_ROUTE, SYNCHRONIZATION_ROUTE, is_transport_refusal},
 };
 
 const UNREACHABLE_GLPI: &str = "https://127.0.0.1:1/apirest.php";
@@ -267,68 +267,100 @@ async fn inbound_admission_saturation_is_represented() {
     assert_contains(&exposition, &format!("{ADMISSION_SATURATED_TOTAL} 1"));
     assert_contains(&exposition, &format!("{ADMISSION_ABANDONED_TOTAL} 1"));
     assert_contains(&exposition, &format!("{ADMISSION_WAITERS} 0"));
+    // This waiter's own deadline really did expire, so the deadline outcome is
+    // the truthful one to record for it.
+    assert_contains(
+        &exposition,
+        &format!("{REQUESTS_TOTAL}{{outcome=\"cancelled_or_expired\"}} 1"),
+    );
+    assert_contains(
+        &exposition,
+        &format!("{REQUEST_STAGE_TOTAL}{{stage=\"admission\"}} 1"),
+    );
+    assert!(
+        !exposition.contains(ADMISSION_REFUSED_TOTAL),
+        "an expired waiter is not a refusal:\n{exposition}"
+    );
     assert_no_sentinels(&exposition);
 
     drop(held);
     scenario.finish().await;
 }
 
-/// A wait list that is already at its bound is distinguishable from ordinary
-/// admission saturation, so an operator can see which bound was reached.
-#[tokio::test(start_paused = true)]
-async fn a_full_admission_wait_list_is_represented() {
-    let scenario = Scenario::build(|options| {
-        options.inbound_admission_limit = NonZeroUsize::new(1).unwrap();
-        options.overall_request_deadline = Duration::from_millis(100);
-    })
-    .await;
+/// A transport-level admission refusal is observable through its own bounded
+/// counter, and is never recorded as a synchronization outcome.
+///
+/// Nothing was cancelled, nothing expired, and nothing was processed, so no
+/// request outcome, stage, or duration may be attributed to it.
+#[tokio::test]
+async fn a_transport_admission_refusal_is_counted_without_a_synchronization_outcome() {
+    let scenario = Arc::new(
+        Scenario::build(|options| {
+            options.inbound_admission_limit = NonZeroUsize::new(1).unwrap();
+            // Long enough that the parked waiter cannot expire during the test,
+            // so any deadline outcome would have to come from the refusal.
+            options.overall_request_deadline = Duration::from_secs(600);
+        })
+        .await,
+    );
     let guard = scenario.fixture.recorder_guard();
 
-    let held = scenario.fixture.hold_admission().await;
+    let held = scenario.fixture.saturate_admission().await;
     let token = scenario.signing.token(Some("service_account"));
 
-    // The first request occupies the single waiter slot and keeps it while it
-    // waits; the second therefore finds the wait list already full.
-    let mut parked = Box::pin(
-        scenario
-            .fixture
-            .synchronize(Some(&token), Body::from(valid_body())),
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut parked)
-            .await
-            .is_err(),
-        "the first request must still be waiting"
-    );
-    assert_eq!(
-        scenario.fixture.state.admission().available_waiter_slots(),
-        0,
-        "the single waiter slot is occupied"
-    );
+    // Occupy the single waiter slot, proven through observed admission state.
+    let parked = {
+        let scenario = Arc::clone(&scenario);
+        let token = token.clone();
+        tokio::spawn(async move {
+            scenario
+                .fixture
+                .synchronize(Some(&token), Body::from(valid_body()))
+                .await
+        })
+    };
+    scenario
+        .fixture
+        .await_admission(|observation| observation.waiting == 1)
+        .await;
 
-    assert_eq!(
-        scenario
-            .fixture
-            .synchronize(Some(&token), Body::from(valid_body()))
-            .await,
-        StatusCode::INTERNAL_SERVER_ERROR
-    );
-    assert_eq!(
-        parked.await,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "the waiting request also ends through the deadline path"
-    );
+    // One request beyond both bounds.
+    let refused = scenario
+        .fixture
+        .synchronize_response(Some(&token), Body::from(valid_body()))
+        .await;
+    assert!(is_transport_refusal(&refused));
 
-    drop(guard);
     let exposition = scenario.fixture.rendered_metrics();
 
-    assert_contains(&exposition, &format!("{ADMISSION_SATURATED_TOTAL} 2"));
     assert_contains(&exposition, &format!("{ADMISSION_REFUSED_TOTAL} 1"));
-    assert_contains(&exposition, &format!("{ADMISSION_WAITERS} 0"));
+    assert_contains(&exposition, &format!("{ADMISSION_SATURATED_TOTAL} 2"));
+    assert!(
+        !exposition.contains("outcome=\"cancelled_or_expired\""),
+        "a refusal must not be recorded as cancelled or expired:\n{exposition}"
+    );
+    assert!(
+        !exposition.contains("stage=\"admission\""),
+        "a refusal must not be recorded as a request stage:\n{exposition}"
+    );
+    assert!(
+        !exposition.contains(ADMISSION_ABANDONED_TOTAL),
+        "a refusal abandoned no wait:\n{exposition}"
+    );
+    assert!(
+        !exposition.contains(REQUESTS_TOTAL),
+        "a refusal is not a synchronization request outcome:\n{exposition}"
+    );
     assert_no_sentinels(&exposition);
 
+    drop(guard);
     drop(held);
-    scenario.finish().await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), parked).await;
+    Arc::try_unwrap(scenario)
+        .map_err(|_| "scenario is still shared")
+        .unwrap()
+        .finish()
+        .await;
 }
 
 /// Selected-target capacity use, saturation, and unavailability are visible and

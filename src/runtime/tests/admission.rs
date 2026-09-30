@@ -29,7 +29,9 @@ use crate::runtime::{
         SigningMaterial, authenticator, glpi_configuration, jwks_fixture, provider_configuration,
         target, valid_body,
     },
-    transport::{HEALTH_ROUTE, METRICS_ROUTE, READINESS_ROUTE, SYNCHRONIZATION_ROUTE},
+    transport::{
+        HEALTH_ROUTE, METRICS_ROUTE, READINESS_ROUTE, SYNCHRONIZATION_ROUTE, is_transport_refusal,
+    },
 };
 
 const UNREACHABLE_GLPI: &str = "https://127.0.0.1:1/apirest.php";
@@ -573,7 +575,7 @@ async fn the_admitted_and_waiting_populations_cannot_grow_past_their_bound() {
         refused.push(
             scenario
                 .fixture
-                .synchronize(Some(&token), Body::from(valid_body()))
+                .synchronize_response(Some(&token), Body::from(valid_body()))
                 .await,
         );
     }
@@ -583,10 +585,8 @@ async fn the_admitted_and_waiting_populations_cannot_grow_past_their_bound() {
         .await;
 
     assert!(
-        refused
-            .iter()
-            .all(|status| *status == StatusCode::INTERNAL_SERVER_ERROR),
-        "a refusal uses the existing server-side outcome, adding no new status"
+        refused.iter().all(is_transport_refusal),
+        "a refusal is a transport refusal, never a PermissionSync outcome"
     );
     assert_eq!(
         observation.waiting, slots,
@@ -630,10 +630,14 @@ async fn the_admitted_and_waiting_populations_cannot_grow_past_their_bound() {
 }
 
 /// A request refused because the bounded population was full must not collect a
-/// body, must use the existing server-side outcome, and must be told that its
-/// connection is closing so the pushback reaches the client's transport.
+/// body and must produce no PermissionSync application response at all.
+///
+/// It is not `cancelled_or_expired`, `capacity_unavailable`, or any other
+/// existing outcome: nothing was cancelled, nothing expired, and nothing was
+/// processed. The route yields only the private placeholder that the connection
+/// driver turns into a terminated connection.
 #[tokio::test]
-async fn a_refused_request_collects_no_body_and_closes_its_connection() {
+async fn a_refused_request_produces_no_application_response() {
     let scenario = Arc::new(
         Scenario::build(|options| {
             options.inbound_admission_limit = NonZeroUsize::new(1).unwrap();
@@ -673,29 +677,19 @@ async fn a_refused_request_collects_no_body_and_closes_its_connection() {
         )
         .await;
 
-    assert_eq!(
-        response.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "a refusal adds no new caller-facing status"
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get(axum::http::header::CONNECTION)
-            .and_then(|value| value.to_str().ok()),
-        Some("close"),
-        "a refusal closes the connection, making the pushback transport backpressure"
+    assert!(
+        is_transport_refusal(&response),
+        "a beyond-bound request must be refused at the transport boundary"
     );
     assert!(
         !polled.load(Ordering::SeqCst),
         "a refused request must not collect its body"
     );
     assert_eq!(polls.load(Ordering::SeqCst), 0);
-    assert!(
-        crate::runtime::tests::support::body_bytes(response)
-            .await
-            .is_empty(),
-        "the synchronization contract has an empty response body"
+    assert_eq!(
+        scenario.jwks.request_count(),
+        0,
+        "a refused request must not start authentication"
     );
 
     drop(held);
@@ -707,64 +701,70 @@ async fn a_refused_request_collects_no_body_and_closes_its_connection() {
         .await;
 }
 
-/// A request that finds the wait list full still ends through the existing
-/// server-side deadline path, not through a new caller-facing status.
-#[tokio::test(start_paused = true)]
-async fn a_request_beyond_the_wait_list_ends_through_the_existing_deadline_path() {
-    let scenario = Scenario::build(|options| {
-        options.inbound_admission_limit = NonZeroUsize::new(1).unwrap();
-        options.overall_request_deadline = Duration::from_millis(200);
-    })
-    .await;
+/// Saturation must not change the outcome ADR 0001 fixes for any request.
+///
+/// A missing credential, a malformed credential, and a malformed body each have
+/// their own fixed outcome. While both bounded populations are full none of them
+/// is produced, because the request is never processed: no `401`, `400`, `403`,
+/// `429`, `500`, or `503` is invented for it.
+#[tokio::test]
+async fn saturation_never_invents_an_application_status() {
+    let scenario = Arc::new(
+        Scenario::build(|options| {
+            options.inbound_admission_limit = NonZeroUsize::new(1).unwrap();
+            options.overall_request_deadline = Duration::from_secs(600);
+        })
+        .await,
+    );
     let token = scenario.token();
     let held = scenario.fixture.saturate_admission().await;
 
-    // Occupy the single waiter slot.
-    let mut parked = Box::pin(
-        scenario.fixture.call(
-            Request::builder()
-                .method("POST")
-                .uri(SYNCHRONIZATION_ROUTE)
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::from(valid_body()))
-                .unwrap(),
-        ),
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), &mut parked)
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        scenario.fixture.state.admission().available_waiter_slots(),
-        0
-    );
-
-    let (body, polled, _) = ObservedBody::new(valid_body());
-    let status = scenario
+    let parked = {
+        let scenario = Arc::clone(&scenario);
+        let token = token.clone();
+        tokio::spawn(async move {
+            scenario
+                .fixture
+                .synchronize(Some(&token), Body::from(valid_body()))
+                .await
+        })
+    };
+    scenario
         .fixture
-        .call(
-            Request::builder()
-                .method("POST")
-                .uri(SYNCHRONIZATION_ROUTE)
-                .header("authorization", format!("Bearer {token}"))
-                .body(Body::new(body))
-                .unwrap(),
-        )
-        .await
-        .status();
+        .await_admission(|observation| observation.waiting == 1)
+        .await;
 
+    for (credential, body) in [
+        (None, valid_body()),
+        (Some("Basic secret"), valid_body()),
+        (Some("Bearer not.a.jwt!"), valid_body()),
+        (Some(format!("Bearer {token}").as_str()), b"{".to_vec()),
+    ] {
+        let mut request = Request::builder().method("POST").uri(SYNCHRONIZATION_ROUTE);
+        if let Some(credential) = credential {
+            request = request.header("authorization", credential);
+        }
+        let response = scenario
+            .fixture
+            .call(request.body(Body::from(body)).unwrap())
+            .await;
+
+        assert!(
+            is_transport_refusal(&response),
+            "saturation must refuse at the transport boundary, not answer"
+        );
+    }
     assert_eq!(
-        status,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "the wait list being full adds no new caller-facing status"
-    );
-    assert!(
-        !polled.load(Ordering::SeqCst),
-        "a request beyond the wait list must not collect its body"
+        scenario.jwks.request_count(),
+        0,
+        "no refused request reached authentication"
     );
 
-    drop(parked);
     drop(held);
-    scenario.finish().await;
+    let _ = tokio::time::timeout(FIXTURE_TIMEOUT, parked).await;
+    Arc::try_unwrap(scenario)
+        .map_err(|_| "scenario is still shared")
+        .unwrap()
+        .finish()
+        .await;
 }

@@ -133,6 +133,25 @@ impl Connection {
         self.stream.flush().await.expect("flush succeeds");
     }
 
+    /// Reads until the peer closes the connection.
+    ///
+    /// Returns everything that was received before the close, so an empty result
+    /// proves the connection was terminated without any HTTP response. Returns
+    /// `None` only when the peer neither answered nor closed, which is a defect.
+    async fn read_until_closed(&mut self, budget: Duration) -> Option<Vec<u8>> {
+        let mut received = Vec::new();
+        let mut buffer = [0_u8; 2048];
+        loop {
+            match timeout(budget, self.stream.read(&mut buffer)).await {
+                // A clean close or a reset both mean the peer terminated the
+                // connection; report what had arrived first.
+                Ok(Ok(0)) | Ok(Err(_)) => return Some(received),
+                Ok(Ok(read)) => received.extend_from_slice(&buffer[..read]),
+                Err(_) => return None,
+            }
+        }
+    }
+
     /// Reads whatever has arrived within `budget`, or returns `None`.
     async fn read_response(&mut self, budget: Duration) -> Option<String> {
         let mut buffer = [0_u8; 2048];
@@ -251,20 +270,18 @@ async fn operational_endpoints_are_served_while_synchronization_admission_is_sat
         "load beyond the bound must not enlarge the admitted population"
     );
 
-    // Each refused request received the existing server-side outcome and was
-    // told its connection is closing, so the pushback is transport backpressure.
+    // Each refused request gets no PermissionSync response at all: the
+    // connection is terminated at the transport boundary, so no status is
+    // invented for a request that was never processed.
     for connection in &mut beyond {
-        let response = connection
-            .read_response(FIXTURE_TIMEOUT)
+        let received = connection
+            .read_until_closed(FIXTURE_TIMEOUT)
             .await
-            .expect("a refused request still receives its response");
+            .expect("a refused connection must be terminated, not left open");
         assert!(
-            response.starts_with("HTTP/1.1 500"),
-            "a refusal uses the existing server-side outcome: {response}"
-        );
-        assert!(
-            response.to_ascii_lowercase().contains("connection: close"),
-            "a refusal closes its connection: {response}"
+            received.is_empty(),
+            "a refused request must receive no HTTP response, got {:?}",
+            String::from_utf8_lossy(&received)
         );
     }
 

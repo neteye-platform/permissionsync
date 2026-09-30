@@ -33,10 +33,11 @@ request:
   # How many synchronization requests may be admitted concurrently. This bounds
   # aggregate request-body buffering and pre-selected-target work, and the same
   # value also bounds how many further synchronization requests may be parked
-  # waiting for admission. A parked request is woken as soon as a permit frees;
-  # a request arriving when both bounds are full is refused immediately with the
-  # ordinary server-side outcome and its connection is closed. Operational
-  # endpoints need neither a permit nor a waiting slot.
+  # waiting for admission. A parked request is woken as soon as a permit frees.
+  # A request arriving when both bounds are already full is refused and its
+  # connection terminated at the transport boundary: it is never processed and
+  # receives no synchronization response, so saturation adds no caller-facing
+  # status. Operational endpoints need neither a permit nor a waiting slot.
   inbound_admission_limit: 64
 
   # How many selected-target synchronizations may run concurrently. Must be

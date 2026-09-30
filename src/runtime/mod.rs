@@ -29,7 +29,7 @@ use std::{
 };
 
 use axum::Router;
-use hyper_util::{rt::TokioIo, service::TowerToHyperService};
+use hyper_util::rt::TokioIo;
 use permissionsync::{
     ComposedApplication, GLPI_ADAPTER_IDENTIFIER, ProviderAvailability, TargetAvailability,
 };
@@ -50,7 +50,7 @@ use crate::runtime::{
     configuration::{ComponentOutcome, ExecutableConfiguration},
     failure::RuntimeFailure,
     lifecycle::{Lifecycle, RequestCancellation},
-    transport::{RuntimeState, record_component_availability, router},
+    transport::{RefusingService, RuntimeState, record_component_availability, router},
 };
 
 /// The bounded window in which cooperatively cancelled requests may return
@@ -462,9 +462,11 @@ async fn drain(connections: &mut JoinSet<()>) {
 /// On shutdown the connection stops accepting further requests on itself and
 /// lets an in-flight request finish, bounded by the caller's grace handling.
 async fn serve_connection(stream: TcpStream, router: Router, lifecycle: Arc<Lifecycle>) {
+    // `RefusingService` is what turns an inbound-admission refusal into a
+    // terminated connection instead of a manufactured application response.
     let connection = hyper::server::conn::http1::Builder::new()
         .keep_alive(true)
-        .serve_connection(TokioIo::new(stream), TowerToHyperService::new(router));
+        .serve_connection(TokioIo::new(stream), RefusingService::new(router));
     let mut connection = Box::pin(connection);
 
     tokio::select! {

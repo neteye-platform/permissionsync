@@ -704,6 +704,26 @@ impl RuntimeFixture {
             .expect("the router service is infallible")
     }
 
+    /// Issues `POST /api/sync-user` and returns the complete response.
+    ///
+    /// Used where a test must inspect more than the status, such as whether the
+    /// response is the private transport-refusal placeholder that never reaches
+    /// a caller.
+    pub(super) async fn synchronize_response(
+        &self,
+        bearer: Option<&str>,
+        body: Body,
+    ) -> Response<Body> {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(crate::runtime::transport::SYNCHRONIZATION_ROUTE)
+            .header("content-type", "application/json");
+        if let Some(bearer) = bearer {
+            request = request.header("authorization", format!("Bearer {bearer}"));
+        }
+        self.call(request.body(body).unwrap()).await
+    }
+
     /// Issues `POST /api/sync-user` with the supplied bearer and body.
     pub(super) async fn synchronize(&self, bearer: Option<&str>, body: Body) -> StatusCode {
         let mut request = Request::builder()

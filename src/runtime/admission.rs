@@ -25,10 +25,11 @@
 //! A request that obtains neither is refused immediately. It is never parked,
 //! never sleeps to its deadline, and never occupies any other application
 //! waiting area, so saturation cannot create a second population outside these
-//! two bounds. The refusal ends through the existing server-side deadline and
-//! cancellation semantics and adds no caller-facing status, and the transport
-//! closes that connection so the pushback reaches the client's transport rather
-//! than accumulating as application state.
+//! two bounds. Such a request also gets no PermissionSync outcome: it was not
+//! cancelled, it did not expire, and it was never processed, so the transport
+//! refuses it by terminating the connection rather than by manufacturing an
+//! application response. Saturation therefore adds no caller-facing status at
+//! all and changes no precedence, and it accumulates no application state.
 //!
 //! The complete invariant is therefore: at any instant the number of
 //! synchronization requests that are admitted or waiting anywhere in this
@@ -43,11 +44,11 @@
 //! `GET /healthz`, `GET /readyz`, and `GET /metrics` take neither a permit nor
 //! a waiter slot, and no connection is gated behind either semaphore. Nothing a
 //! saturated synchronization workload holds is on their path, and a refused
-//! synchronization request releases its connection immediately instead of
-//! holding one. That reservation is structural rather than a share of a shared
-//! connection budget, which could not work here: a request's class is only
-//! known after its head has been read, so a budget taken at accept time cannot
-//! be reserved for a class of request that has not been identified yet.
+//! synchronization request is released at once instead of holding a connection.
+//! That reservation is structural rather than a share of a shared connection
+//! budget, which could not work here: a request's class is only known after its
+//! head has been read, so a budget taken at accept time cannot be reserved for a
+//! class of request that has not been identified yet.
 
 use std::{num::NonZeroUsize, sync::Arc, time::Instant};
 
@@ -117,8 +118,11 @@ pub(crate) enum Admission {
     /// and was not admitted, or shutdown released its wait.
     NotAdmitted,
     /// The bounded population was already full, so the request was refused
-    /// without ever being parked. The transport closes the connection, so the
-    /// pushback is transport backpressure rather than application state.
+    /// without ever being parked.
+    ///
+    /// This is not a PermissionSync outcome. The transport terminates the
+    /// connection without writing a response, so saturation never changes the
+    /// precedence ADR 0001 fixes.
     RefusedWithoutWaiting,
 }
 
@@ -191,10 +195,10 @@ impl InboundAdmission {
     /// reaches neither body collection nor authentication.
     ///
     /// A request only joins the `permits` wait list while a waiter slot is
-    /// free, so that list stays bounded. A request that finds no free slot
-    /// waits on its own deadline without being enqueued anywhere, which keeps
-    /// saturation an existing server-side deadline outcome rather than a new
-    /// caller-facing status or an unbounded queue.
+    /// free, so that list stays bounded. A request that finds no free slot is
+    /// reported as [`Admission::RefusedWithoutWaiting`] straight away: it is not
+    /// enqueued, does not sleep, and receives no application outcome, because
+    /// the transport refuses it by terminating the connection.
     ///
     /// Dropping the returned future removes the waiter, releases its waiter
     /// slot, and returns any permit already assigned to it, so an abandoned
@@ -215,8 +219,10 @@ impl InboundAdmission {
             // The bounded population is full. Refuse now rather than parking
             // this request anywhere: parking it outside the population is
             // exactly the unbounded waiting area the bound exists to prevent.
+            // Deliberately not counted as abandoned: nothing was waiting, and
+            // the dedicated refusal counter is what ADR 0006 needs for local
+            // saturation rejection.
             counter!(ADMISSION_REFUSED_TOTAL).increment(1);
-            counter!(ADMISSION_ABANDONED_TOTAL).increment(1);
             #[cfg(test)]
             self.observer.refused_without_waiting();
             return Admission::RefusedWithoutWaiting;

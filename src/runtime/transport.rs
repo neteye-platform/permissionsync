@@ -15,20 +15,38 @@
 //! 4. Only then is the body collected, bounded by the fixed product limit and
 //!    by that same deadline.
 //! 5. The existing inbound boundary owns everything after that.
+//!
+//! # Requests that cannot enter the bounded admission population
+//!
+//! A request that can neither be admitted nor take one of the bounded waiter
+//! slots has no PermissionSync outcome: it was not cancelled, it did not expire,
+//! and it was never processed. Manufacturing any existing outcome for it would
+//! change the precedence ADR 0001 fixes, so this module produces no application
+//! response at all. The route returns a placeholder marked with
+//! [`ConnectionRefusal`], and [`RefusingService`] turns that marker into a
+//! service failure, which makes the connection driver terminate the connection
+//! without writing a response. Only the operational endpoints and genuinely
+//! processed synchronization requests ever produce an HTTP response.
 
-use std::{sync::Arc, time::Duration, time::Instant};
+use std::{
+    error::Error,
+    fmt,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Router,
     body::Body,
     extract::State,
-    http::{
-        HeaderMap, HeaderValue, Request, Response, StatusCode,
-        header::{CONNECTION, CONTENT_TYPE},
-    },
+    http::{HeaderMap, Request, Response, StatusCode, header::CONTENT_TYPE},
     routing::{get, post},
 };
 use http_body_util::BodyExt;
+use hyper::{body::Incoming, service::Service as HyperService};
+use hyper_util::service::TowerToHyperService;
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusHandle;
 use opentelemetry::propagation::TextMapPropagator;
@@ -279,17 +297,10 @@ async fn handle_synchronization(
                 Stage::Admission,
             );
         }
-        // The bounded waiting population was full, so this request was refused
-        // without being parked anywhere. Closing the connection turns the
-        // refusal into transport backpressure instead of letting a client keep
-        // a connection to retry on immediately.
-        Admission::RefusedWithoutWaiting => {
-            return close_connection(finish(
-                accepted_at,
-                HttpOutcome::CancelledOrExpired,
-                Stage::Admission,
-            ));
-        }
+        // Neither bounded population had room. This request was never parked,
+        // never processed, and neither cancelled nor expired, so it gets no
+        // application outcome at all: it is refused at the transport boundary.
+        Admission::RefusedWithoutWaiting => return refuse_at_transport(),
     };
 
     let collected = collect_body(body, deadline, &cancellation).await;
@@ -352,16 +363,83 @@ fn finish(accepted_at: Instant, outcome: HttpOutcome, stage: Stage) -> Response<
     )
 }
 
-/// Marks a response as the last one on its connection.
+/// A private marker on the one response that must never reach a caller.
 ///
-/// The caller-facing status and empty body are unchanged; only the HTTP/1
-/// connection disposition differs, which is what makes saturation pushback
-/// reach the client's transport.
-fn close_connection(mut response: Response<Body>) -> Response<Body> {
+/// It exists only to carry the refusal decision from the route to the
+/// connection driver. It is never serialized and never observable by a caller.
+#[derive(Clone, Copy)]
+struct ConnectionRefusal;
+
+/// Refuses a synchronization request at the transport boundary.
+///
+/// The returned response is a placeholder that [`RefusingService`] converts into
+/// a service failure, so nothing is written to the connection. No outcome,
+/// stage, duration, or span field is recorded, because no PermissionSync outcome
+/// occurred; the refusal is counted by the dedicated admission-refusal metric
+/// inside the admission boundary itself.
+fn refuse_at_transport() -> Response<Body> {
+    let mut response = Response::new(Body::empty());
+    response.extensions_mut().insert(ConnectionRefusal);
     response
-        .headers_mut()
-        .insert(CONNECTION, HeaderValue::from_static("close"));
-    response
+}
+
+/// Returns whether a response is the transport-refusal placeholder.
+#[cfg(test)]
+pub(crate) fn is_transport_refusal(response: &Response<Body>) -> bool {
+    response.extensions().get::<ConnectionRefusal>().is_some()
+}
+
+/// The service failure that terminates a connection without a response.
+///
+/// It is a fixed category and carries no request, caller, or configuration
+/// detail.
+#[derive(Debug)]
+pub(crate) struct RefusedConnection;
+
+impl fmt::Display for RefusedConnection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the request was refused at the inbound admission boundary")
+    }
+}
+
+impl Error for RefusedConnection {}
+
+/// Serves the router, turning an admission refusal into a service failure.
+///
+/// Hyper writes no response for a failed service call, so this is what makes a
+/// beyond-bound synchronization request end as a terminated connection rather
+/// than as a manufactured PermissionSync outcome. Every other request, including
+/// every operational request, passes through unchanged.
+pub(crate) struct RefusingService {
+    inner: TowerToHyperService<Router>,
+}
+
+impl RefusingService {
+    /// Wraps the router for one connection.
+    pub(crate) fn new(router: Router) -> Self {
+        Self {
+            inner: TowerToHyperService::new(router),
+        }
+    }
+}
+
+impl HyperService<Request<Incoming>> for RefusingService {
+    type Response = Response<Body>;
+    type Error = RefusedConnection;
+    type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, RefusedConnection>> + Send>>;
+
+    fn call(&self, request: Request<Incoming>) -> Self::Future {
+        let inner = self.inner.call(request);
+        Box::pin(async move {
+            // The router's own service is infallible; only the refusal marker
+            // can make this call fail.
+            let response = inner.await.map_err(|_| RefusedConnection)?;
+            if response.extensions().get::<ConnectionRefusal>().is_some() {
+                return Err(RefusedConnection);
+            }
+            Ok(response)
+        })
+    }
 }
 
 fn empty_response(status: StatusCode) -> Response<Body> {
