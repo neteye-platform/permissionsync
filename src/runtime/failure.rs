@@ -1,21 +1,22 @@
-//! Fixed, safe startup-failure categories.
+//! Fixed, safe runtime-failure categories.
 
 use std::{error::Error, fmt};
 
-/// A global, startup-fatal defect.
+/// A fatal runtime defect: a global startup defect, or a serving failure that
+/// terminates the process.
 ///
 /// Every variant is a fixed category with no payload. Configuration inputs can
 /// contain issuer and endpoint URIs, GLPI credentials, OTLP exporter
-/// authentication headers, and private trust material, so this type
-/// deliberately retains neither the offending value, its position in the
-/// document, nor an error source. It names only which part of startup refused
-/// to complete.
+/// authentication headers, and private trust material, and a serving failure can
+/// carry an operating-system error, so this type deliberately retains neither
+/// the offending value, its position in the document, nor an error source. It
+/// names only which part of the runtime refused to continue.
 ///
 /// Component-local Provider and GLPI defects are deliberately absent: they
 /// never abort startup and instead leave that component unavailable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub(crate) enum StartupFailure {
+pub(crate) enum RuntimeFailure {
     /// `PERMISSIONSYNC_CONFIG_FILE` was unset or empty.
     ConfigurationPathMissing,
     /// The configuration file could not be read.
@@ -48,11 +49,14 @@ pub(crate) enum StartupFailure {
     ObservabilityUnavailable,
     /// The configured listener could not be bound.
     ListenerUnavailable,
+    /// The bound listener repeatedly failed to accept connections, so it can no
+    /// longer produce work and the process must terminate.
+    ListenerAcceptFailed,
     /// The asynchronous runtime could not be created.
     RuntimeUnavailable,
 }
 
-impl fmt::Display for StartupFailure {
+impl fmt::Display for RuntimeFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::ConfigurationPathMissing => {
@@ -76,12 +80,15 @@ impl fmt::Display for StartupFailure {
             Self::InvalidComposition => "the configured application composition is unusable",
             Self::ObservabilityUnavailable => "required observability could not be initialized",
             Self::ListenerUnavailable => "the configured listener could not be bound",
+            Self::ListenerAcceptFailed => {
+                "the listener repeatedly failed to accept connections and serving stopped"
+            }
             Self::RuntimeUnavailable => "the asynchronous runtime could not be created",
         })
     }
 }
 
-impl Error for StartupFailure {
+impl Error for RuntimeFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         None
     }
@@ -91,10 +98,11 @@ impl Error for StartupFailure {
 mod tests {
     use std::error::Error;
 
-    use super::StartupFailure;
+    use super::RuntimeFailure;
 
-    /// Startup diagnostics are deliberately value-free: a reviewer can read
-    /// this list and see that no configured value can reach stderr.
+    /// Fatal diagnostics are deliberately value-free: a reviewer can read this
+    /// list and see that no configured value and no operating-system error can
+    /// reach stderr.
     #[test]
     fn every_category_renders_only_fixed_safe_text() {
         const SENSITIVE: [&str; 7] = [
@@ -108,22 +116,23 @@ mod tests {
         ];
 
         for failure in [
-            StartupFailure::ConfigurationPathMissing,
-            StartupFailure::ConfigurationUnreadable,
-            StartupFailure::ConfigurationNotUtf8,
-            StartupFailure::ConfigurationEmpty,
-            StartupFailure::ConfigurationMultipleDocuments,
-            StartupFailure::InvalidDocumentStructure,
-            StartupFailure::InvalidListener,
-            StartupFailure::InvalidRequest,
-            StartupFailure::InvalidShutdown,
-            StartupFailure::InvalidAuthentication,
-            StartupFailure::InvalidObservability,
-            StartupFailure::InvalidTargets,
-            StartupFailure::InvalidComposition,
-            StartupFailure::ObservabilityUnavailable,
-            StartupFailure::ListenerUnavailable,
-            StartupFailure::RuntimeUnavailable,
+            RuntimeFailure::ConfigurationPathMissing,
+            RuntimeFailure::ConfigurationUnreadable,
+            RuntimeFailure::ConfigurationNotUtf8,
+            RuntimeFailure::ConfigurationEmpty,
+            RuntimeFailure::ConfigurationMultipleDocuments,
+            RuntimeFailure::InvalidDocumentStructure,
+            RuntimeFailure::InvalidListener,
+            RuntimeFailure::InvalidRequest,
+            RuntimeFailure::InvalidShutdown,
+            RuntimeFailure::InvalidAuthentication,
+            RuntimeFailure::InvalidObservability,
+            RuntimeFailure::InvalidTargets,
+            RuntimeFailure::InvalidComposition,
+            RuntimeFailure::ObservabilityUnavailable,
+            RuntimeFailure::ListenerUnavailable,
+            RuntimeFailure::ListenerAcceptFailed,
+            RuntimeFailure::RuntimeUnavailable,
         ] {
             assert!(failure.source().is_none());
             for rendered in [failure.to_string(), format!("{failure:?}")] {

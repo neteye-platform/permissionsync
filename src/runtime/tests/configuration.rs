@@ -13,11 +13,13 @@ use permissionsync::{ComposedApplication, ProviderAvailability, TargetAvailabili
 use permissionsync_core::LogicalTarget;
 
 use crate::runtime::{
+    admission::{InboundAdmission, max_inbound_admission_limit},
+    capacity::SemaphoreCapacity,
     configuration::{
         CONFIGURATION_PATH_VARIABLE, ComponentOutcome, ExecutableConfiguration,
         MAX_SYNCHRONIZATION_CAPACITY, configuration_path, decode, load,
     },
-    failure::StartupFailure,
+    failure::RuntimeFailure,
 };
 
 /// A complete, valid document. Tests mutate it through textual substitution so
@@ -98,17 +100,17 @@ fn valid() -> ExecutableConfiguration {
     decode(VALID).expect("the baseline document must be valid")
 }
 
-/// Asserts a global failure without requiring the success value to be
+/// Asserts a global startup failure without requiring the success value to be
 /// formattable: [`ExecutableConfiguration`] owns credentials and trust
 /// material and deliberately has no `Debug`.
-fn global_failure(document: &str) -> StartupFailure {
+fn global_failure(document: &str) -> RuntimeFailure {
     match decode(document) {
         Ok(_) => panic!("the document was expected to abort startup"),
         Err(failure) => failure,
     }
 }
 
-fn load_failure(path: &std::path::Path) -> StartupFailure {
+fn load_failure(path: &std::path::Path) -> RuntimeFailure {
     match load(path) {
         Ok(_) => panic!("loading was expected to abort startup"),
         Err(failure) => failure,
@@ -250,7 +252,7 @@ fn inline_pem_trust_material_is_accepted_only_when_it_parses() {
 
     assert_eq!(
         global_failure(&document),
-        StartupFailure::InvalidAuthentication
+        RuntimeFailure::InvalidAuthentication
     );
 }
 
@@ -311,7 +313,7 @@ fn an_unreadable_path_is_a_global_failure() {
 
     assert_eq!(
         load_failure(&missing),
-        StartupFailure::ConfigurationUnreadable
+        RuntimeFailure::ConfigurationUnreadable
     );
 }
 
@@ -321,7 +323,7 @@ fn a_non_utf8_document_is_a_global_failure() {
 
     assert_eq!(
         load_failure(&file.path),
-        StartupFailure::ConfigurationNotUtf8
+        RuntimeFailure::ConfigurationNotUtf8
     );
 }
 
@@ -334,7 +336,7 @@ fn the_configuration_path_comes_only_from_the_required_variable() {
     match configuration_path() {
         // The variable is not set in the test process, which is the normal
         // case and must be a fixed global failure rather than a default path.
-        Err(failure) => assert_eq!(failure, StartupFailure::ConfigurationPathMissing),
+        Err(failure) => assert_eq!(failure, RuntimeFailure::ConfigurationPathMissing),
         // If an ambient value exists, it must at least be non-empty; path
         // resolution never invents one.
         Ok(path) => assert!(!path.is_empty()),
@@ -347,10 +349,10 @@ fn the_configuration_path_comes_only_from_the_required_variable() {
 
 #[test]
 fn an_empty_document_is_a_global_failure() {
-    assert_eq!(global_failure(""), StartupFailure::ConfigurationEmpty);
+    assert_eq!(global_failure(""), RuntimeFailure::ConfigurationEmpty);
     assert_eq!(
         global_failure("# only a comment\n"),
-        StartupFailure::ConfigurationEmpty
+        RuntimeFailure::ConfigurationEmpty
     );
 }
 
@@ -358,11 +360,11 @@ fn an_empty_document_is_a_global_failure() {
 fn malformed_yaml_is_a_global_failure() {
     assert_eq!(
         global_failure("listener: [unclosed\n"),
-        StartupFailure::InvalidDocumentStructure
+        RuntimeFailure::InvalidDocumentStructure
     );
     assert_eq!(
         global_failure("\tnot: yaml\n"),
-        StartupFailure::InvalidDocumentStructure
+        RuntimeFailure::InvalidDocumentStructure
     );
 }
 
@@ -372,7 +374,7 @@ fn more_than_one_yaml_document_is_a_global_failure() {
 
     assert_eq!(
         global_failure(&two),
-        StartupFailure::ConfigurationMultipleDocuments
+        RuntimeFailure::ConfigurationMultipleDocuments
     );
 }
 
@@ -382,7 +384,7 @@ fn an_unknown_global_field_is_a_global_failure() {
 
     assert_eq!(
         global_failure(&document),
-        StartupFailure::InvalidDocumentStructure
+        RuntimeFailure::InvalidDocumentStructure
     );
 }
 
@@ -398,7 +400,7 @@ fn a_missing_required_section_is_a_global_failure() {
     ] {
         assert_eq!(
             global_failure(&document_without(section)),
-            StartupFailure::InvalidDocumentStructure,
+            RuntimeFailure::InvalidDocumentStructure,
             "a missing {section} section must abort startup"
         );
     }
@@ -408,7 +410,7 @@ fn a_missing_required_section_is_a_global_failure() {
 fn an_unknown_field_inside_a_global_section_is_a_global_failure() {
     let document = replaced("  port: 8443", "  port: 8443\n  backlog: 128");
 
-    assert_eq!(global_failure(&document), StartupFailure::InvalidListener);
+    assert_eq!(global_failure(&document), RuntimeFailure::InvalidListener);
 }
 
 #[test]
@@ -422,7 +424,7 @@ fn an_invalid_listener_is_a_global_failure() {
     ] {
         assert_eq!(
             global_failure(&replaced(from, to)),
-            StartupFailure::InvalidListener,
+            RuntimeFailure::InvalidListener,
             "{to} must abort startup"
         );
     }
@@ -435,7 +437,7 @@ fn a_non_positive_overall_deadline_is_a_global_failure() {
             "  overall_deadline_milliseconds: 10000",
             "  overall_deadline_milliseconds: 0"
         )),
-        StartupFailure::InvalidRequest
+        RuntimeFailure::InvalidRequest
     );
 }
 
@@ -446,8 +448,76 @@ fn a_zero_inbound_admission_limit_is_a_global_failure() {
             "  inbound_admission_limit: 64",
             "  inbound_admission_limit: 0"
         )),
-        StartupFailure::InvalidRequest
+        RuntimeFailure::InvalidRequest
     );
+}
+
+/// Admission is turned into Tokio semaphores, which panic above their own
+/// maximum, so configuration must prove every derived size before startup.
+#[test]
+fn an_impossible_inbound_admission_limit_is_a_global_failure_rather_than_a_panic() {
+    use tokio::sync::Semaphore;
+
+    let with_limit = |limit: usize| {
+        replaced(
+            "  inbound_admission_limit: 64",
+            &format!("  inbound_admission_limit: {limit}"),
+        )
+    };
+
+    // An ordinary value, and the largest value the implementation accepts.
+    assert!(decode(&with_limit(64)).is_ok());
+    let largest = max_inbound_admission_limit().get();
+    assert_eq!(largest, Semaphore::MAX_PERMITS);
+    assert!(
+        decode(&with_limit(largest)).is_ok(),
+        "the largest intentionally accepted limit must start"
+    );
+
+    // Values that would make a derived semaphore impossible to construct.
+    for impossible in [largest + 1, usize::MAX] {
+        assert_eq!(
+            global_failure(&with_limit(impossible)),
+            RuntimeFailure::InvalidRequest,
+            "{impossible} must be a deterministic startup failure"
+        );
+    }
+}
+
+/// The accepted limit must be exactly what every derived semaphore size can be
+/// built from, so decoding and construction can never disagree.
+#[test]
+fn every_accepted_admission_limit_constructs_its_derived_semaphores() {
+    for limit in [1_usize, 2, 64, 1024, max_inbound_admission_limit().get()] {
+        let document = replaced(
+            "  inbound_admission_limit: 64",
+            &format!("  inbound_admission_limit: {limit}"),
+        );
+        let configuration = decode(&document).expect("an accepted limit");
+
+        assert!(
+            InboundAdmission::new(configuration.inbound_admission_limit).is_some(),
+            "{limit} decoded but could not be constructed"
+        );
+    }
+}
+
+/// The selected-target capacity ceiling keeps every accepted capacity
+/// constructible too.
+#[test]
+fn every_accepted_synchronization_capacity_constructs_its_semaphore() {
+    for capacity in [1_usize, 2, 512, MAX_SYNCHRONIZATION_CAPACITY] {
+        let document = replaced(
+            "  synchronization_capacity: 16",
+            &format!("  synchronization_capacity: {capacity}"),
+        );
+        let configuration = decode(&document).expect("an accepted capacity");
+
+        assert!(
+            SemaphoreCapacity::new(configuration.synchronization_capacity).is_some(),
+            "{capacity} decoded but could not be constructed"
+        );
+    }
 }
 
 #[test]
@@ -457,7 +527,7 @@ fn a_zero_synchronization_capacity_is_a_global_failure() {
             "  synchronization_capacity: 16",
             "  synchronization_capacity: 0"
         )),
-        StartupFailure::InvalidRequest
+        RuntimeFailure::InvalidRequest
     );
 }
 
@@ -479,7 +549,7 @@ fn synchronization_capacity_above_the_product_ceiling_is_a_global_failure() {
                 MAX_SYNCHRONIZATION_CAPACITY + 1
             )
         )),
-        StartupFailure::InvalidRequest
+        RuntimeFailure::InvalidRequest
     );
 }
 
@@ -490,7 +560,7 @@ fn a_non_positive_shutdown_grace_is_a_global_failure() {
             "  grace_milliseconds: 20000",
             "  grace_milliseconds: 0"
         )),
-        StartupFailure::InvalidShutdown
+        RuntimeFailure::InvalidShutdown
     );
 }
 
@@ -502,7 +572,7 @@ fn a_shutdown_grace_below_the_overall_deadline_is_a_global_failure() {
             "  grace_milliseconds: 20000",
             "  grace_milliseconds: 9999"
         )),
-        StartupFailure::InvalidShutdown
+        RuntimeFailure::InvalidShutdown
     );
     assert!(
         decode(&replaced(
@@ -551,7 +621,7 @@ fn invalid_authentication_configuration_is_a_global_failure() {
     ] {
         assert_eq!(
             global_failure(&replaced(from, to)),
-            StartupFailure::InvalidAuthentication,
+            RuntimeFailure::InvalidAuthentication,
             "{to} must abort startup"
         );
     }
@@ -566,7 +636,7 @@ fn an_authentication_timeout_above_the_overall_deadline_is_a_global_failure() {
             "  metadata_operation_timeout_milliseconds: 3000",
             "  metadata_operation_timeout_milliseconds: 10001"
         )),
-        StartupFailure::InvalidAuthentication
+        RuntimeFailure::InvalidAuthentication
     );
     assert!(
         decode(&replaced(
@@ -584,7 +654,7 @@ fn an_ambiguous_or_unknown_trusted_source_is_a_global_failure() {
         "    oidc_discovery_uri: \"https://keycloak.example.test/realms/neteye/.well-known/openid-configuration\"",
         "    oidc_discovery_uri: \"https://keycloak.example.test/a\"\n    jwks_uri: \"https://keycloak.example.test/b\"",
     );
-    assert_eq!(global_failure(&both), StartupFailure::InvalidAuthentication);
+    assert_eq!(global_failure(&both), RuntimeFailure::InvalidAuthentication);
 
     let unknown = replaced(
         "    oidc_discovery_uri: \"https://keycloak.example.test/realms/neteye/.well-known/openid-configuration\"",
@@ -592,7 +662,7 @@ fn an_ambiguous_or_unknown_trusted_source_is_a_global_failure() {
     );
     assert_eq!(
         global_failure(&unknown),
-        StartupFailure::InvalidAuthentication
+        RuntimeFailure::InvalidAuthentication
     );
 }
 
@@ -600,7 +670,7 @@ fn an_ambiguous_or_unknown_trusted_source_is_a_global_failure() {
 fn an_unknown_log_level_is_a_global_failure() {
     assert_eq!(
         global_failure(&replaced("  log_level: info", "  log_level: verbose")),
-        StartupFailure::InvalidObservability
+        RuntimeFailure::InvalidObservability
     );
 }
 
@@ -634,7 +704,7 @@ fn invalid_enabled_tracing_configuration_is_a_global_failure() {
         "    endpoint: \"https://otlp.example.test/v1/traces\"\n    export_timeout_milliseconds: 5000\n    insecure: true"
             .to_owned(),
     ] {
-        assert_eq!(global_failure(&enabled(&extra)), StartupFailure::InvalidObservability, "invalid enabled tracing configuration must abort startup: {extra}"
+        assert_eq!(global_failure(&enabled(&extra)), RuntimeFailure::InvalidObservability, "invalid enabled tracing configuration must abort startup: {extra}"
         );
     }
 }
@@ -646,7 +716,7 @@ fn an_unknown_target_field_is_a_global_failure() {
             "    adapter: \"glpi\"",
             "    adapter: \"glpi\"\n    endpoint: \"https://glpi.example.test\""
         )),
-        StartupFailure::InvalidTargets
+        RuntimeFailure::InvalidTargets
     );
 }
 

@@ -23,7 +23,6 @@ pub(crate) mod transport;
 mod tests;
 
 use std::{
-    num::NonZeroUsize,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -39,17 +38,17 @@ use permissionsync_core::{LogicalTarget, SynchronizationContext};
 use tokio::{
     net::{TcpListener, TcpStream},
     signal::unix::{SignalKind, signal},
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::oneshot,
     task::JoinSet,
     time::timeout,
 };
 use tracing::{info, warn};
 
 use crate::runtime::{
-    admission::{InboundAdmission, concurrent_connection_limit},
+    admission::InboundAdmission,
     capacity::SemaphoreCapacity,
     configuration::{ComponentOutcome, ExecutableConfiguration},
-    failure::StartupFailure,
+    failure::RuntimeFailure,
     lifecycle::{Lifecycle, RequestCancellation},
     transport::{RuntimeState, record_component_availability, router},
 };
@@ -84,19 +83,19 @@ const MAX_CONSECUTIVE_ACCEPT_FAILURES: u32 = 16;
 /// Reading and validating configuration happens before the asynchronous runtime
 /// exists, so a global defect aborts before any listener, task, or telemetry
 /// channel is created.
-pub(crate) fn run() -> Result<(), StartupFailure> {
+pub(crate) fn run() -> Result<(), RuntimeFailure> {
     let path = configuration::configuration_path()?;
     let configuration = configuration::load(Path::new(&path))?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|_| StartupFailure::RuntimeUnavailable)?;
+        .map_err(|_| RuntimeFailure::RuntimeUnavailable)?;
 
     runtime.block_on(serve_configured(configuration))
 }
 
-async fn serve_configured(configuration: ExecutableConfiguration) -> Result<(), StartupFailure> {
+async fn serve_configured(configuration: ExecutableConfiguration) -> Result<(), RuntimeFailure> {
     let ExecutableConfiguration {
         listener: listen_address,
         overall_request_deadline,
@@ -123,11 +122,15 @@ async fn serve_configured(configuration: ExecutableConfiguration) -> Result<(), 
         .collect();
 
     let application = ComposedApplication::compose(semantic_configuration)
-        .map_err(|_| StartupFailure::InvalidComposition)?;
+        .map_err(|_| RuntimeFailure::InvalidComposition)?;
 
-    let admission = InboundAdmission::new(inbound_admission_limit);
+    // Configuration validation already proved every derived semaphore size, so
+    // neither constructor can reach a panicking semaphore; both still report
+    // rather than assume it.
+    let admission =
+        InboundAdmission::new(inbound_admission_limit).ok_or(RuntimeFailure::InvalidRequest)?;
     let capacity =
-        SemaphoreCapacity::new(synchronization_capacity).ok_or(StartupFailure::InvalidRequest)?;
+        SemaphoreCapacity::new(synchronization_capacity).ok_or(RuntimeFailure::InvalidRequest)?;
 
     let observability = observability::initialize(&observability_configuration)?;
     report_component_availability(&application, provider_outcome, glpi_outcome, &glpi_routes);
@@ -151,7 +154,6 @@ async fn serve_configured(configuration: ExecutableConfiguration) -> Result<(), 
         router,
         &state,
         lifecycle,
-        inbound_admission_limit,
         shutdown_grace,
         metadata_operation_timeout,
         observability.tracing_enabled(),
@@ -167,20 +169,18 @@ async fn serve_configured(configuration: ExecutableConfiguration) -> Result<(), 
 
 /// Binds the configured listener, begins serving, and then allows bounded
 /// verifier warm-up.
-#[allow(clippy::too_many_arguments)]
 async fn bind_and_serve(
     listen_address: std::net::SocketAddr,
     router: Router,
     state: &Arc<RuntimeState>,
     lifecycle: Arc<Lifecycle>,
-    inbound_admission_limit: NonZeroUsize,
     shutdown_grace: Duration,
     metadata_operation_timeout: Duration,
     tracing_enabled: bool,
-) -> Result<(), StartupFailure> {
+) -> Result<(), RuntimeFailure> {
     let listener = TcpListener::bind(listen_address)
         .await
-        .map_err(|_| StartupFailure::ListenerUnavailable)?;
+        .map_err(|_| RuntimeFailure::ListenerUnavailable)?;
 
     info!(
         target: "permissionsync::runtime",
@@ -188,19 +188,21 @@ async fn bind_and_serve(
         "permissionsync bound its listener and is serving"
     );
 
-    // Spawned before the accept loop is awaited, so it first runs once this
-    // task yields: that is, once serving has begun. It is bounded and never
-    // gates readiness or serving.
-    let warm_up = spawn_verifier_warm_up(state, metadata_operation_timeout);
+    // The warm-up task's first action is to await this signal, which `serve`
+    // sends immediately before its first accept. That is a happens-before
+    // relation rather than a scheduling assumption: no metadata retrieval can
+    // precede serving, whichever worker the task starts on. Warm-up stays
+    // bounded, asynchronous, and non-gating.
+    let (serving_started, serving_has_started) = oneshot::channel();
+    let warm_up = spawn_verifier_warm_up(state, metadata_operation_timeout, serving_has_started);
     let signals = tokio::spawn(signal_shutdown(Arc::clone(&lifecycle)));
 
-    let connection_limit = concurrent_connection_limit(inbound_admission_limit);
-    serve(
+    let served = serve(
         listener,
         router,
         Arc::clone(&lifecycle),
-        connection_limit,
         shutdown_grace,
+        serving_started,
     )
     .await;
 
@@ -210,7 +212,7 @@ async fn bind_and_serve(
     warm_up.abort();
     let _ = warm_up.await;
 
-    Ok(())
+    served
 }
 
 /// Reports which optional components are usable, using bounded labels only.
@@ -276,13 +278,24 @@ fn report_component_availability(
 }
 
 /// Starts the single bounded, non-gating verifier warm-up.
+///
+/// The task waits for `serving_has_started` before anything else, so it cannot
+/// consult the trusted metadata source before serving has begun. A dropped
+/// sender means serving never started, and then warm-up performs no work at
+/// all. The bounded budget is measured from the moment serving started, not
+/// from when the task was spawned.
 fn spawn_verifier_warm_up(
     state: &Arc<RuntimeState>,
     budget: Duration,
+    serving_has_started: oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     let authenticator = state.authenticator().clone();
     let lifecycle = Arc::clone(state.lifecycle());
     tokio::spawn(async move {
+        if serving_has_started.await.is_err() {
+            return;
+        }
+
         let cancellation = RequestCancellation::new(&lifecycle);
         let context = SynchronizationContext::new(Instant::now() + budget, &cancellation);
         // The outcome is deliberately ignored: warm-up never gates serving,
@@ -294,36 +307,41 @@ fn spawn_verifier_warm_up(
 /// Accepts and serves connections until shutdown, then terminates in bounded
 /// phases.
 ///
-/// The accept loop holds at most `connection_limit` connections at once and
-/// stops calling `accept` while that bound is reached. Surplus load therefore
-/// stays in the kernel listen backlog as transport backpressure instead of
-/// becoming application state, which is what bounds admission waiters. Every
-/// connection task is owned by the local [`JoinSet`], so nothing is detached.
+/// Connections are not gated behind an application semaphore. Bounding them
+/// that way could not reserve a share for operational endpoints, because a
+/// request's class is only known after its head has been read, so a saturated
+/// synchronization workload could occupy every slot and hide `/healthz`,
+/// `/readyz`, and `/metrics` behind accept backpressure. What ADR 0011 requires
+/// bounded — admitted synchronization requests, aggregate body buffering, and
+/// application-owned waiter state — is bounded by
+/// [`InboundAdmission`](crate::runtime::admission::InboundAdmission) instead,
+/// which no operational request touches.
+///
+/// Every connection task is owned by the local [`JoinSet`] and finished tasks
+/// are reaped each iteration, so nothing is detached and the owned set tracks
+/// only live connections.
+///
+/// `serving_started` is signalled once, immediately before the first accept, so
+/// anything that must not precede serving can wait on it.
 async fn serve(
     listener: TcpListener,
     router: Router,
     lifecycle: Arc<Lifecycle>,
-    connection_limit: usize,
     shutdown_grace: Duration,
-) {
-    let permits = Arc::new(Semaphore::new(connection_limit));
+    serving_started: oneshot::Sender<()>,
+) -> Result<(), RuntimeFailure> {
     let mut connections: JoinSet<()> = JoinSet::new();
     let shutdown_lifecycle = Arc::clone(&lifecycle);
     let mut shutdown = Box::pin(async move { shutdown_lifecycle.shutdown_started().await });
     let mut consecutive_failures = 0_u32;
 
+    // The listener is bound and this loop is about to accept: serving has
+    // begun. Anything awaiting this signal therefore cannot run earlier.
+    let _ = serving_started.send(());
+
     loop {
         // Reap finished connections so the owned set stays bounded.
         while connections.try_join_next().is_some() {}
-
-        let permit = tokio::select! {
-            biased;
-            () = &mut shutdown => break,
-            permit = Arc::clone(&permits).acquire_owned() => match permit {
-                Ok(permit) => permit,
-                Err(_) => break,
-            },
-        };
 
         let accepted = tokio::select! {
             biased;
@@ -339,19 +357,53 @@ async fn serve(
                     stream,
                     router.clone(),
                     Arc::clone(&lifecycle),
-                    permit,
                 ));
             }
             Err(_) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                if consecutive_failures >= MAX_CONSECUTIVE_ACCEPT_FAILURES {
-                    break;
+                if accept_failure_is_fatal(&mut consecutive_failures) {
+                    return Err(terminate_after_fatal_accept_failure(
+                        &mut connections,
+                        &lifecycle,
+                        shutdown_grace,
+                    )
+                    .await);
                 }
             }
         }
     }
 
     shut_down_connections(&mut connections, &lifecycle, shutdown_grace).await;
+    Ok(())
+}
+
+/// Records one listener-accept failure and reports whether the listener must be
+/// treated as unusable.
+///
+/// A transient failure such as an aborted connection is tolerated; repeated
+/// consecutive failures mean the listener can no longer produce connections, so
+/// the process must terminate rather than spin.
+fn accept_failure_is_fatal(consecutive_failures: &mut u32) -> bool {
+    *consecutive_failures = consecutive_failures.saturating_add(1);
+    *consecutive_failures >= MAX_CONSECUTIVE_ACCEPT_FAILURES
+}
+
+/// Terminates the runtime through the ordinary shutdown lifecycle after the
+/// listener became unusable, and reports the fatal category.
+///
+/// Fatal accept exhaustion is not a quiet stop: readiness becomes false first,
+/// no further synchronization request is admitted, pending admission waits are
+/// released, already admitted work follows the same bounded grace and
+/// cancellation phases, and remaining owned tasks are terminated and awaited.
+/// The returned category makes the process report failure rather than normal
+/// termination.
+async fn terminate_after_fatal_accept_failure(
+    connections: &mut JoinSet<()>,
+    lifecycle: &Lifecycle,
+    shutdown_grace: Duration,
+) -> RuntimeFailure {
+    lifecycle.begin_shutdown();
+    shut_down_connections(connections, lifecycle, shutdown_grace).await;
+    RuntimeFailure::ListenerAcceptFailed
 }
 
 /// Translates a termination signal into the start of shutdown.
@@ -405,17 +457,11 @@ async fn drain(connections: &mut JoinSet<()>) {
     while connections.join_next().await.is_some() {}
 }
 
-/// Serves one connection, releasing its transport permit when the task ends.
+/// Serves one connection.
 ///
 /// On shutdown the connection stops accepting further requests on itself and
 /// lets an in-flight request finish, bounded by the caller's grace handling.
-async fn serve_connection(
-    stream: TcpStream,
-    router: Router,
-    lifecycle: Arc<Lifecycle>,
-    permit: OwnedSemaphorePermit,
-) {
-    let _permit = permit;
+async fn serve_connection(stream: TcpStream, router: Router, lifecycle: Arc<Lifecycle>) {
     let connection = hyper::server::conn::http1::Builder::new()
         .keep_alive(true)
         .serve_connection(TokioIo::new(stream), TowerToHyperService::new(router));
@@ -439,17 +485,42 @@ pub(crate) async fn serve_for_test(
     listener: TcpListener,
     router: Router,
     lifecycle: Arc<Lifecycle>,
-    connection_limit: usize,
     shutdown_grace: Duration,
-) {
-    serve(
-        listener,
-        router,
-        lifecycle,
-        connection_limit,
-        shutdown_grace,
-    )
-    .await;
+    serving_started: oneshot::Sender<()>,
+) -> Result<(), RuntimeFailure> {
+    serve(listener, router, lifecycle, shutdown_grace, serving_started).await
+}
+
+/// Test-only access to the fatal-accept decision.
+#[cfg(test)]
+pub(crate) fn accept_failure_is_fatal_for_test(consecutive_failures: &mut u32) -> bool {
+    accept_failure_is_fatal(consecutive_failures)
+}
+
+/// Test-only access to the fatal-accept lifecycle transition.
+#[cfg(test)]
+pub(crate) async fn terminate_after_fatal_accept_failure_for_test(
+    connections: &mut JoinSet<()>,
+    lifecycle: &Lifecycle,
+    shutdown_grace: Duration,
+) -> RuntimeFailure {
+    terminate_after_fatal_accept_failure(connections, lifecycle, shutdown_grace).await
+}
+
+/// Test-only access to the consecutive-accept-failure threshold.
+#[cfg(test)]
+pub(crate) const fn max_consecutive_accept_failures() -> u32 {
+    MAX_CONSECUTIVE_ACCEPT_FAILURES
+}
+
+/// Test-only access to the bounded verifier warm-up task.
+#[cfg(test)]
+pub(crate) fn spawn_verifier_warm_up_for_test(
+    state: &Arc<RuntimeState>,
+    budget: Duration,
+    serving_has_started: oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_verifier_warm_up(state, budget, serving_has_started)
 }
 
 /// Test-only accessor for the fixed post-grace cancellation window.

@@ -58,11 +58,12 @@ process-wide GLPI backend.
 
 Startup aborts for a global defect: an unreadable, non-UTF-8, empty,
 multi-document, or malformed file; an unknown top-level field; an invalid
-listener, deadline, admission limit, or capacity; a synchronization capacity
-above the product ceiling of 1024; a shutdown grace below the overall deadline;
-invalid authentication configuration; invalid tracing configuration while export
-is explicitly enabled; a duplicate or grammar-invalid logical target; or a
-listener that cannot be bound.
+listener, deadline, admission limit, or capacity; an admission limit or
+synchronization capacity whose bounded-concurrency primitives could not be
+constructed; a synchronization capacity above the product ceiling of 1024; a
+shutdown grace below the overall deadline; invalid authentication configuration;
+invalid tracing configuration while export is explicitly enabled; a duplicate or
+grammar-invalid logical target; or a listener that cannot be bound.
 
 Startup does **not** abort because a component is unusable. An absent or invalid
 `provider` section leaves the Provider unavailable, and an absent or invalid
@@ -87,10 +88,19 @@ safely. It does not require current Keycloak connectivity while still-usable
 cached verification material exists, and it never depends on the Provider, GLPI,
 a target, or a telemetry backend. It turns false as soon as shutdown begins.
 
-The three operational endpoints need no inbound admission, so they stay
-observable while synchronization is saturated. They expose no secrets, URLs,
-targets, credentials, trust material, JWT details, or internal errors, and there
-is no general status or configuration endpoint.
+The three operational endpoints take neither an inbound admission permit nor a
+place in the admission wait list, and connections are not gated behind either,
+so a saturated synchronization workload cannot keep them from being answered.
+They expose no secrets, URLs, targets, credentials, trust material, JWT details,
+or internal errors, and there is no general status or configuration endpoint.
+
+`inbound_admission_limit` bounds two things: how many synchronization requests
+may be admitted at once, and — through a value derived from it — how many further
+synchronization requests may be waiting for admission. A request beyond both
+bounds is never queued: it waits only on its own overall deadline and then
+returns the ordinary server-side deadline outcome. Saturation therefore adds no
+`429`, `503`, or other caller-facing status, and no application queue can grow
+with the number of open connections.
 
 The inbound synchronization body has a fixed one-mebibyte product limit. It is
 not configurable, and exceeding it is a body-validation outcome in the fixed
@@ -116,6 +126,10 @@ context and never changes an outcome. No trace-context header is added to
 Provider or Target Adapter requests.
 
 ### Shutdown
+
+If the bound listener repeatedly fails to accept connections, the process treats
+it as fatal: it enters the same shutdown sequence as below and then exits
+reporting failure rather than success.
 
 On `SIGTERM` or `SIGINT` the process marks readiness false, stops accepting,
 admits no further synchronization request and releases pending admission waits,

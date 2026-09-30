@@ -10,9 +10,10 @@ use axum::{body::Body, http::Request, http::StatusCode};
 
 use crate::runtime::{
     observability::{
-        ADMISSION_ABANDONED_TOTAL, ADMISSION_SATURATED_TOTAL, ADMISSION_WAITERS, CAPACITY_IN_USE,
-        CAPACITY_SATURATED_TOTAL, CAPACITY_UNAVAILABLE_TOTAL, COMPONENT_AVAILABLE, READY,
-        REQUEST_DURATION_SECONDS, REQUEST_STAGE_TOTAL, REQUESTS_IN_FLIGHT, REQUESTS_TOTAL,
+        ADMISSION_ABANDONED_TOTAL, ADMISSION_QUEUE_FULL_TOTAL, ADMISSION_SATURATED_TOTAL,
+        ADMISSION_WAITERS, CAPACITY_IN_USE, CAPACITY_SATURATED_TOTAL, CAPACITY_UNAVAILABLE_TOTAL,
+        COMPONENT_AVAILABLE, READY, REQUEST_DURATION_SECONDS, REQUEST_STAGE_TOTAL,
+        REQUESTS_IN_FLIGHT, REQUESTS_TOTAL,
     },
     tests::support::{
         GLPI, HttpsFixture, RuntimeFixture, RuntimeFixtureOptions, SigningMaterial, authenticator,
@@ -283,6 +284,73 @@ async fn inbound_admission_saturation_is_represented() {
 
     assert_contains(&exposition, &format!("{ADMISSION_SATURATED_TOTAL} 1"));
     assert_contains(&exposition, &format!("{ADMISSION_ABANDONED_TOTAL} 1"));
+    assert_contains(&exposition, &format!("{ADMISSION_WAITERS} 0"));
+    assert_no_sentinels(&exposition);
+
+    drop(held);
+    scenario.finish().await;
+}
+
+/// A wait list that is already at its bound is distinguishable from ordinary
+/// admission saturation, so an operator can see which bound was reached.
+#[tokio::test(start_paused = true)]
+async fn a_full_admission_wait_list_is_represented() {
+    let scenario = Scenario::build(|options| {
+        options.inbound_admission_limit = NonZeroUsize::new(1).unwrap();
+        options.overall_request_deadline = Duration::from_millis(100);
+    })
+    .await;
+    let guard = scenario.fixture.recorder_guard();
+
+    let held = scenario
+        .fixture
+        .state
+        .admission()
+        .admit(
+            std::time::Instant::now() + Duration::from_secs(600),
+            &scenario.fixture.lifecycle,
+        )
+        .await
+        .expect("admissible");
+    let token = scenario.signing.token(Some("service_account"));
+
+    // The first request occupies the single waiter slot and keeps it while it
+    // waits; the second therefore finds the wait list already full.
+    let mut parked = Box::pin(
+        scenario
+            .fixture
+            .synchronize(Some(&token), Body::from(valid_body())),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut parked)
+            .await
+            .is_err(),
+        "the first request must still be waiting"
+    );
+    assert_eq!(
+        scenario.fixture.state.admission().available_waiter_slots(),
+        0,
+        "the single waiter slot is occupied"
+    );
+
+    assert_eq!(
+        scenario
+            .fixture
+            .synchronize(Some(&token), Body::from(valid_body()))
+            .await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        parked.await,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the waiting request also ends through the deadline path"
+    );
+
+    drop(guard);
+    let exposition = scenario.fixture.rendered_metrics();
+
+    assert_contains(&exposition, &format!("{ADMISSION_SATURATED_TOTAL} 2"));
+    assert_contains(&exposition, &format!("{ADMISSION_QUEUE_FULL_TOTAL} 1"));
     assert_contains(&exposition, &format!("{ADMISSION_WAITERS} 0"));
     assert_no_sentinels(&exposition);
 

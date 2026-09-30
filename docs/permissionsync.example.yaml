@@ -31,8 +31,10 @@ request:
   overall_deadline_milliseconds: 10000
 
   # How many synchronization requests may be admitted concurrently. This bounds
-  # aggregate request-body buffering and pre-selected-target work. Operational
-  # endpoints need no admission.
+  # aggregate request-body buffering and pre-selected-target work, and the same
+  # value also bounds how many further synchronization requests may wait for
+  # admission. Requests beyond both bounds are never queued: they wait only on
+  # their own overall deadline. Operational endpoints need neither.
   inbound_admission_limit: 64
 
   # How many selected-target synchronizations may run concurrently. Must be

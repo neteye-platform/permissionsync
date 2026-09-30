@@ -616,7 +616,8 @@ impl RuntimeFixture {
         .expect("test composition must be globally valid");
         let capacity = SemaphoreCapacity::new(options.synchronization_capacity)
             .expect("test capacity is within the product ceiling");
-        let admission = InboundAdmission::new(options.inbound_admission_limit);
+        let admission = InboundAdmission::new(options.inbound_admission_limit)
+            .expect("test admission limits are constructible");
         let lifecycle = Arc::new(Lifecycle::new());
 
         let state = Arc::new(RuntimeState::new(

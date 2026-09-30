@@ -32,7 +32,7 @@ use tracing_subscriber::{
 };
 
 use crate::runtime::{
-    failure::StartupFailure,
+    failure::RuntimeFailure,
     otlp::{ExporterOrigin, PinnedExporterClient},
 };
 
@@ -47,6 +47,8 @@ pub(crate) const ADMISSION_SATURATED_TOTAL: &str =
     "permissionsync_inbound_admission_saturated_total";
 pub(crate) const ADMISSION_ABANDONED_TOTAL: &str =
     "permissionsync_inbound_admission_abandoned_total";
+pub(crate) const ADMISSION_QUEUE_FULL_TOTAL: &str =
+    "permissionsync_inbound_admission_queue_full_total";
 pub(crate) const CAPACITY_IN_USE: &str = "permissionsync_synchronization_capacity_in_use";
 pub(crate) const CAPACITY_SATURATED_TOTAL: &str =
     "permissionsync_synchronization_capacity_saturated_total";
@@ -242,10 +244,10 @@ impl Observability {
 /// runtime task.
 pub(crate) fn initialize(
     configuration: &ObservabilityConfiguration,
-) -> Result<Observability, StartupFailure> {
+) -> Result<Observability, RuntimeFailure> {
     let recorder = PrometheusBuilder::new()
         .set_buckets(&DURATION_BUCKETS)
-        .map_err(|_| StartupFailure::ObservabilityUnavailable)?
+        .map_err(|_| RuntimeFailure::ObservabilityUnavailable)?
         .build_recorder();
     let metrics = recorder.handle();
 
@@ -269,17 +271,17 @@ pub(crate) fn initialize(
     match &tracer_provider {
         None => registry
             .try_init()
-            .map_err(|_| StartupFailure::ObservabilityUnavailable)?,
+            .map_err(|_| RuntimeFailure::ObservabilityUnavailable)?,
         Some(provider) => {
             let tracer = opentelemetry::trace::TracerProvider::tracer(provider, "permissionsync");
             registry
                 .with(tracing_opentelemetry::layer().with_tracer(tracer))
                 .try_init()
-                .map_err(|_| StartupFailure::ObservabilityUnavailable)?;
+                .map_err(|_| RuntimeFailure::ObservabilityUnavailable)?;
         }
     }
 
-    metrics::set_global_recorder(recorder).map_err(|_| StartupFailure::ObservabilityUnavailable)?;
+    metrics::set_global_recorder(recorder).map_err(|_| RuntimeFailure::ObservabilityUnavailable)?;
 
     Ok(Observability {
         metrics,
@@ -294,7 +296,7 @@ pub(crate) fn initialize(
 /// HTTPS client. None of these paths can backpressure synchronization work.
 pub(crate) fn build_tracer_provider(
     configuration: &TracingConfiguration,
-) -> Result<SdkTracerProvider, StartupFailure> {
+) -> Result<SdkTracerProvider, RuntimeFailure> {
     let exporter = SpanExporter::builder()
         .with_http()
         .with_http_client(configuration.client())
@@ -305,7 +307,7 @@ pub(crate) fn build_tracer_provider(
         // becoming a queue of repeated work.
         .with_retry_policy(RetryPolicy::disabled())
         .build()
-        .map_err(|_| StartupFailure::InvalidObservability)?;
+        .map_err(|_| RuntimeFailure::InvalidObservability)?;
 
     let processor = BatchSpanProcessor::builder(exporter)
         .with_batch_config(

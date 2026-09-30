@@ -23,7 +23,7 @@ use axum::{
 use http_body::{Body as HttpBody, Frame, SizeHint};
 
 use crate::runtime::{
-    admission::{ADMISSION_WAITER_HEADROOM, concurrent_connection_limit},
+    admission::waiter_slots,
     tests::support::{
         GLPI, HttpsFixture, RuntimeFixture, RuntimeFixtureOptions, SigningMaterial, authenticator,
         glpi_configuration, jwks_fixture, provider_configuration, target, valid_body,
@@ -533,23 +533,146 @@ async fn saturation_introduces_no_new_caller_facing_status() {
     scenario.finish().await;
 }
 
-/// Application-owned waiter state is bounded by the transport connection bound,
-/// not by the admission limit alone.
-#[test]
-fn waiter_state_is_bounded_by_the_transport_connection_bound() {
-    for limit in [1_usize, 8, 64, 1024] {
-        let admission = NonZeroUsize::new(limit).unwrap();
-        let connections = concurrent_connection_limit(admission);
+/// Application-owned waiter state is bounded by admission's own derived waiter
+/// bound, not by how many connections happen to be served.
+///
+/// Requests beyond that bound are never enqueued: they wait only on their own
+/// deadline, so the wait list cannot grow past it.
+#[tokio::test(start_paused = true)]
+async fn the_admission_wait_list_cannot_grow_past_its_derived_bound() {
+    let limit = NonZeroUsize::new(2).unwrap();
+    let slots = waiter_slots(limit).get();
+    let scenario = Scenario::build(|options| {
+        options.inbound_admission_limit = limit;
+        options.overall_request_deadline = Duration::from_secs(600);
+    })
+    .await;
+    let token = scenario.token();
+    let held = saturate(&scenario.fixture).await;
 
-        assert_eq!(connections, limit + ADMISSION_WAITER_HEADROOM);
+    // Park exactly as many requests as the wait list allows.
+    let mut parked = Vec::new();
+    for _ in 0..slots {
+        let mut request = Box::pin(
+            scenario.fixture.call(
+                Request::builder()
+                    .method("POST")
+                    .uri(SYNCHRONIZATION_ROUTE)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(valid_body()))
+                    .unwrap(),
+            ),
+        );
         assert!(
-            connections > limit,
-            "there must be headroom above the admission limit for waiters and probes"
+            tokio::time::timeout(Duration::from_millis(20), &mut request)
+                .await
+                .is_err(),
+            "a saturated request must still be waiting"
         );
-        assert_eq!(
-            connections - limit,
-            ADMISSION_WAITER_HEADROOM,
-            "at most this many requests can wait for admission or use an operational endpoint"
-        );
+        parked.push(request);
     }
+    assert_eq!(
+        scenario.fixture.state.admission().available_waiter_slots(),
+        0,
+        "the wait list is at its bound"
+    );
+
+    // Further requests must not enlarge the wait list.
+    let mut beyond = Vec::new();
+    for _ in 0..4 {
+        let mut request = Box::pin(
+            scenario.fixture.call(
+                Request::builder()
+                    .method("POST")
+                    .uri(SYNCHRONIZATION_ROUTE)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(valid_body()))
+                    .unwrap(),
+            ),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut request)
+                .await
+                .is_err(),
+            "a request beyond the wait list still waits on its own deadline"
+        );
+        beyond.push(request);
+    }
+    assert_eq!(
+        scenario.fixture.state.admission().available_waiter_slots(),
+        0,
+        "the wait list stayed at its bound"
+    );
+    assert_eq!(
+        scenario.jwks.request_count(),
+        0,
+        "no unadmitted request reached authentication"
+    );
+
+    drop(beyond);
+    drop(parked);
+    drop(held);
+    scenario.finish().await;
+}
+
+/// A request that finds the wait list full still ends through the existing
+/// server-side deadline path, not through a new caller-facing status.
+#[tokio::test(start_paused = true)]
+async fn a_request_beyond_the_wait_list_ends_through_the_existing_deadline_path() {
+    let scenario = Scenario::build(|options| {
+        options.inbound_admission_limit = NonZeroUsize::new(1).unwrap();
+        options.overall_request_deadline = Duration::from_millis(200);
+    })
+    .await;
+    let token = scenario.token();
+    let held = saturate(&scenario.fixture).await;
+
+    // Occupy the single waiter slot.
+    let mut parked = Box::pin(
+        scenario.fixture.call(
+            Request::builder()
+                .method("POST")
+                .uri(SYNCHRONIZATION_ROUTE)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(valid_body()))
+                .unwrap(),
+        ),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut parked)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        scenario.fixture.state.admission().available_waiter_slots(),
+        0
+    );
+
+    let (body, polled, _) = ObservedBody::new(valid_body());
+    let status = scenario
+        .fixture
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri(SYNCHRONIZATION_ROUTE)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::new(body))
+                .unwrap(),
+        )
+        .await
+        .status();
+
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the wait list being full adds no new caller-facing status"
+    );
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "a request beyond the wait list must not collect its body"
+    );
+
+    drop(parked);
+    drop(held);
+    scenario.finish().await;
 }

@@ -1,5 +1,6 @@
-//! The bounded operational lifecycle: transport backpressure, graceful
-//! shutdown, grace expiry, and a bounded trace flush.
+//! The bounded operational lifecycle: operational reachability under
+//! synchronization saturation, graceful shutdown, grace expiry, fatal
+//! accept-loop failure, a bounded trace flush, and verifier warm-up ordering.
 //!
 //! Lifecycle correctness is exercised through the real accept loop on an
 //! ephemeral loopback port, and through the lifecycle state directly, rather
@@ -20,7 +21,8 @@ use tokio::{
 };
 
 use crate::runtime::{
-    admission::concurrent_connection_limit,
+    admission::waiter_slots,
+    failure::RuntimeFailure,
     lifecycle::Lifecycle,
     observability::{
         BOUNDED_EXPORT_BATCH, BOUNDED_SPAN_QUEUE, SPAN_EXPORT_INTERVAL, TracingConfiguration,
@@ -28,9 +30,9 @@ use crate::runtime::{
     },
     tests::support::{
         FIXTURE_TIMEOUT, HttpsFixture, RefusingEndpoint, RuntimeFixture, RuntimeFixtureOptions,
-        SigningMaterial, authenticator, jwks_fixture, valid_body,
+        SigningMaterial, authenticator, jwks_fixture, provider_configuration, valid_body,
     },
-    transport::{HEALTH_ROUTE, READINESS_ROUTE, SYNCHRONIZATION_ROUTE, router},
+    transport::{HEALTH_ROUTE, METRICS_ROUTE, READINESS_ROUTE, SYNCHRONIZATION_ROUTE, router},
 };
 
 /// A generous bound on any lifecycle assertion, so a defect fails rather than
@@ -44,12 +46,11 @@ struct Serving {
     fixture: Arc<RuntimeFixture>,
     jwks: HttpsFixture,
     signing: SigningMaterial,
-    serve: Option<tokio::task::JoinHandle<()>>,
+    serve: Option<tokio::task::JoinHandle<Result<(), RuntimeFailure>>>,
 }
 
 impl Serving {
     async fn start(
-        connection_limit: usize,
         shutdown_grace: Duration,
         options: impl FnOnce(&mut RuntimeFixtureOptions),
     ) -> Self {
@@ -66,12 +67,13 @@ impl Serving {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let (serving_started, _serving_has_started) = tokio::sync::oneshot::channel();
         let serve = tokio::spawn(crate::runtime::serve_for_test(
             listener,
             router,
             Arc::clone(&lifecycle),
-            connection_limit,
             shutdown_grace,
+            serving_started,
         ));
 
         Self {
@@ -85,14 +87,18 @@ impl Serving {
     }
 
     /// Begins shutdown and waits for the accept loop to finish, bounded.
+    ///
+    /// A normal shutdown must report success: only a fatal serving failure
+    /// terminates with a failure category.
     async fn shut_down(&mut self) -> Duration {
         let started = Instant::now();
         self.lifecycle.begin_shutdown();
         let serve = self.serve.take().expect("serve runs once");
-        timeout(LIFECYCLE_BOUND, serve)
+        let served = timeout(LIFECYCLE_BOUND, serve)
             .await
             .expect("shutdown must be bounded")
             .expect("the accept loop must not panic");
+        assert_eq!(served, Ok(()), "a requested shutdown is not a failure");
         started.elapsed()
     }
 
@@ -141,6 +147,18 @@ impl Connection {
         format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n")
     }
 
+    /// A complete synchronization request, so nothing about it is waiting on
+    /// more bytes from the client.
+    fn synchronization_request(bearer: &str) -> String {
+        let body = String::from_utf8(valid_body()).expect("the fixed body is UTF-8");
+        format!(
+            "POST {SYNCHRONIZATION_ROUTE} HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+             Authorization: Bearer {bearer}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
     /// A request that declares more body than it sends, so the handler stays in
     /// bounded body collection until its own deadline.
     fn incomplete_body_request(bearer: &str) -> String {
@@ -153,61 +171,127 @@ impl Connection {
 }
 
 // ---------------------------------------------------------------------------
-// Transport backpressure
+// Operational reachability under synchronization saturation
 // ---------------------------------------------------------------------------
 
-/// The accept loop stops accepting at the connection bound, so surplus load
-/// stays in the kernel listen backlog instead of becoming application state.
-/// This is what bounds admission waiter state.
+/// The invariant that matters: with synchronization admission fully saturated
+/// and its bounded wait list completely full, a newly opened connection for
+/// `/healthz`, `/readyz`, or `/metrics` is still served.
+///
+/// This exercises the real listener and real connections, not the router
+/// directly, because the property being proven is about the accept path.
 #[tokio::test]
-async fn the_accept_loop_serves_no_more_than_the_connection_bound() {
-    let mut serving = Serving::start(1, Duration::from_secs(5), |_| {}).await;
+async fn operational_endpoints_are_served_while_synchronization_admission_is_saturated() {
+    let provider = HttpsFixture::start(Vec::new()).await;
+    let admission_limit = NonZeroUsize::new(1).unwrap();
+    let waiters = waiter_slots(admission_limit).get();
+    let mut serving = Serving::start(Duration::from_secs(10), |options| {
+        options.inbound_admission_limit = admission_limit;
+        // Long enough that no parked request can finish by itself during the
+        // assertions below.
+        options.overall_request_deadline = Duration::from_secs(600);
+        options.provider = Some(provider_configuration(
+            &provider.endpoint("/permissions"),
+            vec![provider.trust_anchor_pem().to_vec()],
+        ));
+    })
+    .await;
+    let token = serving.signing.token(Some("service_account"));
 
-    // The first connection is served and then kept alive, so its connection
-    // task holds the only transport permit.
-    let mut first = Connection::open(serving.address).await;
-    first
-        .write_request(&Connection::keep_alive_request(HEALTH_ROUTE))
-        .await;
-    let served = first
-        .read_response(FIXTURE_TIMEOUT)
+    // Hold every admission permit, so nothing further can be admitted.
+    let held = serving
+        .fixture
+        .state
+        .admission()
+        .admit(
+            Instant::now() + Duration::from_secs(600),
+            &serving.lifecycle,
+        )
         .await
-        .expect("the first connection must be served");
-    assert!(served.starts_with("HTTP/1.1 200"), "got {served}");
+        .expect("the configured limit must be admissible");
+    assert_eq!(serving.fixture.state.admission().available_permits(), 0);
 
-    // A second connection can complete its TCP handshake through the listen
-    // backlog, but must not be served while the bound is reached.
-    let mut second = Connection::open(serving.address).await;
-    second
-        .write_request(&Connection::keep_alive_request(HEALTH_ROUTE))
-        .await;
-    assert!(
-        second
-            .read_response(Duration::from_millis(250))
-            .await
-            .is_none(),
-        "a connection beyond the bound must not be served"
+    // Fill every waiter slot the implementation permits, and then add more
+    // synchronization connections beyond that bound.
+    let mut synchronization = Vec::new();
+    for _ in 0..(waiters + 4) {
+        let mut connection = Connection::open(serving.address).await;
+        connection
+            .write_request(&Connection::synchronization_request(&token))
+            .await;
+        synchronization.push(connection);
+    }
+
+    // No unadmitted synchronization request started authentication, Provider, or
+    // Adapter work. This is asserted before probing `/readyz`, because readiness
+    // legitimately performs its own bounded metadata refresh.
+    assert_eq!(
+        serving.jwks.request_count(),
+        0,
+        "no unadmitted request reached authentication"
+    );
+    assert_eq!(
+        provider.request_count(),
+        0,
+        "no unadmitted request reached the Provider"
+    );
+    assert_eq!(
+        serving.fixture.state.capacity().available_permits(),
+        RuntimeFixtureOptions::default()
+            .synchronization_capacity
+            .get(),
+        "no unadmitted request acquired selected-target capacity"
     );
 
-    // Releasing the first connection lets the second one through.
-    drop(first);
-    let served = second
-        .read_response(FIXTURE_TIMEOUT)
-        .await
-        .expect("the second connection must be served once a slot frees");
-    assert!(served.starts_with("HTTP/1.1 200"), "got {served}");
+    // Every operational endpoint must still answer on a brand-new connection.
+    for route in [HEALTH_ROUTE, READINESS_ROUTE, METRICS_ROUTE] {
+        let mut probe = Connection::open(serving.address).await;
+        probe
+            .write_request(&Connection::keep_alive_request(route))
+            .await;
+        let response = probe
+            .read_response(FIXTURE_TIMEOUT)
+            .await
+            .unwrap_or_else(|| panic!("{route} must be served under saturation"));
+        assert!(
+            response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.1 503"),
+            "{route} answered unexpectedly: {response}"
+        );
+    }
 
+    // Waiter state stayed bounded throughout, and the probes changed nothing
+    // about synchronization admission.
+    assert_eq!(
+        serving.fixture.state.admission().available_waiter_slots(),
+        0,
+        "the wait list is at its bound and cannot grow further"
+    );
+    assert_eq!(
+        serving.fixture.state.admission().available_permits(),
+        0,
+        "no further request was admitted"
+    );
+    assert_eq!(
+        provider.request_count(),
+        0,
+        "operational probes never reach the Provider"
+    );
+
+    drop(synchronization);
+    drop(held);
     serving.shut_down().await;
+    provider.shutdown().await;
     serving.finish().await;
 }
 
-/// The derived bound is always strictly above the configured admission limit, so
-/// operational probes and admission waiters always have room.
+/// The admission wait list is bounded by a value derived from the configured
+/// limit, which is what keeps application-owned waiter state bounded now that
+/// connections are not gated behind an application semaphore.
 #[test]
-fn the_connection_bound_always_exceeds_the_admission_limit() {
+fn the_admission_wait_list_bound_is_derived_from_the_configured_limit() {
     for limit in [1_usize, 2, 16, 64, 1024] {
         let admission = NonZeroUsize::new(limit).unwrap();
-        assert!(concurrent_connection_limit(admission) > limit);
+        assert_eq!(waiter_slots(admission).get(), limit);
     }
 }
 
@@ -219,7 +303,7 @@ fn the_connection_bound_always_exceeds_the_admission_limit() {
 /// even finished draining.
 #[tokio::test]
 async fn readiness_turns_false_before_shutdown_completes() {
-    let serving = Serving::start(4, Duration::from_secs(5), |_| {}).await;
+    let serving = Serving::start(Duration::from_secs(5), |_| {}).await;
     assert_eq!(
         serving.fixture.get(READINESS_ROUTE).await.status(),
         StatusCode::OK
@@ -246,7 +330,7 @@ async fn readiness_turns_false_before_shutdown_completes() {
 #[tokio::test]
 async fn shutdown_closes_idle_connections_within_the_grace_period() {
     let grace = Duration::from_secs(10);
-    let mut serving = Serving::start(4, grace, |_| {}).await;
+    let mut serving = Serving::start(grace, |_| {}).await;
 
     let mut idle = Connection::open(serving.address).await;
     idle.write_request(&Connection::keep_alive_request(HEALTH_ROUTE))
@@ -273,7 +357,7 @@ async fn shutdown_closes_idle_connections_within_the_grace_period() {
 /// The accept loop stops accepting as soon as shutdown begins.
 #[tokio::test]
 async fn no_connection_is_accepted_after_shutdown_begins() {
-    let mut serving = Serving::start(4, Duration::from_secs(5), |_| {}).await;
+    let mut serving = Serving::start(Duration::from_secs(5), |_| {}).await;
     let elapsed = serving.shut_down().await;
     assert!(elapsed < LIFECYCLE_BOUND);
 
@@ -307,7 +391,6 @@ async fn no_connection_is_accepted_after_shutdown_begins() {
 async fn grace_expiry_cancels_remaining_contexts_and_terminates_owned_tasks() {
     let grace = Duration::from_millis(300);
     let mut serving = Serving::start(
-        4,
         grace,
         // A long request deadline, so the in-flight request cannot end by
         // itself before the grace period expires.
@@ -360,7 +443,7 @@ async fn grace_expiry_cancels_remaining_contexts_and_terminates_owned_tasks() {
 /// process lifecycle.
 #[tokio::test]
 async fn no_admission_permit_survives_shutdown() {
-    let mut serving = Serving::start(4, Duration::from_millis(300), |options| {
+    let mut serving = Serving::start(Duration::from_millis(300), |options| {
         options.inbound_admission_limit = NonZeroUsize::new(2).unwrap();
         options.overall_request_deadline = Duration::from_secs(600);
     })
@@ -394,7 +477,7 @@ async fn no_admission_permit_survives_shutdown() {
 #[tokio::test]
 async fn admission_waiting_never_extends_shutdown() {
     let grace = Duration::from_secs(10);
-    let mut serving = Serving::start(4, grace, |options| {
+    let mut serving = Serving::start(grace, |options| {
         options.inbound_admission_limit = NonZeroUsize::new(1).unwrap();
         options.overall_request_deadline = Duration::from_secs(600);
     })
@@ -490,4 +573,209 @@ fn the_post_grace_cancellation_window_is_bounded() {
     let window = crate::runtime::cancelled_request_window();
     assert!(window > Duration::ZERO);
     assert!(window <= Duration::from_secs(5));
+}
+
+// ---------------------------------------------------------------------------
+// Fatal accept-loop failure
+// ---------------------------------------------------------------------------
+
+/// A transient accept failure is tolerated; only repeated consecutive failures
+/// make the listener unusable, and the threshold is exact.
+#[test]
+fn only_repeated_consecutive_accept_failures_are_fatal() {
+    let threshold = crate::runtime::max_consecutive_accept_failures();
+    assert!(
+        threshold > 1,
+        "a single transient failure must not be fatal"
+    );
+
+    let mut consecutive = 0_u32;
+    for attempt in 1..threshold {
+        assert!(
+            !crate::runtime::accept_failure_is_fatal_for_test(&mut consecutive),
+            "failure {attempt} of {threshold} must not be fatal"
+        );
+    }
+    assert!(
+        crate::runtime::accept_failure_is_fatal_for_test(&mut consecutive),
+        "the threshold failure must be fatal"
+    );
+
+    // A successful accept resets the counter in the loop, so a fresh counter
+    // must again tolerate transient failures.
+    let mut reset = 0_u32;
+    assert!(!crate::runtime::accept_failure_is_fatal_for_test(
+        &mut reset
+    ));
+}
+
+/// Fatal accept exhaustion must enter the same lifecycle invariants as a
+/// requested shutdown, and must report a failure rather than normal
+/// termination.
+#[tokio::test]
+async fn fatal_accept_failure_enters_shutdown_and_reports_failure() {
+    let serving = Serving::start(Duration::from_millis(200), |_| {}).await;
+    assert_eq!(
+        serving.fixture.get(READINESS_ROUTE).await.status(),
+        StatusCode::OK,
+        "the process is ready before the listener fails"
+    );
+
+    // An owned connection task that never finishes on its own, so the bounded
+    // grace and cancellation phases have to terminate it.
+    let mut connections: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    connections.spawn(std::future::pending::<()>());
+
+    let failure = timeout(
+        LIFECYCLE_BOUND,
+        crate::runtime::terminate_after_fatal_accept_failure_for_test(
+            &mut connections,
+            &serving.lifecycle,
+            Duration::from_millis(200),
+        ),
+    )
+    .await
+    .expect("fatal termination must stay bounded");
+
+    assert_eq!(
+        failure,
+        RuntimeFailure::ListenerAcceptFailed,
+        "the process must report a failure, not normal termination"
+    );
+    assert!(
+        serving.lifecycle.is_shutting_down(),
+        "readiness must be false and admission closed"
+    );
+    assert!(
+        serving.lifecycle.requests_cancelled(),
+        "grace expiry must cancel the remaining request contexts"
+    );
+    assert_eq!(
+        serving.fixture.get(READINESS_ROUTE).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "readiness must be false once the listener is unusable"
+    );
+    assert!(
+        connections.is_empty(),
+        "remaining owned tasks must be terminated and awaited"
+    );
+
+    // No further synchronization request is admitted after the transition.
+    assert!(
+        serving
+            .fixture
+            .state
+            .admission()
+            .admit(
+                Instant::now() + Duration::from_secs(600),
+                &serving.lifecycle
+            )
+            .await
+            .is_none(),
+        "no synchronization request may be admitted after fatal termination"
+    );
+
+    serving.finish().await;
+}
+
+/// The fatal category renders safely and exposes no operating-system error.
+#[test]
+fn the_fatal_accept_category_is_value_free() {
+    let rendered = RuntimeFailure::ListenerAcceptFailed.to_string();
+
+    assert!(!rendered.is_empty());
+    for leaked in [
+        "EMFILE",
+        "errno",
+        "os error",
+        "127.0.0.1",
+        "Too many open files",
+    ] {
+        assert!(!rendered.contains(leaked), "{rendered} leaked {leaked}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Verifier warm-up ordering
+// ---------------------------------------------------------------------------
+
+/// Warm-up must not consult the trusted metadata source before serving has
+/// begun. The ordering is a happens-before relation on an explicit signal, not
+/// a scheduling assumption, so holding the signal holds the warm-up.
+#[tokio::test]
+async fn warm_up_cannot_consult_the_metadata_source_before_serving_starts() {
+    let signing = SigningMaterial::new("warm-up-order-key");
+    let jwks = jwks_fixture(&signing, 2).await;
+    let fixture = Arc::new(RuntimeFixture::new(
+        authenticator(jwks.endpoint("/keys"), jwks.trust_anchor_pem().to_vec()),
+        RuntimeFixtureOptions::default(),
+    ));
+
+    let (serving_started, serving_has_started) = tokio::sync::oneshot::channel();
+    let mut warm_up = crate::runtime::spawn_verifier_warm_up_for_test(
+        &fixture.state,
+        Duration::from_secs(5),
+        serving_has_started,
+    );
+
+    // While the signal is unsent the task cannot progress past its first await,
+    // so it can never have issued a metadata request.
+    assert!(
+        timeout(Duration::from_millis(100), &mut warm_up)
+            .await
+            .is_err(),
+        "warm-up must not complete before serving starts"
+    );
+    assert_eq!(
+        jwks.request_count(),
+        0,
+        "warm-up must not consult the metadata source before serving starts"
+    );
+
+    // Signalling that serving started releases exactly one bounded refresh.
+    serving_started.send(()).expect("the warm-up task is alive");
+    timeout(LIFECYCLE_BOUND, warm_up)
+        .await
+        .expect("warm-up must stay bounded")
+        .expect("warm-up must not panic");
+    assert_eq!(
+        jwks.request_count(),
+        1,
+        "warm-up performs exactly one bounded refresh once serving started"
+    );
+
+    jwks.shutdown().await;
+}
+
+/// Serving that never starts must leave warm-up doing nothing at all.
+#[tokio::test]
+async fn warm_up_performs_no_work_when_serving_never_starts() {
+    let signing = SigningMaterial::new("warm-up-never-key");
+    let jwks = jwks_fixture(&signing, 2).await;
+    let fixture = Arc::new(RuntimeFixture::new(
+        authenticator(jwks.endpoint("/keys"), jwks.trust_anchor_pem().to_vec()),
+        RuntimeFixtureOptions::default(),
+    ));
+
+    let (serving_started, serving_has_started) = tokio::sync::oneshot::channel::<()>();
+    let warm_up = crate::runtime::spawn_verifier_warm_up_for_test(
+        &fixture.state,
+        Duration::from_secs(5),
+        serving_has_started,
+    );
+
+    // Dropping the sender is what happens when the listener could not be bound.
+    drop(serving_started);
+    timeout(LIFECYCLE_BOUND, warm_up)
+        .await
+        .expect("warm-up must return promptly")
+        .expect("warm-up must not panic");
+
+    assert_eq!(
+        jwks.request_count(),
+        0,
+        "warm-up must perform no metadata retrieval when serving never started"
+    );
+
+    jwks.shutdown().await;
 }

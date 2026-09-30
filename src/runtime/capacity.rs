@@ -27,6 +27,11 @@ use crate::runtime::{
     observability::{CAPACITY_IN_USE, CAPACITY_SATURATED_TOTAL, CAPACITY_UNAVAILABLE_TOTAL},
 };
 
+/// The ADR 0011 product ceiling must stay constructible as a Tokio semaphore.
+/// Tokio panics above `Semaphore::MAX_PERMITS`, so this is proven here rather
+/// than assumed.
+const _: () = assert!(MAX_SYNCHRONIZATION_CAPACITY <= Semaphore::MAX_PERMITS);
+
 /// Bounded selected-target synchronization capacity backed by one semaphore.
 pub(crate) struct SemaphoreCapacity {
     permits: Arc<Semaphore>,

@@ -48,7 +48,8 @@ use serde::Deserialize;
 use yaml_serde::Value;
 
 use crate::runtime::{
-    failure::StartupFailure,
+    admission,
+    failure::RuntimeFailure,
     observability::{LogLevel, ObservabilityConfiguration, TracingConfiguration},
 };
 
@@ -57,6 +58,10 @@ pub(crate) const CONFIGURATION_PATH_VARIABLE: &str = "PERMISSIONSYNC_CONFIG_FILE
 
 /// The finite product safety ceiling on configured selected-target
 /// synchronization capacity required by ADR 0011.
+///
+/// It is well below Tokio's own semaphore maximum, which
+/// [`crate::runtime::capacity`] asserts at compile time, so a capacity value
+/// accepted here is always constructible.
 pub(crate) const MAX_SYNCHRONIZATION_CAPACITY: usize = 1024;
 
 /// Whether one optional component section produced a usable component.
@@ -98,22 +103,22 @@ pub(crate) struct ExecutableConfiguration {
 /// Path resolution is separated from loading so every loading and validation
 /// rule stays testable from a temporary file without mutating process
 /// environment state.
-pub(crate) fn configuration_path() -> Result<OsString, StartupFailure> {
+pub(crate) fn configuration_path() -> Result<OsString, RuntimeFailure> {
     match std::env::var_os(CONFIGURATION_PATH_VARIABLE) {
         Some(path) if !path.is_empty() => Ok(path),
-        Some(_) | None => Err(StartupFailure::ConfigurationPathMissing),
+        Some(_) | None => Err(RuntimeFailure::ConfigurationPathMissing),
     }
 }
 
 /// Loads, decodes, and validates the single configuration document.
-pub(crate) fn load(path: &Path) -> Result<ExecutableConfiguration, StartupFailure> {
-    let bytes = std::fs::read(path).map_err(|_| StartupFailure::ConfigurationUnreadable)?;
-    let text = String::from_utf8(bytes).map_err(|_| StartupFailure::ConfigurationNotUtf8)?;
+pub(crate) fn load(path: &Path) -> Result<ExecutableConfiguration, RuntimeFailure> {
+    let bytes = std::fs::read(path).map_err(|_| RuntimeFailure::ConfigurationUnreadable)?;
+    let text = String::from_utf8(bytes).map_err(|_| RuntimeFailure::ConfigurationNotUtf8)?;
     decode(&text)
 }
 
 /// Decodes and validates one already-read UTF-8 configuration document.
-pub(crate) fn decode(text: &str) -> Result<ExecutableConfiguration, StartupFailure> {
+pub(crate) fn decode(text: &str) -> Result<ExecutableConfiguration, RuntimeFailure> {
     let document = single_document(text)?;
 
     let listener = listener(&document.listener)?;
@@ -157,18 +162,18 @@ pub(crate) fn decode(text: &str) -> Result<ExecutableConfiguration, StartupFailu
 /// a malformed single document is reported as malformed rather than as a
 /// multi-document stream. A stream that really does carry a second document is
 /// a global failure rather than a silently used first document.
-fn single_document(text: &str) -> Result<DocumentDelivery, StartupFailure> {
+fn single_document(text: &str) -> Result<DocumentDelivery, RuntimeFailure> {
     let mut documents = yaml_serde::Deserializer::from_str(text);
-    let first = documents.next().ok_or(StartupFailure::ConfigurationEmpty)?;
-    let value = Value::deserialize(first).map_err(|_| StartupFailure::InvalidDocumentStructure)?;
+    let first = documents.next().ok_or(RuntimeFailure::ConfigurationEmpty)?;
+    let value = Value::deserialize(first).map_err(|_| RuntimeFailure::InvalidDocumentStructure)?;
     if value.is_null() {
-        return Err(StartupFailure::ConfigurationEmpty);
+        return Err(RuntimeFailure::ConfigurationEmpty);
     }
     if documents.next().is_some() {
-        return Err(StartupFailure::ConfigurationMultipleDocuments);
+        return Err(RuntimeFailure::ConfigurationMultipleDocuments);
     }
 
-    yaml_serde::from_value(value).map_err(|_| StartupFailure::InvalidDocumentStructure)
+    yaml_serde::from_value(value).map_err(|_| RuntimeFailure::InvalidDocumentStructure)
 }
 
 /// The strict top-level document shape.
@@ -190,7 +195,7 @@ struct DocumentDelivery {
     glpi: Option<Value>,
 }
 
-fn section<T>(value: &Value, failure: StartupFailure) -> Result<T, StartupFailure>
+fn section<T>(value: &Value, failure: RuntimeFailure) -> Result<T, RuntimeFailure>
 where
     T: serde::de::DeserializeOwned,
 {
@@ -228,14 +233,14 @@ struct ListenerDelivery {
     port: u16,
 }
 
-fn listener(value: &Value) -> Result<SocketAddr, StartupFailure> {
-    let delivery: ListenerDelivery = section(value, StartupFailure::InvalidListener)?;
+fn listener(value: &Value) -> Result<SocketAddr, RuntimeFailure> {
+    let delivery: ListenerDelivery = section(value, RuntimeFailure::InvalidListener)?;
     let address: IpAddr = delivery
         .address
         .parse()
-        .map_err(|_| StartupFailure::InvalidListener)?;
+        .map_err(|_| RuntimeFailure::InvalidListener)?;
     if delivery.port == 0 {
-        return Err(StartupFailure::InvalidListener);
+        return Err(RuntimeFailure::InvalidListener);
     }
     Ok(SocketAddr::new(address, delivery.port))
 }
@@ -254,17 +259,32 @@ struct RequestConfiguration {
     synchronization_capacity: NonZeroUsize,
 }
 
-fn request(value: &Value) -> Result<RequestConfiguration, StartupFailure> {
-    let delivery: RequestDelivery = section(value, StartupFailure::InvalidRequest)?;
+/// Validates the `request` section, including that every bounded-concurrency
+/// value the runtime derives from it is actually constructible.
+///
+/// The runtime turns these values into Tokio semaphores, and Tokio panics when a
+/// semaphore is created with more than `Semaphore::MAX_PERMITS` permits. An
+/// impossible admission or capacity value therefore has to be a deterministic
+/// startup failure here, never a panic after successful decoding.
+fn request(value: &Value) -> Result<RequestConfiguration, RuntimeFailure> {
+    let delivery: RequestDelivery = section(value, RuntimeFailure::InvalidRequest)?;
     let overall_request_deadline = positive_duration(delivery.overall_deadline_milliseconds)
-        .ok_or(StartupFailure::InvalidRequest)?;
+        .ok_or(RuntimeFailure::InvalidRequest)?;
+
     let inbound_admission_limit = NonZeroUsize::new(delivery.inbound_admission_limit)
-        .ok_or(StartupFailure::InvalidRequest)?;
+        .ok_or(RuntimeFailure::InvalidRequest)?;
+    // Proves every semaphore size that inbound admission derives from this one
+    // configured value, using checked arithmetic rather than clamping an
+    // impossible value into a seemingly valid one.
+    admission::derived_semaphore_sizes(inbound_admission_limit)
+        .ok_or(RuntimeFailure::InvalidRequest)?;
+
     let synchronization_capacity = NonZeroUsize::new(delivery.synchronization_capacity)
-        .ok_or(StartupFailure::InvalidRequest)?;
+        .ok_or(RuntimeFailure::InvalidRequest)?;
     if synchronization_capacity.get() > MAX_SYNCHRONIZATION_CAPACITY {
-        return Err(StartupFailure::InvalidRequest);
+        return Err(RuntimeFailure::InvalidRequest);
     }
+
     Ok(RequestConfiguration {
         overall_request_deadline,
         inbound_admission_limit,
@@ -280,12 +300,12 @@ struct ShutdownDelivery {
 
 /// The grace period must cover one complete compliant request, so every
 /// request accepted before shutdown has time to return.
-fn shutdown(value: &Value, overall_request_deadline: Duration) -> Result<Duration, StartupFailure> {
-    let delivery: ShutdownDelivery = section(value, StartupFailure::InvalidShutdown)?;
+fn shutdown(value: &Value, overall_request_deadline: Duration) -> Result<Duration, RuntimeFailure> {
+    let delivery: ShutdownDelivery = section(value, RuntimeFailure::InvalidShutdown)?;
     let grace =
-        positive_duration(delivery.grace_milliseconds).ok_or(StartupFailure::InvalidShutdown)?;
+        positive_duration(delivery.grace_milliseconds).ok_or(RuntimeFailure::InvalidShutdown)?;
     if grace < overall_request_deadline {
-        return Err(StartupFailure::InvalidShutdown);
+        return Err(RuntimeFailure::InvalidShutdown);
     }
     Ok(grace)
 }
@@ -375,25 +395,25 @@ struct AuthenticationConfiguration {
 fn authentication(
     value: &Value,
     overall_request_deadline: Duration,
-) -> Result<AuthenticationConfiguration, StartupFailure> {
-    let delivery: AuthenticationDelivery = section(value, StartupFailure::InvalidAuthentication)?;
+) -> Result<AuthenticationConfiguration, RuntimeFailure> {
+    let delivery: AuthenticationDelivery = section(value, RuntimeFailure::InvalidAuthentication)?;
     let metadata_operation_timeout =
         positive_duration(delivery.metadata_operation_timeout_milliseconds)
-            .ok_or(StartupFailure::InvalidAuthentication)?;
+            .ok_or(RuntimeFailure::InvalidAuthentication)?;
     // A child operation may shorten the remaining budget but must never
     // create a later deadline than the one overall request deadline.
     if metadata_operation_timeout > overall_request_deadline {
-        return Err(StartupFailure::InvalidAuthentication);
+        return Err(RuntimeFailure::InvalidAuthentication);
     }
     let cache_policy = VerificationCachePolicy::new(
         positive_duration(delivery.cache.freshness_milliseconds)
-            .ok_or(StartupFailure::InvalidAuthentication)?,
+            .ok_or(RuntimeFailure::InvalidAuthentication)?,
         Duration::from_millis(delivery.cache.stale_if_error_milliseconds),
     );
     let source = delivery
         .source
         .project()
-        .ok_or(StartupFailure::InvalidAuthentication)?;
+        .ok_or(RuntimeFailure::InvalidAuthentication)?;
     let config = TechnicalCallerAuthenticatorConfig::new(
         delivery.issuer,
         delivery.audience,
@@ -408,7 +428,7 @@ fn authentication(
         Duration::from_millis(delivery.clock_skew_milliseconds),
         trust_anchors(delivery.additional_trust_anchors_pem),
     )
-    .map_err(|_| StartupFailure::InvalidAuthentication)?;
+    .map_err(|_| RuntimeFailure::InvalidAuthentication)?;
 
     Ok(AuthenticationConfiguration {
         config,
@@ -460,8 +480,8 @@ struct TracingDelivery {
     additional_trust_anchors_pem: Vec<String>,
 }
 
-fn observability(value: &Value) -> Result<ObservabilityConfiguration, StartupFailure> {
-    let delivery: ObservabilityDelivery = section(value, StartupFailure::InvalidObservability)?;
+fn observability(value: &Value) -> Result<ObservabilityConfiguration, RuntimeFailure> {
+    let delivery: ObservabilityDelivery = section(value, RuntimeFailure::InvalidObservability)?;
     let tracing = match delivery.tracing {
         // Trace export is an additional optional channel, disabled unless the
         // document explicitly enables it. An absent section and an explicitly
@@ -472,17 +492,17 @@ fn observability(value: &Value) -> Result<ObservabilityConfiguration, StartupFai
             TracingConfiguration::new(
                 tracing
                     .endpoint
-                    .ok_or(StartupFailure::InvalidObservability)?,
+                    .ok_or(RuntimeFailure::InvalidObservability)?,
                 positive_duration(
                     tracing
                         .export_timeout_milliseconds
-                        .ok_or(StartupFailure::InvalidObservability)?,
+                        .ok_or(RuntimeFailure::InvalidObservability)?,
                 )
-                .ok_or(StartupFailure::InvalidObservability)?,
+                .ok_or(RuntimeFailure::InvalidObservability)?,
                 tracing.headers,
                 trust_anchors(tracing.additional_trust_anchors_pem),
             )
-            .map_err(|_| StartupFailure::InvalidObservability)?,
+            .map_err(|_| RuntimeFailure::InvalidObservability)?,
         ),
     };
 
@@ -501,8 +521,8 @@ struct TargetDelivery {
 
 /// Target routes keep their configured input order. Composition owns grammar
 /// validation, duplicate detection, and adapter resolution.
-fn targets(value: &Value) -> Result<Vec<ConfiguredTarget>, StartupFailure> {
-    let delivery: Vec<TargetDelivery> = section(value, StartupFailure::InvalidTargets)?;
+fn targets(value: &Value) -> Result<Vec<ConfiguredTarget>, RuntimeFailure> {
+    let delivery: Vec<TargetDelivery> = section(value, RuntimeFailure::InvalidTargets)?;
     Ok(delivery
         .into_iter()
         .map(|target| ConfiguredTarget {

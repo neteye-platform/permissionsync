@@ -5,9 +5,11 @@
 //! synchronization and operational endpoints on one configured listener, and
 //! shuts down in bounded phases on `SIGTERM` or `SIGINT`.
 //!
-//! Every runtime concern lives in private modules under this binary. Startup
-//! and fatal diagnostics go to standard error as fixed, value-free categories;
-//! ordinary runtime events are structured JSON on standard output.
+//! Every runtime concern lives in private modules under this binary. Fatal
+//! diagnostics, whether from startup or from a listener that stopped accepting,
+//! go to standard error as fixed, value-free categories, and the process then
+//! reports failure; ordinary runtime events are structured JSON on standard
+//! output.
 
 #![forbid(unsafe_code)]
 
@@ -19,10 +21,11 @@ fn main() -> ExitCode {
     match runtime::run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
-            // Startup diagnostics deliberately name only the failing category:
+            // Fatal diagnostics deliberately name only the failing category:
             // configuration inputs can contain credentials, private trust
-            // material, and exporter authentication headers.
-            eprintln!("permissionsync: startup failed: {failure}");
+            // material, and exporter authentication headers, and a serving
+            // failure can carry an operating-system error.
+            eprintln!("permissionsync: {failure}");
             ExitCode::FAILURE
         }
     }
