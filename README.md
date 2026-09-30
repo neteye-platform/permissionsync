@@ -118,6 +118,14 @@ The inbound synchronization body has a fixed one-mebibyte product limit. It is
 not configurable, and exceeding it is a body-validation outcome in the fixed
 processing order rather than an immediate transport rejection.
 
+Connections are additionally bounded by a fixed thirty-second window in which a
+client must deliver one complete request head. It applies to an incomplete first
+request head and to an idle keep-alive connection waiting for the next request,
+so neither can hold a task and a descriptor indefinitely. Like the body limit it
+is a fixed product value rather than a deployment knob, and it is unrelated to
+the configured overall request deadline, which starts only once a
+synchronization request reaches the transport handler.
+
 ### Observability
 
 Ordinary runtime events are structured JSON on standard output; startup and
@@ -139,9 +147,13 @@ Provider or Target Adapter requests.
 
 ### Shutdown
 
-If the bound listener repeatedly fails to accept connections, the process treats
-it as fatal: it enters the same shutdown sequence as below and then exits
-reporting failure rather than success.
+Listener-accept failures are classified before any of them is treated as fatal.
+A per-connection or network error is retried immediately, and local resource
+pressure such as descriptor exhaustion is retried behind a short fixed backoff
+that shutdown can interrupt; neither is evidence that the listener itself broke,
+so neither can terminate the process. Only repeated consecutive failures that do
+indicate an unusable listener are fatal: the process then enters the same
+shutdown sequence as below and exits reporting failure rather than success.
 
 On `SIGTERM` or `SIGINT` the process marks readiness false, stops accepting,
 admits no further synchronization request and releases pending admission waits,

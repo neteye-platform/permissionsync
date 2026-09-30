@@ -43,7 +43,7 @@ native-tls = { version = "=0.2.18", default-features = false }
 opentelemetry = { version = "=0.33.0", default-features = false, features = ["trace"] }
 opentelemetry-http = { version = "=0.33.0", default-features = false, features = ["hyper"] }
 opentelemetry-otlp = { version = "=0.33.0", default-features = false, features = ["http-proto", "trace"] }
-opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["rt-tokio", "trace"] }
+opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["experimental_trace_batch_span_processor_with_async_runtime", "rt-tokio", "trace"] }
 permissionsync-adapter-glpi = { path = "crates/permissionsync-adapter-glpi", version = "=0.1.0" }
 permissionsync-auth = { path = "crates/permissionsync-auth", version = "=0.1.0" }
 permissionsync-core = { path = "crates/permissionsync-core", version = "=0.1.0" }

@@ -560,12 +560,23 @@ async fn collect_body(
         let Ok(data) = frame.into_data() else {
             continue;
         };
-        if collected.len().saturating_add(data.len()) > INBOUND_BODY_LIMIT_BYTES {
+        let received = collected.len().saturating_add(data.len());
+        if received > INBOUND_BODY_LIMIT_BYTES {
             return CollectedBody::BoundExceeded;
         }
-        // Reserve exactly what arrived so the allocation itself also stays
-        // within the bound.
-        collected.reserve_exact(data.len());
+        // Grow geometrically, but never past the fixed bound, so the allocation
+        // itself also stays within the limit. Growing by exactly one frame
+        // instead would re-allocate once per received frame, which a body split
+        // into very many tiny frames could turn into quadratic copying; this
+        // keeps accumulation linear in the bytes actually received.
+        if received > collected.capacity() {
+            let target = collected
+                .capacity()
+                .saturating_mul(2)
+                .max(received)
+                .min(INBOUND_BODY_LIMIT_BYTES);
+            collected.reserve_exact(target - collected.len());
+        }
         collected.extend_from_slice(&data);
     }
 

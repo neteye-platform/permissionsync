@@ -459,6 +459,71 @@ impl Drop for RefusingEndpoint {
     }
 }
 
+/// A listener that accepts a TCP connection and then never speaks.
+///
+/// It gives a deterministic *stalled* peer, as opposed to
+/// [`RefusingEndpoint`]'s deterministic *failing* peer: a TLS handshake started
+/// against it never completes, so anything waiting on it waits until its own
+/// bound fires. Accepted streams are retained so the connection stays open.
+pub(super) struct StalledEndpoint {
+    address: SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StalledEndpoint {
+    pub(super) async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, mut shutdown_receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_receiver => break,
+                    accepted = listener.accept() => match accepted {
+                        // Retaining the stream keeps the connection open while
+                        // nothing is ever read from it or written to it.
+                        Ok((stream, _)) => held.push(stream),
+                        Err(_) => break,
+                    },
+                }
+            }
+        });
+        Self {
+            address,
+            shutdown: Some(shutdown),
+            task: Some(task),
+        }
+    }
+
+    pub(super) fn endpoint(&self, path: &str) -> String {
+        format!("https://{}{}", self.address, path)
+    }
+}
+
+impl Drop for StalledEndpoint {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Emits exactly one finished, sampled span through a provider's own tracer.
+///
+/// This is what makes a test exercise the configured span processor and exporter
+/// rather than the exporter's HTTP client on its own.
+pub(super) fn emit_one_span(provider: &opentelemetry_sdk::trace::SdkTracerProvider) {
+    use opentelemetry::trace::{Tracer, TracerProvider};
+
+    let tracer = provider.tracer("permissionsync-test");
+    tracer.in_span("permissionsync.test", |_| {});
+}
+
 // ---------------------------------------------------------------------------
 // Signing material
 // ---------------------------------------------------------------------------

@@ -24,8 +24,11 @@ use opentelemetry_otlp::{
     Protocol as OtlpProtocol, RetryPolicy, SpanExporter, WithExportConfig, WithHttpConfig,
 };
 use opentelemetry_sdk::{
-    Resource,
-    trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider},
+    Resource, runtime,
+    trace::{
+        BatchConfigBuilder, SdkTracerProvider,
+        span_processor_with_async_runtime::BatchSpanProcessor,
+    },
 };
 use tracing_subscriber::{
     Layer, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt,
@@ -223,13 +226,11 @@ impl Observability {
 
     /// Requests a bounded flush and shutdown of the trace provider.
     ///
-    /// The bound is the exporter's own configured export timeout, so an
-    /// unavailable backend loses final telemetry instead of extending process
-    /// shutdown. Telemetry loss here is deliberate and never reported as a
-    /// service failure.
-    pub(crate) fn shutdown_tracing(&self, flush_budget: Duration) {
-        if let Some(provider) = &self.tracer_provider {
-            let _ = provider.shutdown_with_timeout(flush_budget);
+    /// Telemetry loss here is deliberate and never reported as a service
+    /// failure; see [`shutdown_tracer_provider`] for how the bound is applied.
+    pub(crate) async fn shutdown_tracing(self, flush_budget: Duration) {
+        if let Some(provider) = self.tracer_provider {
+            shutdown_tracer_provider(provider, flush_budget).await;
         }
     }
 
@@ -237,6 +238,36 @@ impl Observability {
     pub(crate) fn tracing_enabled(&self) -> bool {
         self.tracer_provider.is_some()
     }
+}
+
+/// Requests a final flush and shutdown of the trace provider, bounded by
+/// `flush_budget`.
+///
+/// The Tokio-runtime batch span processor answers a shutdown request by blocking
+/// the calling thread until its own worker task replies, and it ignores the
+/// timeout it is handed, so the bound has to be applied here. The blocking call
+/// therefore runs on its own thread — never on a runtime worker, which that
+/// worker task needs in order to reply — and this function stops waiting at the
+/// budget.
+///
+/// Abandoning the wait loses final telemetry, which ADR 0011 prefers over
+/// extending shutdown: the abandoned thread owns nothing but the provider, holds
+/// no request state, and cannot affect any synchronization outcome.
+pub(crate) async fn shutdown_tracer_provider(provider: SdkTracerProvider, flush_budget: Duration) {
+    let (finished, flushed) = tokio::sync::oneshot::channel();
+    if std::thread::Builder::new()
+        .name("permissionsync-trace-flush".to_owned())
+        .spawn(move || {
+            let _ = provider.shutdown_with_timeout(flush_budget);
+            let _ = finished.send(());
+        })
+        .is_err()
+    {
+        // No thread was available for the final flush. Final telemetry is lost,
+        // which never affects terminating the service.
+        return;
+    }
+    let _ = tokio::time::timeout(flush_budget, flushed).await;
 }
 
 /// Initializes the required and optional observability channels.
@@ -295,6 +326,9 @@ pub(crate) fn initialize(
 /// The batch queue is bounded and drops spans when full, the exporter performs
 /// exactly one attempt per batch, and the transport is the origin-pinned
 /// HTTPS client. None of these paths can backpressure synchronization work.
+///
+/// Must be called from within the Tokio runtime: the batch span processor owns a
+/// runtime task, which it spawns here.
 pub(crate) fn build_tracer_provider(
     configuration: &TracingConfiguration,
 ) -> Result<SdkTracerProvider, RuntimeFailure> {
@@ -310,12 +344,25 @@ pub(crate) fn build_tracer_provider(
         .build()
         .map_err(|_| RuntimeFailure::InvalidObservability)?;
 
-    let processor = BatchSpanProcessor::builder(exporter)
+    // The Tokio-runtime processor, not the default thread-based one: the
+    // origin-pinned exporter transport above is an asynchronous Hyper client,
+    // which the thread-based processor cannot drive at all because it exports
+    // from a plain thread with no reactor.
+    let processor = BatchSpanProcessor::builder(exporter, runtime::Tokio)
         .with_batch_config(
             BatchConfigBuilder::default()
                 .with_max_queue_size(BOUNDED_SPAN_QUEUE)
                 .with_max_export_batch_size(BOUNDED_EXPORT_BATCH)
                 .with_scheduled_delay(SPAN_EXPORT_INTERVAL)
+                // Every remaining batch value is set explicitly, because
+                // `BatchConfigBuilder::default()` seeds itself from ambient
+                // `OTEL_BSP_*` environment variables and ADR 0011 allows no
+                // environment-value configuration override. One export at a
+                // time keeps telemetry from fanning out into concurrent
+                // outbound work, and the configured export timeout is the
+                // batch-level bound as well.
+                .with_max_concurrent_exports(BOUNDED_CONCURRENT_EXPORTS)
+                .with_max_export_timeout(configuration.export_timeout)
                 .build(),
         )
         .build();
@@ -337,6 +384,9 @@ pub(crate) const BOUNDED_SPAN_QUEUE: usize = 2048;
 pub(crate) const BOUNDED_EXPORT_BATCH: usize = 512;
 /// The interval at which queued spans are exported.
 pub(crate) const SPAN_EXPORT_INTERVAL: Duration = Duration::from_secs(5);
+/// How many export requests may be in flight at once. Telemetry never fans out
+/// into concurrent outbound work.
+pub(crate) const BOUNDED_CONCURRENT_EXPORTS: usize = 1;
 
 #[cfg(test)]
 mod tests {

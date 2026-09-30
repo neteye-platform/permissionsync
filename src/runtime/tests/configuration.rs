@@ -7,7 +7,11 @@
 //! meaningful because path resolution is separated from every loading and
 //! validation rule.
 
-use std::{io::Write, path::PathBuf, time::Duration};
+use std::{
+    io::Write,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use permissionsync::{ComposedApplication, ProviderAvailability, TargetAvailability};
 use permissionsync_core::LogicalTarget;
@@ -252,6 +256,96 @@ fn inline_pem_trust_material_is_accepted_only_when_it_parses() {
 
     assert_eq!(
         global_failure(&document),
+        RuntimeFailure::InvalidAuthentication
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Configured duration boundaries
+// ---------------------------------------------------------------------------
+
+/// Every configured duration is an unconstrained count of whole milliseconds,
+/// and the runtime later turns several of them into absolute deadlines with
+/// `Instant + Duration`, which panics on an unrepresentable instant.
+///
+/// This pins the invariant that makes those additions safe: the largest duration
+/// the delivery model can express still forms an absolute deadline. If a
+/// platform or dependency ever narrowed that range, this test fails instead of
+/// the process panicking on a request.
+#[test]
+fn the_largest_expressible_configured_durations_still_form_absolute_deadlines() {
+    let maximum = u64::MAX.to_string();
+    let document = VALID
+        .replace(
+            "overall_deadline_milliseconds: 10000",
+            &format!("overall_deadline_milliseconds: {maximum}"),
+        )
+        .replace(
+            "grace_milliseconds: 20000",
+            &format!("grace_milliseconds: {maximum}"),
+        )
+        .replace(
+            "metadata_operation_timeout_milliseconds: 3000",
+            &format!("metadata_operation_timeout_milliseconds: {maximum}"),
+        )
+        // Both the Provider and the GLPI operation timeout.
+        .replace(
+            "operation_timeout_milliseconds: 5000",
+            &format!("operation_timeout_milliseconds: {maximum}"),
+        );
+    let configuration = decode(&document).expect("the maximum expressible durations are valid");
+
+    assert_eq!(
+        configuration.overall_request_deadline,
+        Duration::from_millis(u64::MAX)
+    );
+    // Component timeouts at the same maximum stay within the overall deadline,
+    // so both components remain usable rather than being rejected locally.
+    assert_eq!(configuration.provider_outcome, ComponentOutcome::Configured);
+    assert_eq!(configuration.glpi_outcome, ComponentOutcome::Configured);
+
+    let now = Instant::now();
+    for (name, duration) in [
+        (
+            "overall request deadline",
+            configuration.overall_request_deadline,
+        ),
+        ("shutdown grace", configuration.shutdown_grace),
+        (
+            "authentication metadata timeout",
+            configuration.metadata_operation_timeout,
+        ),
+    ] {
+        assert!(
+            now.checked_add(duration).is_some(),
+            "the {name} must form a representable absolute deadline"
+        );
+    }
+}
+
+/// A duration of zero milliseconds is never a valid required duration, and the
+/// rejection is per section rather than a single generic failure.
+#[test]
+fn a_zero_millisecond_required_duration_is_rejected_per_section() {
+    assert_eq!(
+        global_failure(&replaced(
+            "overall_deadline_milliseconds: 10000",
+            "overall_deadline_milliseconds: 0"
+        )),
+        RuntimeFailure::InvalidRequest
+    );
+    assert_eq!(
+        global_failure(&replaced(
+            "grace_milliseconds: 20000",
+            "grace_milliseconds: 0"
+        )),
+        RuntimeFailure::InvalidShutdown
+    );
+    assert_eq!(
+        global_failure(&replaced(
+            "metadata_operation_timeout_milliseconds: 3000",
+            "metadata_operation_timeout_milliseconds: 0"
+        )),
         RuntimeFailure::InvalidAuthentication
     );
 }

@@ -15,11 +15,11 @@ use axum::{
 use opentelemetry_http::{Bytes, HttpClient};
 
 use crate::runtime::{
-    observability::TracingConfiguration,
+    observability::{TracingConfiguration, build_tracer_provider, shutdown_tracer_provider},
     tests::support::{
         GLPI, HttpsFixture, RefusingEndpoint, RuntimeFixture, RuntimeFixtureOptions,
-        ScriptedResponse, SigningMaterial, authenticator, glpi_configuration, jwks_fixture,
-        provider_configuration, target, valid_body,
+        ScriptedResponse, SigningMaterial, authenticator, emit_one_span, glpi_configuration,
+        jwks_fixture, provider_configuration, target, valid_body,
     },
     transport::SYNCHRONIZATION_ROUTE,
 };
@@ -547,6 +547,93 @@ async fn only_configured_and_protocol_headers_reach_the_backend() {
     );
 
     backend.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// The batch-export path
+// ---------------------------------------------------------------------------
+
+/// The decisive batch-export regression: a span emitted through the configured
+/// tracer provider must actually reach the configured local OTLP endpoint while
+/// running under Tokio.
+///
+/// This exercises the real span processor and exporter, not the HTTP client on
+/// its own. It is what proves the Tokio-runtime batch span processor is in use:
+/// the SDK's default thread-based processor exports from a plain thread with no
+/// reactor, so it cannot drive the origin-pinned asynchronous Hyper client at
+/// all and no request would arrive here.
+#[tokio::test]
+async fn an_emitted_span_reaches_the_configured_endpoint_through_the_batch_processor() {
+    let backend = HttpsFixture::start(vec![ScriptedResponse::empty(200)]).await;
+    let configuration = tracing_configuration(
+        &backend.endpoint("/v1/traces"),
+        vec![backend.trust_anchor_pem().to_vec()],
+    );
+    let provider = build_tracer_provider(&configuration).expect("the provider builds locally");
+
+    emit_one_span(&provider);
+
+    // Shutting the provider down is the flush: it exports everything still
+    // queued, bounded.
+    shutdown_tracer_provider(provider, Duration::from_secs(10)).await;
+
+    assert_eq!(
+        backend.request_count(),
+        1,
+        "the batch processor must export the emitted span to the configured endpoint"
+    );
+    let observed = backend.observed();
+    assert!(
+        observed[0]
+            .request_line
+            .starts_with("POST /v1/traces HTTP/1.1"),
+        "unexpected export request line: {}",
+        observed[0].request_line
+    );
+    assert_eq!(
+        observed[0].header("content-type"),
+        Some("application/x-protobuf"),
+        "OTLP/HTTP protobuf encoding must be used"
+    );
+    assert_eq!(
+        observed[0].header("authorization"),
+        Some(EXPORTER_CREDENTIAL),
+        "the configured exporter credential must reach the configured endpoint"
+    );
+    assert!(
+        !observed[0].body.is_empty(),
+        "an exported batch must carry a protobuf payload"
+    );
+
+    backend.shutdown().await;
+}
+
+/// A batch export must not reach any other origin, even when a span really was
+/// emitted: origin pinning applies to the exporter's own requests, not only to
+/// requests a test aims by hand.
+#[tokio::test]
+async fn a_batch_export_never_reaches_another_origin() {
+    let configured = HttpsFixture::start(vec![ScriptedResponse::empty(200)]).await;
+    let foreign = HttpsFixture::start(vec![ScriptedResponse::empty(200)]).await;
+    // Trust only the foreign backend's root, so the configured endpoint cannot
+    // be exported to either; neither backend may see a credential.
+    let configuration = tracing_configuration(
+        &configured.endpoint("/v1/traces"),
+        vec![foreign.trust_anchor_pem().to_vec()],
+    );
+    let provider = build_tracer_provider(&configuration).expect("the provider builds locally");
+
+    emit_one_span(&provider);
+    shutdown_tracer_provider(provider, Duration::from_secs(10)).await;
+
+    assert_eq!(
+        foreign.request_count(),
+        0,
+        "no export may reach a non-configured origin"
+    );
+
+    configured.shutdown().await;
+    foreign.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------

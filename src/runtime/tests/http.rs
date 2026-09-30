@@ -661,6 +661,115 @@ async fn the_body_bound_does_not_depend_on_a_declared_content_length() {
     scenario.finish().await;
 }
 
+/// A body delivered as very many one-byte frames must still be collected
+/// exactly, must still honour the fixed bound, and must not make accumulation
+/// cost grow faster than the bytes received.
+///
+/// A frame-by-frame reservation would re-allocate once per frame, so a body
+/// split into a million tiny frames would cost quadratic copying while still
+/// respecting the size bound. This exercises that path with a body whose frames
+/// are as small as HTTP/1 chunked framing allows.
+#[tokio::test]
+async fn a_body_arriving_as_many_tiny_frames_is_collected_exactly_and_stays_bounded() {
+    let scenario = Scenario::build(|_| {}).await;
+    let token = scenario.token(Some("service_account"));
+
+    // Exactly the contract body, one byte per frame.
+    let response = scenario
+        .fixture
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri(SYNCHRONIZATION_ROUTE)
+                .header("authorization", format!("Bearer {token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::new(SingleByteFrames::new(valid_body())))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "a tiny-frame body must be reassembled exactly"
+    );
+
+    // One byte beyond the bound, still one byte per frame.
+    let response = scenario
+        .fixture
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri(SYNCHRONIZATION_ROUTE)
+                .header("authorization", format!("Bearer {token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::new(SingleByteFrames::new(body_of_length(
+                    INBOUND_BODY_LIMIT_BYTES + 1,
+                ))))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "frame size must not change where the fixed bound lies"
+    );
+
+    // Exactly the bound, still one byte per frame, is collected and validated
+    // normally rather than being cut short by an off-by-one in the growth step.
+    // The fixture's own bounded call is what would catch accumulation that grew
+    // faster than the bytes received.
+    let response = scenario
+        .fixture
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri(SYNCHRONIZATION_ROUTE)
+                .header("authorization", format!("Bearer {token}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::new(SingleByteFrames::new(body_of_length(
+                    INBOUND_BODY_LIMIT_BYTES,
+                ))))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "a body of exactly the bound must be collected in full and validated"
+    );
+
+    scenario.finish().await;
+}
+
+/// A request body that yields exactly one byte per frame.
+struct SingleByteFrames {
+    remaining: std::collections::VecDeque<u8>,
+}
+
+impl SingleByteFrames {
+    fn new(body: Vec<u8>) -> Self {
+        Self {
+            remaining: body.into(),
+        }
+    }
+}
+
+impl http_body::Body for SingleByteFrames {
+    type Data = bytes::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Ready(self.remaining.pop_front().map(|byte| {
+            Ok(http_body::Frame::data(bytes::Bytes::copy_from_slice(&[
+                byte,
+            ])))
+        }))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Response shape and operational endpoints
 // ---------------------------------------------------------------------------

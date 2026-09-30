@@ -21,16 +21,18 @@ use tokio::{
 };
 
 use crate::runtime::{
+    AcceptBackoff, AcceptFailure,
     admission::{Admission, waiter_slots},
     failure::RuntimeFailure,
     lifecycle::Lifecycle,
     observability::{
-        BOUNDED_EXPORT_BATCH, BOUNDED_SPAN_QUEUE, SPAN_EXPORT_INTERVAL, TracingConfiguration,
-        build_tracer_provider,
+        BOUNDED_CONCURRENT_EXPORTS, BOUNDED_EXPORT_BATCH, BOUNDED_SPAN_QUEUE, SPAN_EXPORT_INTERVAL,
+        TracingConfiguration, build_tracer_provider, shutdown_tracer_provider,
     },
     tests::support::{
         FIXTURE_TIMEOUT, HttpsFixture, RefusingEndpoint, RuntimeFixture, RuntimeFixtureOptions,
-        SigningMaterial, authenticator, jwks_fixture, provider_configuration, valid_body,
+        SigningMaterial, StalledEndpoint, authenticator, emit_one_span, jwks_fixture,
+        provider_configuration, valid_body,
     },
     transport::{HEALTH_ROUTE, METRICS_ROUTE, READINESS_ROUTE, SYNCHRONIZATION_ROUTE, router},
 };
@@ -643,14 +645,56 @@ async fn a_trace_flush_against_an_unavailable_backend_stays_bounded() {
 
     let budget = crate::runtime::trace_flush_budget();
     let started = Instant::now();
-    // Telemetry loss is deliberate here; only boundedness is asserted.
-    let _ = provider.shutdown_with_timeout(budget);
+    // The production shutdown path is what has to stay bounded: the Tokio
+    // batch processor ignores the timeout it is handed, so the bound lives in
+    // `shutdown_tracer_provider` rather than in the SDK. Telemetry loss is
+    // deliberate here; only boundedness is asserted.
+    shutdown_tracer_provider(provider, budget).await;
     let elapsed = started.elapsed();
 
     assert!(
         elapsed < budget + Duration::from_secs(5),
         "the trace flush must stay bounded, took {elapsed:?}"
     );
+}
+
+/// A trace flush must not extend shutdown even when the processor's own
+/// shutdown never answers within the budget.
+///
+/// The backend here accepts the TCP connection and then stalls without ever
+/// completing a TLS handshake, so the exporter stays busy for longer than the
+/// budget and the bound must come from the runtime.
+#[tokio::test]
+async fn a_trace_flush_against_a_stalled_backend_returns_at_the_budget() {
+    let stalled = StalledEndpoint::start().await;
+    let configuration = TracingConfiguration::new(
+        stalled.endpoint("/v1/traces"),
+        // Deliberately far longer than the flush budget below.
+        Duration::from_secs(600),
+        BTreeMap::new(),
+        Vec::new(),
+    )
+    .expect("a valid enabled tracing configuration");
+    let provider = build_tracer_provider(&configuration).expect("the provider builds locally");
+    emit_one_span(&provider);
+
+    let budget = Duration::from_millis(200);
+    let started = Instant::now();
+    shutdown_tracer_provider(provider, budget).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < budget + LIFECYCLE_BOUND,
+        "the trace flush must return at its own budget, took {elapsed:?}"
+    );
+}
+
+/// Telemetry export must never fan out into concurrent outbound work, and the
+/// batch values that are not explicitly configured would otherwise be read from
+/// ambient `OTEL_BSP_*` environment variables.
+#[test]
+fn telemetry_exports_one_batch_at_a_time() {
+    assert_eq!(BOUNDED_CONCURRENT_EXPORTS, 1);
 }
 
 /// The post-grace cancellation window is a fixed, bounded product value.
@@ -780,6 +824,319 @@ fn the_fatal_accept_category_is_value_free() {
         "Too many open files",
     ] {
         assert!(!rendered.contains(leaked), "{rendered} leaked {leaked}");
+    }
+}
+
+/// The accept-failure classification, stated exhaustively over the Linux
+/// conditions `accept(2)` documents.
+///
+/// This is checked against constructed `io::Error` values rather than by
+/// exhausting the test process's real descriptors, which would be neither
+/// deterministic nor isolated.
+#[test]
+fn accept_failures_are_classified_by_what_they_say_about_the_listener() {
+    fn classify(errno: i32) -> AcceptFailure {
+        crate::runtime::classify_accept_failure_for_test(&std::io::Error::from_raw_os_error(errno))
+    }
+
+    // Local resource pressure: no descriptor, buffer, or memory right now. The
+    // listener is healthy, so these are retried behind a fixed backoff.
+    for (errno, name) in [
+        (23, "ENFILE"),
+        (24, "EMFILE"),
+        (105, "ENOBUFS"),
+        (12, "ENOMEM"),
+    ] {
+        assert_eq!(
+            classify(errno),
+            AcceptFailure::ResourcePressure,
+            "{name} is recoverable resource pressure"
+        );
+    }
+
+    // Per-connection and already-pending network errors. `accept(2)` documents
+    // these as retryable like `EAGAIN`.
+    for (errno, name) in [
+        (103, "ECONNABORTED"),
+        (104, "ECONNRESET"),
+        (4, "EINTR"),
+        (11, "EAGAIN"),
+        (1, "EPERM"),
+        (64, "ENONET"),
+        (71, "EPROTO"),
+        (92, "ENOPROTOOPT"),
+        (95, "EOPNOTSUPP"),
+        (100, "ENETDOWN"),
+        (101, "ENETUNREACH"),
+        (110, "ETIMEDOUT"),
+        (112, "EHOSTDOWN"),
+        (113, "EHOSTUNREACH"),
+    ] {
+        assert_eq!(
+            classify(errno),
+            AcceptFailure::Transient,
+            "{name} is a transient connection or network error"
+        );
+    }
+
+    // Only these say the listener itself stopped working.
+    for (errno, name) in [(9, "EBADF"), (22, "EINVAL"), (88, "ENOTSOCK")] {
+        assert_eq!(
+            classify(errno),
+            AcceptFailure::ListenerUnusable,
+            "{name} means the listener is unusable"
+        );
+    }
+
+    // An unrecognized failure is evidence about the listener, not an invitation
+    // to retry forever.
+    assert_eq!(
+        crate::runtime::classify_accept_failure_for_test(&std::io::Error::other("unknown")),
+        AcceptFailure::ListenerUnusable
+    );
+}
+
+/// Recoverable accept failures must never advance the fatal-listener count, so
+/// a client that only produces them can never terminate the process.
+#[test]
+fn only_listener_unusable_failures_advance_the_fatal_count() {
+    let threshold = crate::runtime::max_consecutive_accept_failures();
+    let mut consecutive = 0_u32;
+
+    // Far more recoverable failures than the threshold, none of them counted:
+    // the loop only calls the counter for `ListenerUnusable`.
+    for errno in [24, 23, 105, 12, 103, 4, 100] {
+        let failure = crate::runtime::classify_accept_failure_for_test(
+            &std::io::Error::from_raw_os_error(errno),
+        );
+        assert_ne!(failure, AcceptFailure::ListenerUnusable);
+    }
+    assert_eq!(
+        consecutive, 0,
+        "no recoverable failure may have advanced the count"
+    );
+
+    for _ in 1..threshold {
+        assert!(!crate::runtime::accept_failure_is_fatal_for_test(
+            &mut consecutive
+        ));
+    }
+    assert!(crate::runtime::accept_failure_is_fatal_for_test(
+        &mut consecutive
+    ));
+}
+
+/// The resource-pressure backoff is short, fixed, and positive, so retrying is
+/// paced without becoming a visible outage.
+#[test]
+fn the_resource_pressure_backoff_is_a_short_fixed_value() {
+    let backoff = crate::runtime::accept_resource_pressure_backoff();
+    assert!(backoff > Duration::ZERO);
+    assert!(backoff <= Duration::from_secs(1));
+}
+
+/// The backoff must be interruptible by shutdown: resource pressure may not
+/// delay the bounded shutdown phases by even one backoff.
+#[tokio::test]
+async fn the_resource_pressure_backoff_is_interrupted_by_shutdown() {
+    let lifecycle = Lifecycle::new();
+    lifecycle.begin_shutdown();
+
+    // A backoff far longer than any test could wait for: only the shutdown
+    // branch can resolve this.
+    let stop = timeout(
+        LIFECYCLE_BOUND,
+        crate::runtime::accept_backoff_for_test(&lifecycle, Duration::from_secs(3600)),
+    )
+    .await
+    .expect("shutdown must interrupt the backoff immediately");
+
+    assert_eq!(stop, AcceptBackoff::Stop);
+}
+
+/// Shutdown that begins while the backoff is already running must release it
+/// too, not only one that began before it.
+///
+/// A single explicit poll registers the backoff's shutdown waiter, so the
+/// ordering this test depends on is established by that poll rather than by
+/// giving a spawned task a chance to run.
+#[tokio::test]
+async fn shutdown_during_the_backoff_releases_it() {
+    use std::{
+        future::{Future, poll_fn},
+        task::Poll,
+    };
+
+    let lifecycle = Lifecycle::new();
+    let mut waiting = Box::pin(crate::runtime::accept_backoff_for_test(
+        &lifecycle,
+        // Far longer than any test could wait for, so only shutdown can resolve
+        // this once it is running.
+        Duration::from_secs(3600),
+    ));
+
+    assert!(
+        poll_fn(|context| Poll::Ready(waiting.as_mut().poll(context)))
+            .await
+            .is_pending(),
+        "the backoff must register its shutdown waiter and stay pending"
+    );
+    lifecycle.begin_shutdown();
+
+    let stop = timeout(LIFECYCLE_BOUND, waiting)
+        .await
+        .expect("the backoff must be released by shutdown");
+    assert_eq!(stop, AcceptBackoff::Stop);
+}
+
+/// Without shutdown, the backoff simply elapses and accepting resumes.
+#[tokio::test(start_paused = true)]
+async fn the_backoff_elapses_and_accepting_resumes() {
+    let lifecycle = Lifecycle::new();
+
+    let resumed = crate::runtime::accept_backoff_for_test(
+        &lifecycle,
+        crate::runtime::accept_resource_pressure_backoff(),
+    )
+    .await;
+
+    assert_eq!(resumed, AcceptBackoff::Continue);
+}
+
+// ---------------------------------------------------------------------------
+// The connection-level header-read bound
+// ---------------------------------------------------------------------------
+
+/// The fixed header-read bound the runtime actually serves with is positive and
+/// well below any sensible caller timeout.
+#[test]
+fn the_header_read_bound_is_a_fixed_positive_product_value() {
+    let bound = crate::runtime::header_read_timeout();
+    assert!(bound > Duration::ZERO);
+    assert!(bound <= Duration::from_secs(60));
+}
+
+/// A connection that never completes its first request head must be closed at
+/// the header-read bound instead of holding a task and a descriptor forever.
+///
+/// The bound is injected as a short value through the private test seam, so the
+/// assertion needs no thirty-second wall-clock wait and the production value
+/// stays a fixed product constant rather than a configuration knob.
+#[tokio::test]
+async fn an_incomplete_request_head_cannot_hold_a_connection() {
+    let bound = Duration::from_millis(200);
+    let served = ServedConnection::start(bound).await;
+    let mut client = Connection::open(served.address).await;
+
+    // A request head that is deliberately never terminated.
+    client
+        .write_request("POST /api/sync-user HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Partial: ye")
+        .await;
+
+    let received = client
+        .read_until_closed(LIFECYCLE_BOUND)
+        .await
+        .expect("the connection must be closed rather than held open");
+    assert!(
+        received.is_empty() || String::from_utf8_lossy(&received).starts_with("HTTP/1.1 408"),
+        "an incomplete head must not produce a synchronization outcome, got {}",
+        String::from_utf8_lossy(&received)
+    );
+
+    served.finish().await;
+}
+
+/// The same bound must apply to a subsequent keep-alive request head, so an
+/// idle connection cannot be held open indefinitely after one complete request.
+///
+/// Normal keep-alive is proven first: the connection really does answer a second
+/// request before the idle bound closes it.
+#[tokio::test]
+async fn keep_alive_survives_a_second_request_and_then_the_idle_bound_closes_it() {
+    let bound = Duration::from_millis(500);
+    let served = ServedConnection::start(bound).await;
+    let mut client = Connection::open(served.address).await;
+
+    for request in 1..=2 {
+        client
+            .write_request(&Connection::keep_alive_request(HEALTH_ROUTE))
+            .await;
+        let response = client
+            .read_response(LIFECYCLE_BOUND)
+            .await
+            .unwrap_or_default();
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "keep-alive request {request} must be answered, got {response}"
+        );
+    }
+
+    // Nothing further is sent, so only the idle header-read bound can end this.
+    let received = client
+        .read_until_closed(LIFECYCLE_BOUND)
+        .await
+        .expect("an idle keep-alive connection must be closed at the bound");
+    assert!(
+        !String::from_utf8_lossy(&received).contains("HTTP/1.1 200"),
+        "no third response was requested, got {}",
+        String::from_utf8_lossy(&received)
+    );
+
+    served.finish().await;
+}
+
+/// One connection served by the real connection driver on an ephemeral port.
+struct ServedConnection {
+    address: std::net::SocketAddr,
+    jwks: HttpsFixture,
+    accept: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ServedConnection {
+    async fn start(header_read_timeout: Duration) -> Self {
+        let signing = SigningMaterial::new("header-bound-key");
+        let jwks = jwks_fixture(&signing, 2).await;
+        let fixture = RuntimeFixture::new(
+            authenticator(jwks.endpoint("/keys"), jwks.trust_anchor_pem().to_vec()),
+            RuntimeFixtureOptions::default(),
+        );
+        let lifecycle = Arc::clone(&fixture.lifecycle);
+        let router = router(Arc::clone(&fixture.state));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            // Keep the fixture alive for as long as the connection is served.
+            let _fixture = fixture;
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            crate::runtime::serve_connection_for_test(
+                stream,
+                router,
+                lifecycle,
+                header_read_timeout,
+            )
+            .await;
+        });
+
+        Self {
+            address,
+            jwks,
+            accept: Some(accept),
+        }
+    }
+
+    async fn finish(mut self) {
+        if let Some(accept) = self.accept.take() {
+            // The driver must have returned on its own; the bound is what ends
+            // it, never an abort from the test.
+            timeout(LIFECYCLE_BOUND, accept)
+                .await
+                .expect("the connection driver must return at the header-read bound")
+                .expect("the connection driver must not panic");
+        }
+        self.jwks.shutdown().await;
     }
 }
 

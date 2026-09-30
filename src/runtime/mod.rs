@@ -23,13 +23,14 @@ pub(crate) mod transport;
 mod tests;
 
 use std::{
+    io::{self, ErrorKind},
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use axum::Router;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use permissionsync::{
     ComposedApplication, GLPI_ADAPTER_IDENTIFIER, ProviderAvailability, TargetAvailability,
 };
@@ -40,7 +41,7 @@ use tokio::{
     signal::unix::{SignalKind, signal},
     sync::oneshot,
     task::JoinSet,
-    time::timeout,
+    time::{sleep, timeout},
 };
 use tracing::{info, warn};
 
@@ -69,7 +70,33 @@ const TRACE_FLUSH_BUDGET: Duration = Duration::from_secs(2);
 
 /// Consecutive listener-accept failures tolerated before the process stops
 /// serving, so a permanently broken listener cannot become a hot loop.
+///
+/// Only failures classified as [`AcceptFailure::ListenerUnusable`] advance this
+/// count: a per-connection, network, or resource-pressure failure leaves the
+/// listener healthy and must not push the process toward shutdown.
 const MAX_CONSECUTIVE_ACCEPT_FAILURES: u32 = 16;
+
+/// The fixed pause applied after a listener-accept failure caused by local
+/// resource pressure.
+///
+/// It exists only so exhaustion cannot become a hot accept loop. It is
+/// deliberately short, because the listener is still healthy and the condition
+/// is usually transient, and it is always interruptible by shutdown.
+const ACCEPT_RESOURCE_PRESSURE_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The bounded window in which a client must deliver one complete request head.
+///
+/// Hyper's HTTP/1 server carries a default header-read timeout, but it only
+/// takes effect when a timer is configured, so the runtime configures both and
+/// states the value itself instead of inheriting a library default that is not
+/// part of PermissionSync's own contract. Hyper re-arms the bound for every
+/// request head on a connection, so it covers an incomplete initial head and an
+/// idle keep-alive connection waiting for the next request alike.
+///
+/// It is a fixed product safety value, not a deployment knob, and it is
+/// unrelated to the configured overall request deadline, which ADR 0011 starts
+/// only once a synchronization request has reached the transport handler.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Runs the executable runtime to completion.
 ///
@@ -161,8 +188,9 @@ async fn serve_configured(configuration: ExecutableConfiguration) -> Result<(), 
     .await;
 
     // The bounded trace flush runs on every exit path, including a listener
-    // that could not be bound, so no exporter task is left behind.
-    observability.shutdown_tracing(TRACE_FLUSH_BUDGET);
+    // that could not be bound, so the exporter is always asked to stop. The
+    // budget is what keeps that request from extending shutdown.
+    observability.shutdown_tracing(TRACE_FLUSH_BUDGET).await;
 
     result
 }
@@ -334,6 +362,10 @@ async fn serve(
     let shutdown_lifecycle = Arc::clone(&lifecycle);
     let mut shutdown = Box::pin(async move { shutdown_lifecycle.shutdown_started().await });
     let mut consecutive_failures = 0_u32;
+    // Resource pressure is reported once per episode rather than once per
+    // failed accept, so a sustained shortage cannot turn a paced retry into a
+    // log flood. A successful accept ends the episode.
+    let mut reported_resource_pressure = false;
 
     // The listener is bound and this loop is about to accept: serving has
     // begun. Anything awaiting this signal therefore cannot run earlier.
@@ -353,22 +385,51 @@ async fn serve(
         match accepted {
             Ok((stream, _)) => {
                 consecutive_failures = 0;
+                reported_resource_pressure = false;
                 connections.spawn(serve_connection(
                     stream,
                     router.clone(),
                     Arc::clone(&lifecycle),
+                    HEADER_READ_TIMEOUT,
                 ));
             }
-            Err(_) => {
-                if accept_failure_is_fatal(&mut consecutive_failures) {
-                    return Err(terminate_after_fatal_accept_failure(
-                        &mut connections,
-                        &lifecycle,
-                        shutdown_grace,
-                    )
-                    .await);
+            Err(error) => match classify_accept_failure(&error) {
+                // The listener is healthy: retry at once, and never let a
+                // hostile or unlucky client push the process toward shutdown.
+                AcceptFailure::Transient => {}
+                // Also not a listener defect, so it advances no fatal count.
+                // The fixed backoff is what keeps retrying from spinning.
+                AcceptFailure::ResourcePressure => {
+                    if !reported_resource_pressure {
+                        reported_resource_pressure = true;
+                        warn!(
+                            target: "permissionsync::runtime",
+                            reason = "resource_pressure",
+                            "the listener cannot accept connections; retrying behind a fixed backoff"
+                        );
+                    }
+                    if accept_backoff(&lifecycle, ACCEPT_RESOURCE_PRESSURE_BACKOFF).await
+                        == AcceptBackoff::Stop
+                    {
+                        break;
+                    }
                 }
-            }
+                AcceptFailure::ListenerUnusable => {
+                    warn!(
+                        target: "permissionsync::runtime",
+                        reason = "listener_unusable",
+                        "the listener reported a state in which it can no longer accept"
+                    );
+                    if accept_failure_is_fatal(&mut consecutive_failures) {
+                        return Err(terminate_after_fatal_accept_failure(
+                            &mut connections,
+                            &lifecycle,
+                            shutdown_grace,
+                        )
+                        .await);
+                    }
+                }
+            },
         }
     }
 
@@ -376,12 +437,115 @@ async fn serve(
     Ok(())
 }
 
-/// Records one listener-accept failure and reports whether the listener must be
-/// treated as unusable.
+/// Linux `errno` values for the `accept(2)` conditions `std` does not expose as
+/// a stable [`ErrorKind`].
 ///
-/// A transient failure such as an aborted connection is tolerated; repeated
-/// consecutive failures mean the listener can no longer produce connections, so
-/// the process must terminate rather than spin.
+/// ADR 0011 fixes a Linux runtime, and these are the `asm-generic/errno.h`
+/// values shared by the Linux targets PermissionSync is built for. They are kept
+/// here, named and isolated, rather than adding a dependency for five integers;
+/// every other condition below is classified through `std`'s own portable
+/// mapping.
+mod accept_errno {
+    pub(super) const ENFILE: i32 = 23;
+    pub(super) const EMFILE: i32 = 24;
+    pub(super) const ENONET: i32 = 64;
+    pub(super) const EPROTO: i32 = 71;
+    pub(super) const ENOPROTOOPT: i32 = 92;
+    pub(super) const ENOBUFS: i32 = 105;
+    pub(super) const EHOSTDOWN: i32 = 112;
+}
+
+/// How one `TcpListener::accept()` failure has to be handled.
+///
+/// The distinction exists because the three categories say different things
+/// about the listener, and only one of them is evidence that the listener itself
+/// stopped working.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AcceptFailure {
+    /// A per-connection or already-pending network error. `accept(2)` documents
+    /// these as retryable like `EAGAIN`, so the listener is healthy, the next
+    /// accept is attempted at once, and nothing counts toward the fatal
+    /// threshold.
+    Transient,
+    /// Local resource pressure: no descriptor, socket buffer, or memory is
+    /// available for a new connection right now. The listener is still healthy,
+    /// so this never contributes to the fatal threshold either; retrying is
+    /// paced by [`ACCEPT_RESOURCE_PRESSURE_BACKOFF`] instead.
+    ResourcePressure,
+    /// The listener itself can no longer produce connections, for example a
+    /// closed, invalid, or wrong-type descriptor. Only this category advances
+    /// the fatal threshold.
+    ListenerUnusable,
+}
+
+/// Classifies one listener-accept failure.
+///
+/// Deliberately narrow: only conditions Linux's `accept(2)` actually documents
+/// as connection-level, network-level, or resource-level are treated as
+/// recoverable. Anything else is assumed to be evidence about the listener, so
+/// an unrecognized failure still reaches the existing fatal lifecycle rather
+/// than being retried forever.
+fn classify_accept_failure(error: &io::Error) -> AcceptFailure {
+    match error.raw_os_error() {
+        // `std` maps none of these to a stable `ErrorKind` this code can match.
+        Some(accept_errno::EMFILE | accept_errno::ENFILE | accept_errno::ENOBUFS) => {
+            AcceptFailure::ResourcePressure
+        }
+        Some(
+            accept_errno::ENONET
+            | accept_errno::EPROTO
+            | accept_errno::ENOPROTOOPT
+            | accept_errno::EHOSTDOWN,
+        ) => AcceptFailure::Transient,
+        _ => match error.kind() {
+            // `ENOMEM`.
+            ErrorKind::OutOfMemory => AcceptFailure::ResourcePressure,
+            // `ECONNABORTED`, `ECONNRESET`, `EINTR`, `EAGAIN`, `ETIMEDOUT`,
+            // `EPERM`, `ENETDOWN`, `ENETUNREACH`, `EHOSTUNREACH`, and
+            // `EOPNOTSUPP`: all about one connection or the network, never about
+            // a listener this process bound itself as a TCP stream socket.
+            ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+            | ErrorKind::PermissionDenied
+            | ErrorKind::NetworkDown
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::HostUnreachable
+            | ErrorKind::Unsupported => AcceptFailure::Transient,
+            _ => AcceptFailure::ListenerUnusable,
+        },
+    }
+}
+
+/// Whether accepting should resume after a resource-pressure backoff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AcceptBackoff {
+    /// The backoff elapsed; accept again.
+    Continue,
+    /// Shutdown began first; stop accepting.
+    Stop,
+}
+
+/// Waits out the fixed resource-pressure backoff, interruptible by shutdown.
+///
+/// Shutdown is biased ahead of the timer, so resource pressure cannot delay the
+/// bounded shutdown phases by even one backoff.
+async fn accept_backoff(lifecycle: &Lifecycle, backoff: Duration) -> AcceptBackoff {
+    tokio::select! {
+        biased;
+        () = lifecycle.shutdown_started() => AcceptBackoff::Stop,
+        () = sleep(backoff) => AcceptBackoff::Continue,
+    }
+}
+
+/// Records one listener-accept failure that indicated an unusable listener and
+/// reports whether the listener must now be treated as unusable for good.
+///
+/// Only [`AcceptFailure::ListenerUnusable`] reaches this. A successful accept
+/// resets the count in the loop, so the threshold really does mean consecutive
+/// evidence that the listener stopped producing connections.
 fn accept_failure_is_fatal(consecutive_failures: &mut u32) -> bool {
     *consecutive_failures = consecutive_failures.saturating_add(1);
     *consecutive_failures >= MAX_CONSECUTIVE_ACCEPT_FAILURES
@@ -461,10 +625,23 @@ async fn drain(connections: &mut JoinSet<()>) {
 ///
 /// On shutdown the connection stops accepting further requests on itself and
 /// lets an in-flight request finish, bounded by the caller's grace handling.
-async fn serve_connection(stream: TcpStream, router: Router, lifecycle: Arc<Lifecycle>) {
+///
+/// `header_read_timeout` bounds how long this connection may occupy a task and a
+/// descriptor while producing no request: a client that never completes a
+/// request head, and an idle keep-alive connection that never starts the next
+/// one, are both closed at that bound. Hyper only enforces it when a timer is
+/// configured, so both are set together here.
+async fn serve_connection(
+    stream: TcpStream,
+    router: Router,
+    lifecycle: Arc<Lifecycle>,
+    header_read_timeout: Duration,
+) {
     // `RefusingService` is what turns an inbound-admission refusal into a
     // terminated connection instead of a manufactured application response.
     let connection = hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout)
         .keep_alive(true)
         .serve_connection(TokioIo::new(stream), RefusingService::new(router));
     let mut connection = Box::pin(connection);
@@ -491,6 +668,48 @@ pub(crate) async fn serve_for_test(
     serving_started: oneshot::Sender<()>,
 ) -> Result<(), RuntimeFailure> {
     serve(listener, router, lifecycle, shutdown_grace, serving_started).await
+}
+
+/// Test-only entry point that serves one already-accepted connection.
+///
+/// It exists so the connection-level header-read bound can be proven with a
+/// short injected value instead of a thirty-second wall-clock wait, without
+/// making that bound a production or public configuration knob.
+#[cfg(test)]
+pub(crate) async fn serve_connection_for_test(
+    stream: TcpStream,
+    router: Router,
+    lifecycle: Arc<Lifecycle>,
+    header_read_timeout: Duration,
+) {
+    serve_connection(stream, router, lifecycle, header_read_timeout).await;
+}
+
+/// Test-only accessor for the fixed header-read bound the runtime serves with.
+#[cfg(test)]
+pub(crate) const fn header_read_timeout() -> Duration {
+    HEADER_READ_TIMEOUT
+}
+
+/// Test-only access to the accept-failure classification.
+#[cfg(test)]
+pub(crate) fn classify_accept_failure_for_test(error: &io::Error) -> AcceptFailure {
+    classify_accept_failure(error)
+}
+
+/// Test-only access to the shutdown-interruptible resource-pressure backoff.
+#[cfg(test)]
+pub(crate) async fn accept_backoff_for_test(
+    lifecycle: &Lifecycle,
+    backoff: Duration,
+) -> AcceptBackoff {
+    accept_backoff(lifecycle, backoff).await
+}
+
+/// Test-only accessor for the fixed resource-pressure backoff.
+#[cfg(test)]
+pub(crate) const fn accept_resource_pressure_backoff() -> Duration {
+    ACCEPT_RESOURCE_PRESSURE_BACKOFF
 }
 
 /// Test-only access to the fatal-accept decision.
