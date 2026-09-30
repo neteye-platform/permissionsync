@@ -704,7 +704,7 @@ async fn ambient_opentelemetry_environment_cannot_change_the_trace_configuration
         return;
     }
 
-    let status = std::process::Command::new(
+    let child = std::process::Command::new(
         std::env::current_exe().expect("the running test binary has a path"),
     )
     .args([
@@ -714,12 +714,30 @@ async fn ambient_opentelemetry_environment_cannot_change_the_trace_configuration
     ])
     .env(AMBIENT_ENVIRONMENT_CHILD, "1")
     .envs(AMBIENT_OTEL_ENVIRONMENT)
-    .status()
+    .output()
     .expect("the test binary must be re-executable");
 
+    // A successful exit alone would not prove anything: a test binary whose
+    // `--exact` filter selects nothing also exits successfully. If the test above
+    // were ever renamed without updating the filter string, that would silently
+    // turn this test into a no-op. So the child's own report is checked: exactly
+    // one test was selected, and it passed.
+    let stdout = String::from_utf8_lossy(&child.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&child.stderr).into_owned();
+    let report = format!("child stdout:\n{stdout}\nchild stderr:\n{stderr}");
+
     assert!(
-        status.success(),
-        "the trace configuration changed under ambient OpenTelemetry environment variables"
+        child.status.success(),
+        "the trace configuration changed under ambient OpenTelemetry environment variables\n\
+         {report}"
+    );
+    assert!(
+        stdout.contains("running 1 test\n"),
+        "the child must select exactly the one hostile-environment test\n{report}"
+    );
+    assert!(
+        stdout.contains("test result: ok. 1 passed; 0 failed"),
+        "the child must report exactly one passing test\n{report}"
     );
 }
 
