@@ -463,11 +463,21 @@ fn the_deployment_contract_example_probes_the_operational_endpoints() {
     }
 }
 
-/// Graceful termination has to be compatible with the shutdown grace the
-/// mounted configuration selects, otherwise Kubernetes would kill the process
-/// while a compliant request was still allowed to finish.
+/// Headroom the checked-in example must keep above the configured request
+/// grace.
+///
+/// Kubernetes' termination horizon has to cover more than
+/// `shutdown.grace_milliseconds`: once that expires the runtime still spends a
+/// fixed bounded window letting cancelled requests return, and then a bounded
+/// final trace flush, before it exits. Those are private runtime constants, so
+/// this file does not pretend to know them. It asserts only that the example
+/// keeps a real margin, which is what makes the example safe to copy, instead
+/// of codifying the weaker claim that equalling the configured grace is always
+/// enough.
+const MINIMUM_TERMINATION_HEADROOM: Duration = Duration::from_secs(5);
+
 #[test]
-fn the_deployment_contract_example_allows_the_configured_shutdown_grace() {
+fn the_deployment_contract_example_keeps_headroom_above_the_configured_grace() {
     let example = kubernetes_example();
     let grace_period = Duration::from_secs(
         field(pod_spec(&example), &["terminationGracePeriodSeconds"])
@@ -483,10 +493,96 @@ fn the_deployment_contract_example_allows_the_configured_shutdown_grace() {
             .expect("the example configuration declares a shutdown grace"),
     );
 
+    let required = configured_grace + MINIMUM_TERMINATION_HEADROOM;
     assert!(
-        grace_period >= configured_grace,
-        "terminationGracePeriodSeconds ({grace_period:?}) must be at least the configured \
-         shutdown grace ({configured_grace:?})"
+        grace_period >= required,
+        "terminationGracePeriodSeconds ({grace_period:?}) must cover the configured shutdown \
+         grace ({configured_grace:?}) plus headroom for the runtime's bounded post-grace \
+         phases, so at least {required:?}"
+    );
+}
+
+/// Overlapping workflow runs for one release ref must not race each other
+/// through the preflight and publish path, and a later run must never cancel a
+/// release that is already publishing.
+#[test]
+fn the_release_workflow_serializes_releases_per_ref() {
+    let workflow: Value = yaml_serde::from_str(&read(".github/workflows/release-image.yaml"))
+        .expect("the release workflow parses as YAML");
+    let concurrency = field(&workflow, &["concurrency"]);
+    let group = field(concurrency, &["group"])
+        .as_str()
+        .expect("the concurrency group is a string");
+    assert!(
+        group.contains("github.ref"),
+        "the concurrency group must be per release ref, found {group:?}"
+    );
+    assert_eq!(
+        field(concurrency, &["cancel-in-progress"]).as_bool(),
+        Some(false),
+        "a later release run must not cancel one that is already publishing"
+    );
+}
+
+/// The published tag set is a release decision, and documentation that claims
+/// the opposite is worse than none. Stable releases really do move `latest`,
+/// so the documentation has to describe it and still direct deployments at the
+/// immutable references.
+#[test]
+fn the_release_documentation_describes_latest_as_mutable() {
+    let readme = read("README.md");
+    assert!(
+        readme.contains("`latest`"),
+        "the README must document the latest tag that stable releases move"
+    );
+    assert!(
+        readme.contains("Mutable by design"),
+        "the README must say plainly that latest is mutable"
+    );
+    assert!(
+        readme.contains("@sha256:"),
+        "the README must keep recommending the immutable digest"
+    );
+    for source in [
+        "README.md",
+        ".github/workflows/release-image.yaml",
+        "deploy/kubernetes/permissionsync.example.yaml",
+    ] {
+        let text = read(source);
+        for stale in ["no mutable `latest`", "no `latest`", "publishes no mutable"] {
+            assert!(
+                !text.contains(stale),
+                "{source} still claims {stale:?}, which is not what the release workflow does"
+            );
+        }
+    }
+}
+
+/// `latest` is expected to exist from the first stable release onward and to
+/// move on every later one, so its presence must never block a release.
+#[test]
+fn the_release_preflight_checks_the_version_tag_rather_than_latest() {
+    let workflow: Value = yaml_serde::from_str(&read(".github/workflows/release-image.yaml"))
+        .expect("the release workflow parses as YAML");
+    let steps = field(&workflow, &["jobs", "unpublished-version", "steps"])
+        .as_sequence()
+        .expect("the preflight job declares steps");
+    let script = steps
+        .iter()
+        .filter_map(|step| step.get("run"))
+        .filter_map(Value::as_str)
+        .collect::<String>();
+    assert!(
+        !script.is_empty(),
+        "the preflight job must run a registry check"
+    );
+    assert!(
+        script.contains("manifests/${version}"),
+        "the preflight must request the immutable version manifest"
+    );
+    assert!(
+        !script.contains("manifests/latest"),
+        "the preflight must not consult the mutable latest tag"
     );
 }
 

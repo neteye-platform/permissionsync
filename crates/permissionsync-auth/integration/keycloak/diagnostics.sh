@@ -22,7 +22,15 @@ if ! source "$runtime_env" >/dev/null 2>&1; then
   exit 0
 fi
 
-secrets=()
+# The values to redact are handed to the redaction filter through a private
+# file inside the already-private runtime directory, never through its process
+# argument vector, which any local user can read from /proc. The file is
+# removed when this script exits, and teardown removes the whole runtime
+# directory regardless.
+secrets_file="$(mktemp "${KEYCLOAK_TEST_RUNTIME_DIR:-${TMPDIR:-/tmp}}/redaction.XXXXXX")"
+chmod 600 "$secrets_file"
+trap 'rm -f -- "$secrets_file"' EXIT
+
 for secret in \
   "${KEYCLOAK_TEST_ADMIN_PASSWORD:-}" \
   "${KEYCLOAK_TEST_CALLER_CLIENT_SECRET:-}" \
@@ -31,8 +39,11 @@ for secret in \
   "${KEYCLOAK_TEST_SHORTLIVED_CLIENT_SECRET:-}" \
   "${KEYCLOAK_TEST_WRONG_AUDIENCE_CLIENT_SECRET:-}" \
   "${KEYCLOAK_TEST_FOREIGN_CLIENT_SECRET:-}"; do
-  if [[ -n "$secret" ]]; then
-    secrets+=("$secret")
+  # Every generated value is hexadecimal, so one per line is unambiguous. A
+  # value that somehow contained a newline is skipped rather than written as
+  # two partial patterns that would redact nothing useful.
+  if [[ -n "$secret" && "$secret" != *$'\n'* ]]; then
+    printf '%s\n' "$secret" >> "$secrets_file"
   fi
 done
 
@@ -40,12 +51,13 @@ redact() {
   python3 -c '
 import sys
 
-secrets = [secret for secret in sys.argv[1:] if secret]
+with open(sys.argv[1], encoding="utf-8") as patterns:
+    secrets = [secret for secret in patterns.read().splitlines() if secret]
 for line in sys.stdin:
     for secret in secrets:
         line = line.replace(secret, "[REDACTED]")
     sys.stdout.write(line)
-' "${secrets[@]}"
+' "$secrets_file"
 }
 
 if [[ -n "${KEYCLOAK_TEST_COMPOSE_PROJECT:-}" ]]; then

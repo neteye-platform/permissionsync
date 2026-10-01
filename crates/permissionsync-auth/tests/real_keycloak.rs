@@ -81,6 +81,10 @@ const STALE_IF_ERROR: Duration = Duration::from_secs(600);
 
 const CLOCK_SKEW: Duration = Duration::from_secs(30);
 
+/// Deterministic allowance added after a short-lived token's reported lifetime
+/// has elapsed, so the expiry assertion never races the boundary it is testing.
+const EXPIRY_MARGIN: Duration = Duration::from_secs(2);
+
 struct NeverCancelled;
 
 impl CancellationSignal for NeverCancelled {
@@ -668,9 +672,8 @@ async fn a_real_expired_token_is_rejected() {
 
     // A dedicated client with a one-second access-token lifespan, so expiry is
     // a known instant derived from the issuing response rather than an
-    // arbitrary interval. `exp` is evaluated without clock skew, so passing
+    // arbitrary interval. `exp` is evaluated without clock skew, so waiting out
     // the reported lifetime is sufficient.
-    let issued_at = Instant::now();
     let token = issue_token(
         &environment,
         &environment.token_endpoint,
@@ -679,12 +682,16 @@ async fn a_real_expired_token_is_rejected() {
         None,
     )
     .await;
+    // Taken after the response arrived. Keycloak set `exp` no later than this
+    // instant plus the reported lifetime, so waiting from here cannot
+    // under-wait however long issuance itself took.
+    let received_at = Instant::now();
     assert!(
         token.lifetime <= Duration::from_secs(5),
         "the short-lived client must issue a short-lived token"
     );
     tokio::time::sleep_until(tokio::time::Instant::from_std(
-        issued_at + token.lifetime + Duration::from_secs(2),
+        received_at + token.lifetime + EXPIRY_MARGIN,
     ))
     .await;
 

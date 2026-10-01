@@ -35,10 +35,11 @@ spec:
       labels:
         app.kubernetes.io/name: permissionsync
     spec:
-      # At least the configured shutdown grace period, so every request
-      # accepted before SIGTERM has time to return. Keep this consistent with
-      # `shutdown.grace_milliseconds` in the mounted configuration: the
-      # example document configures 20000 ms.
+      # Must cover the whole bounded shutdown horizon, not only the configured
+      # request grace: after `shutdown.grace_milliseconds` expires the process
+      # still spends a fixed bounded window letting cancelled requests return,
+      # and then a bounded final trace flush, before it exits. 30s leaves ample
+      # headroom over the example document's 20000 ms grace.
       terminationGracePeriodSeconds: 30
       # PermissionSync calls no Kubernetes API, so it needs no API credential.
       automountServiceAccountToken: false

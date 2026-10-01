@@ -237,11 +237,21 @@ labels. The `version`, `revision`, and `created` labels are added by the
 publishing workflow from the release event, so a local build never claims a
 release identity it does not have.
 
-Released images are published to
-`ghcr.io/neteye-platform/permissionsync:<version>` for semantic version tags
-only. There is no mutable `latest` tag, and the publishing workflow prints the
-published digest. Select a release by its immutable digest
-(`…/permissionsync:1.2.3@sha256:…`) wherever operational tooling permits.
+Releases are published to `ghcr.io/neteye-platform/permissionsync` from stable
+`vX.Y.Z` tags only. Each release publishes the version tag and also moves the
+conventional `latest` tag.
+
+| Reference                         | Mutability                                                                                        |
+| --------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `…/permissionsync:1.2.3@sha256:…` | Immutable by construction. The reproducible deployment reference.                                 |
+| `…/permissionsync:1.2.3`          | Immutable by policy: the release workflow refuses to publish a version that is already published. |
+| `…/permissionsync:latest`         | **Mutable by design.** It moves to each new stable release.                                       |
+
+The version tag and the content digest are the release identity. `latest` is a
+convenience and discovery reference only and is never part of deployment
+correctness, so a deployment that needs reproducibility or offline recovery
+MUST reference the immutable digest, which the publishing workflow prints for
+every release. Do not pin `latest`.
 
 After installation or upgrade, normal restart and recovery must not depend on
 public registry connectivity. That is deployment infrastructure, not
@@ -266,19 +276,19 @@ yourself.
 
 The supported deployment contract is:
 
-| Contract           | Requirement                                                                                |
-| ------------------ | ------------------------------------------------------------------------------------------ |
-| Configuration      | Exactly one external YAML document, mounted read-only                                      |
-| Configuration path | `PERMISSIONSYNC_CONFIG_FILE` pointing at that mounted file, and no other environment value |
-| Liveness           | `GET /healthz` on the configured listener port                                             |
-| Readiness          | `GET /readyz` on the same port                                                             |
-| Seccomp            | `seccompProfile.type: RuntimeDefault`                                                      |
-| User               | `runAsNonRoot: true` with the image's `runAsUser`/`runAsGroup` of `65532`                  |
-| Privileges         | `allowPrivilegeEscalation: false`, not privileged, all capabilities dropped                |
-| Filesystem         | `readOnlyRootFilesystem: true`; no writable path is required                               |
-| Host namespaces    | None: no host network, PID, or IPC, and no Kubernetes API token is mounted                 |
-| Termination        | `SIGTERM`, with `terminationGracePeriodSeconds` at least `shutdown.grace_milliseconds`     |
-| Image              | The published image pinned by immutable digest, kept available locally for restart         |
+| Contract           | Requirement                                                                                 |
+| ------------------ | ------------------------------------------------------------------------------------------- |
+| Configuration      | Exactly one external YAML document, mounted read-only                                       |
+| Configuration path | `PERMISSIONSYNC_CONFIG_FILE` pointing at that mounted file, and no other environment value  |
+| Liveness           | `GET /healthz` on the configured listener port                                              |
+| Readiness          | `GET /readyz` on the same port                                                              |
+| Seccomp            | `seccompProfile.type: RuntimeDefault`                                                       |
+| User               | `runAsNonRoot: true` with the image's `runAsUser`/`runAsGroup` of `65532`                   |
+| Privileges         | `allowPrivilegeEscalation: false`, not privileged, all capabilities dropped                 |
+| Filesystem         | `readOnlyRootFilesystem: true`; no writable path is required                                |
+| Host namespaces    | None: no host network, PID, or IPC, and no Kubernetes API token is mounted                  |
+| Termination        | `SIGTERM`, with `terminationGracePeriodSeconds` covering the whole bounded shutdown horizon |
+| Image              | The published image pinned by immutable digest, kept available locally for restart          |
 
 Any volume source that presents the single document at the mounted path works.
 Kubernetes Secrets are **not** required, and PermissionSync neither requires nor
@@ -286,6 +296,25 @@ understands a secret backend: a Secret, a ConfigMap, a projected volume, a CSI
 secrets-store volume, or an operator-managed volume are all equally valid. The
 example shows a Secret only because that document normally carries credentials
 and private trust material.
+
+`terminationGracePeriodSeconds` has to cover PermissionSync's whole bounded
+shutdown horizon, which is wider than the configured request grace. Once
+`shutdown.grace_milliseconds` expires, the process still spends a fixed bounded
+window letting already cancelled requests return, and then a bounded final
+trace flush when tracing is enabled, before it exits. Both are fixed product
+values of a few seconds, not deployment knobs, so budget:
+
+```text
+shutdown.grace + fixed post-grace cancellation window
+               + bounded final lifecycle and trace cleanup
+               + operational margin
+```
+
+The example manifest keeps 30 seconds against the example configuration's
+20-second grace, which leaves ample headroom for both fixed phases. Choosing
+this horizon is the deployment's responsibility; PermissionSync keeps its own
+shutdown internally bounded either way, and a horizon that is too short simply
+means Kubernetes sends `SIGKILL` before the process finished its own sequence.
 
 Replicas, resource requests and limits, scheduling, Service and Ingress
 objects, and TLS termination in front of the listener are deployment concerns.
@@ -327,7 +356,8 @@ Adversarial parser, cryptographic, and detailed cache-timing cases remain the
 job of the hermetic auth tests; this suite covers the wire and deployment
 contract.
 
-Run it locally, which needs Docker or Podman:
+Run it locally. The disposable environments drive `docker` and
+`docker compose`, so they need Docker Engine with the Compose v2 plugin:
 
 ```sh
 source <(crates/permissionsync-auth/integration/keycloak/bootstrap.sh)
@@ -367,7 +397,9 @@ strict mode against the targeted Kubernetes version, both in `prek run
 pinned in one place.
 
 Both container scripts live in [integration/oci/](integration/oci/) and take a
-built image reference, so they can be run locally:
+built image reference, so they can be run locally. Like the GLPI and Keycloak
+layers they drive `docker` and `docker compose`, so they need Docker Engine
+with the Compose v2 plugin:
 
 ```sh
 docker build --file Dockerfile --tag permissionsync:local .
