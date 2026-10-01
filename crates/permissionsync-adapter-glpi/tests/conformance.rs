@@ -2068,9 +2068,8 @@ async fn user_creation_failure_makes_zero_profile_user_mutation_requests() {
         ])),
         ok(&search_body(0, &[])),
         json_response("500 Internal Server Error", "{}"), // POST User fails
-        // No authoritative re-resolution follows: a server error is not GLPI's
-        // proven add rejection, so it never enters the concurrent-create
-        // recovery path and reconciliation fails straight away.
+        // No authoritative re-resolution follows: no failed creation response
+        // may be recovered from, so reconciliation fails straight away.
         ok("true"), // killSession still attempted
     ];
 
@@ -6036,10 +6035,12 @@ impl FakeGlpi {
                 );
             }
             if state.reject_duplicate_user_names && state.user_id(&name).is_some() {
-                // Exactly GLPI 11.0.9's single-item add rejection: `400` with
-                // the two-element `[status_code, message]` array its
-                // `returnError($message, 400, "ERROR_GLPI_ADD", false)` writes.
-                // That branch runs only when `add()` inserted nothing.
+                // GLPI 11.0.9's single-item add rejection: `400` with the
+                // two-element `[status_code, message]` array its `returnError`
+                // writes. Here the uniqueness constraint really did reject the
+                // insert, but the response looks identical to one emitted after
+                // a successful insert whose post-add work then failed, which is
+                // why the adapter may not read it either way.
                 return (
                     "400 Bad Request",
                     r#"["ERROR_GLPI_ADD","the login already exists"]"#.to_owned(),
@@ -6664,12 +6665,15 @@ async fn await_fake_step_second(overlap: &Overlap) -> ReconciliationOutcome {
 
 // --- Ambiguous missing-user creation results ---------------------------------
 //
-// Only GLPI's documented single-item add rejection — `400` with the
-// `["ERROR_GLPI_ADD", message]` array its `returnError(..., 400,
-// "ERROR_GLPI_ADD", false)` writes — proves that nothing was inserted, because
-// that branch runs only when `add()` returned `false`. Every other creation
-// result is ambiguous and must fail closed rather than be read as a benign
-// concurrent rejection.
+// No failed or rejected GLPI `User` creation response proves that the request
+// left no persistent side effect. The add rejection is ambiguous too: GLPI
+// inserts the row before its post-add work runs, so a throw anywhere in that
+// tail — deployment plugins and hooks included — reports a failed create for a
+// user that already exists.
+//
+// Only the strict confirmed creation contract may continue. Every other result
+// fails closed, performing neither a username re-resolution nor any
+// `Profile_User` work.
 
 /// A `201` whose body breaks the creation contract must fail, even though the
 /// user really was created and a fresh lookup would find exactly one account.
@@ -6762,14 +6766,12 @@ async fn a_server_error_during_user_creation_fails_closed() {
     overlap.finish().await;
 }
 
-/// A `400` whose body is not GLPI's add-rejection contract fails closed.
+/// Other `400` creation responses fail closed as well.
 ///
-/// The status alone is not the proof: the proof is the machine-readable status
-/// code in the response array. A different documented code, the multi-item
-/// partial-add code, or any other shape leaves it unknown whether a row was
-/// inserted.
+/// No response shape is a recoverable category: whichever status code or body a
+/// rejected create carries, it leaves unknown whether a row was inserted.
 #[tokio::test]
-async fn a_bad_request_that_is_not_the_glpi_add_rejection_fails_closed() {
+async fn other_bad_request_creation_responses_fail_closed() {
     for (label, body) in [
         (
             "the multi-item partial-add code",
