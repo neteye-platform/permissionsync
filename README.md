@@ -16,8 +16,8 @@ bounded inbound admission and synchronization capacity, health, readiness and
 metrics endpoints, graceful shutdown, structured logging, Prometheus metrics,
 and optional OTLP trace export.
 
-Supported-Keycloak deployment contract tests and OCI/Kubernetes packaging remain
-future work; the internal auth-crate tests are not a deployment claim.
+A real supported-Keycloak deployment contract suite is described below.
+OCI and Kubernetes packaging remain future work.
 
 ## Running the service
 
@@ -185,6 +185,51 @@ cancels the remaining request contexts, terminates and awaits its remaining
 tasks, and performs a bounded trace flush when tracing is enabled. Final
 telemetry may be lost if the exporter is still unavailable.
 
+## Supported Keycloak
+
+CI exercises exactly one supported Keycloak release, **26.8.0**, pinned by
+release tag and immutable digest in
+[the disposable Keycloak environment](crates/permissionsync-auth/integration/keycloak/docker-compose.yml).
+That is the tested deployment baseline, not a claim that other releases are
+broken: PermissionSync's contract is the OIDC and JWT behaviour recorded in
+[ADR-0002](docs/adr/0002-receiver-side-jwt-verification.md), and any Keycloak
+that satisfies it works. Renovate proposes release and digest updates, and such
+an upgrade must pass the contract suite before it can be merged.
+
+The suite proves, against a real Keycloak instance over real HTTPS, that both
+supported trusted-source modes work — OIDC discovery, where the discovered
+issuer must equal the configured issuer exactly and its `jwks_uri` becomes
+trusted only through that chain, and a directly configured `jwks_uri`. It also
+proves the token contract: real Client Credentials tokens carry `client_id` and
+the configured audience, zero/one/many `permissionsync:<target>` scope tokens
+behave as the scope convention requires, and real tokens with the wrong
+audience, a different realm, an expired lifetime, or an algorithm outside the
+configured allowlist are all refused. One test additionally stops the
+configured metadata source and proves that still-usable cached verification
+material keeps verifying while an authenticator with no retained state fails
+closed.
+
+The Keycloak endpoint is HTTPS with certificate and hostname validation fully
+enabled; the disposable CA is supplied through PermissionSync's existing
+`additional_trust_anchors_pem` configuration. Nothing in the suite disables
+verification, accepts plaintext, or bypasses a host name. Every credential is
+generated per run inside the disposable environment and is destroyed with it.
+
+Adversarial parser, cryptographic, and detailed cache-timing cases remain the
+job of the hermetic auth tests; this suite covers the wire and deployment
+contract.
+
+Run it locally, which needs Docker or Podman:
+
+```sh
+source <(crates/permissionsync-auth/integration/keycloak/bootstrap.sh)
+set -a
+source "$KEYCLOAK_TEST_RUNTIME_ENV"
+set +a
+cargo test -p permissionsync-auth --test real_keycloak --locked -- --ignored
+crates/permissionsync-auth/integration/keycloak/teardown.sh
+```
+
 ## Development
 
 The exact Rust toolchain is defined in
@@ -205,11 +250,14 @@ cargo check --workspace --all-targets --all-features --locked
 cargo test --workspace --all-features --locked
 ```
 
-Normal Cargo tests remain hermetic and require neither Docker nor GLPI. The GLPI
-adapter additionally has a dedicated disposable
-[real-GLPI integration layer](crates/permissionsync-adapter-glpi/integration/glpi/)
-that CI executes through the
-[GLPI adapter test workflow](.github/workflows/glpi-adapter-tests.yaml).
+Normal Cargo tests remain hermetic and require neither Docker, GLPI, nor
+Keycloak. The GLPI adapter has a dedicated disposable
+[real-GLPI integration layer](crates/permissionsync-adapter-glpi/integration/glpi/),
+and authentication has a dedicated disposable
+[real-Keycloak integration layer](crates/permissionsync-auth/integration/keycloak/).
+CI executes both, through the
+[GLPI adapter test workflow](.github/workflows/glpi-adapter-tests.yaml) and the
+[Keycloak authentication test workflow](.github/workflows/keycloak-authentication-tests.yaml).
 
 The dependency-policy check requires the exact, Renovate-managed
 `CARGO_DENY_VERSION` in
