@@ -23,6 +23,15 @@ pub(crate) enum GlpiFailure {
     MissingReference,
     MalformedReference,
     UserCreationFailed,
+    /// GLPI itself refused the missing-user creation before any row existed.
+    ///
+    /// This is the one creation failure whose outcome a reconciliation may
+    /// resolve by re-reading authoritative target state: the GLPI 11.0.9 single
+    /// -item create path reports it only when `add()` returned `false`, so no
+    /// user was inserted by this request. Every other creation failure, this
+    /// request's own confirmed creation included, is
+    /// [`Self::UserCreationFailed`].
+    UserCreationRejected,
     MutationFailed,
     /// The final authoritative read did not show this request's canonical
     /// desired assignment set.

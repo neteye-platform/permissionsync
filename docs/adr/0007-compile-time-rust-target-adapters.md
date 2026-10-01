@@ -186,8 +186,14 @@ relationship with each other, and a response does not freeze target state. A
 later non-concurrent synchronization must still converge the target toward its
 own desired state.
 
-An adapter MUST NOT close that window by serializing, locking, coordinating, or
-repeating its work until its own desired state prevails.
+What an adapter MUST NOT do to close that window is introduce coordination
+PermissionSync does not have: identity serialization in Core, a process-local
+lock presented as a cross-replica guarantee, implicit distributed or shared
+coordination, or repeating its work until its own desired state prevails.
+Target-native atomicity, conditional writes, transactions, uniqueness, and
+conflict detection remain allowed and preferred wherever the target contract
+actually provides them, because those are properties of the target rather than
+coordination PermissionSync invents.
 
 Once a request enters the selected-target synchronization path, a successful
 `200` or selected-target `204` requires successful completion of both the

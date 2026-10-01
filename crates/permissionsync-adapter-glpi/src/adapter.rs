@@ -344,15 +344,21 @@ async fn reconcile_with_session(
 ///
 /// Two concurrent reconciliations may both observe the username as absent, and
 /// the ADR 0009 operation set contains no conditional write that would let one
-/// creation win. The available GLPI V1 documentation states no login-uniqueness
-/// guarantee either, so this deliberately relies on none: the creation attempt's
-/// own result is treated as a hint, and a fresh exact lookup decides. ADR 0009
-/// already permits a lookup result only when exactly one exact match exists, and
-/// reconciliation continues here only when that one match is the user this
-/// request created, or when the creation was refused and exactly one match now
-/// exists because another reconciliation created it. Anything else is
-/// unprovable and fails closed, so two logical users can never both be
-/// reconciled.
+/// creation win. Exactly two outcomes let reconciliation continue, and both
+/// require a fresh exact lookup to prove that one usable account now exists:
+///
+/// - this request's creation was confirmed by GLPI's strict creation contract
+///   and the lookup returns exactly that account;
+/// - GLPI proved it refused the creation without inserting anything
+///   ([`GlpiFailure::UserCreationRejected`]) and the lookup returns exactly one
+///   account, which another reconciliation created.
+///
+/// Everything else fails closed, including an ambiguous creation result such as
+/// a `201` whose body does not satisfy the creation contract: GLPI may have
+/// inserted the user, so a lookup finding one account cannot tell whether this
+/// request performed that mutation, and reporting either `Changed` or
+/// `Unchanged` would be a guess. Cancellation, an expired budget, and transport
+/// failures likewise prove nothing about target state and propagate unchanged.
 ///
 /// This resolves one target mutation inside the same reconciliation. It is not
 /// an automatic retry: the creation is attempted at most once and nothing is
@@ -377,11 +383,13 @@ async fn create_user_and_resolve_outcome(
     .await
     {
         Ok(id) => Some(id),
-        // GLPI answered and refused the creation, which is exactly the shape a
-        // concurrently created login produces. Every other failure —
-        // cancellation, an expired deadline, or a transport failure — proves
-        // nothing about target state and propagates unchanged.
-        Err(GlpiFailure::UserCreationFailed) => None,
+        // GLPI proved it refused the creation without inserting a row, which is
+        // exactly what a concurrently created login produces. This is the only
+        // failure whose outcome may be resolved by re-reading target state.
+        Err(GlpiFailure::UserCreationRejected) => None,
+        // Every other failure is ambiguous or unrelated and stays a failure: an
+        // unparsable success body, an unexpected status, cancellation, an
+        // expired budget, or a transport failure.
         Err(other) => return Err(other),
     };
 
@@ -391,14 +399,14 @@ async fn create_user_and_resolve_outcome(
     match (created, resolved) {
         // This request created the one user that now answers the exact lookup,
         // so it owns the reconciliation and the creation was an effective
-        // mutation.
+        // mutation GLPI confirmed.
         (Some(created_id), Some(resolved_id)) if created_id == resolved_id => Ok((created_id, 1)),
-        // The creation was refused and exactly one exact user now exists, so a
-        // concurrent reconciliation created it. Continue against that user
-        // without claiming a mutation of this request's own.
+        // The creation was proven refused and exactly one exact user now
+        // exists, so a concurrent reconciliation created it. Continue against
+        // that user without claiming a mutation of this request's own.
         (None, Some(resolved_id)) => Ok((resolved_id, 0)),
-        // A creation that succeeded while a different user answers the exact
-        // lookup, or no user at all: unprovable ownership.
+        // A confirmed creation while a different user answers the exact lookup,
+        // or no user at all: unprovable ownership.
         (Some(_) | None, _) => Err(GlpiFailure::UserCreationFailed),
     }
 }

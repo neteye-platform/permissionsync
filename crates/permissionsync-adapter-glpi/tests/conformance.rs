@@ -2068,10 +2068,9 @@ async fn user_creation_failure_makes_zero_profile_user_mutation_requests() {
         ])),
         ok(&search_body(0, &[])),
         json_response("500 Internal Server Error", "{}"), // POST User fails
-        // The refused creation's outcome is resolved authoritatively: the login
-        // still does not exist, so ownership is unprovable and reconciliation
-        // fails without touching any assignment.
-        ok(&search_body(0, &[])),
+        // No authoritative re-resolution follows: a server error is not GLPI's
+        // proven add rejection, so it never enters the concurrent-create
+        // recovery path and reconciliation fails straight away.
         ok("true"), // killSession still attempted
     ];
 
@@ -5639,9 +5638,33 @@ struct FakeState {
     next_id: u64,
     /// Whether the fake refuses a second `User` with an existing exact login.
     ///
-    /// The available GLPI V1 documentation states no login-uniqueness
-    /// guarantee, so the adapter relies on none. Both settings are exercised.
+    /// GLPI 11.0.9 carries `UNIQUE KEY unicityloginauth (name, authtype,
+    /// auths_id)` on `glpi_users`, so a real backend does refuse one. The
+    /// adapter nevertheless relies on no uniqueness guarantee, and both
+    /// settings are exercised.
     reject_duplicate_user_names: bool,
+    /// How the fake answers a `POST /User` that it accepts.
+    user_creation_response: UserCreationResponse,
+    /// An exact `(status line, body)` every `POST /User` answers with instead of
+    /// creating anything.
+    user_creation_failure: Option<(&'static str, &'static str)>,
+    /// Logins the `User` search hides, so the adapter believes an existing
+    /// account is absent and attempts to create it.
+    hidden_users: Vec<String>,
+}
+
+/// How the stateful fake answers an accepted `POST /User`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UserCreationResponse {
+    /// GLPI's documented creation contract: `201` with `{"id":…,"message":…}`.
+    Contract,
+    /// `201` after really inserting the user, but with a body that does not
+    /// satisfy the creation contract.
+    ///
+    /// This is the ambiguous result the adapter must never reinterpret: the row
+    /// exists, so a fresh lookup finds exactly one account, yet nothing proves
+    /// whether this request created it.
+    MalformedSuccessBody,
 }
 
 impl FakeState {
@@ -5661,6 +5684,9 @@ impl FakeState {
             assignments: assignments.to_vec(),
             next_id,
             reject_duplicate_user_names: true,
+            user_creation_response: UserCreationResponse::Contract,
+            user_creation_failure: None,
+            hidden_users: Vec::new(),
         }
     }
 
@@ -5747,6 +5773,9 @@ impl GateHandle {
 struct FakeGlpi {
     state: Arc<std::sync::Mutex<FakeState>>,
     gates: Arc<std::sync::Mutex<Vec<FakeGate>>>,
+    /// Every `(method, path)` the fake served, so a test can assert that a
+    /// request was never made at all.
+    served: Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
 impl FakeGlpi {
@@ -5754,12 +5783,53 @@ impl FakeGlpi {
         Self {
             state: Arc::new(std::sync::Mutex::new(FakeState::new(users, assignments))),
             gates: Arc::new(std::sync::Mutex::new(Vec::new())),
+            served: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
     fn with_duplicate_user_names_allowed(self) -> Self {
         self.state.lock().unwrap().reject_duplicate_user_names = false;
         self
+    }
+
+    /// Makes an accepted `POST /User` really insert the user and then answer
+    /// `201` with a body that breaks the creation contract.
+    fn with_malformed_user_creation_response(self) -> Self {
+        self.state.lock().unwrap().user_creation_response =
+            UserCreationResponse::MalformedSuccessBody;
+        self
+    }
+
+    /// Makes every `POST /User` answer exactly this response and create nothing.
+    fn with_user_creation_failure(self, status_line: &'static str, body: &'static str) -> Self {
+        self.state.lock().unwrap().user_creation_failure = Some((status_line, body));
+        self
+    }
+
+    /// Hides one existing login from the `User` search, so the adapter believes
+    /// it is absent and attempts the creation that GLPI then rejects.
+    fn with_hidden_user(self, username: &str) -> Self {
+        self.state
+            .lock()
+            .unwrap()
+            .hidden_users
+            .push(username.to_owned());
+        self
+    }
+
+    /// Whether any request with this method and path was served.
+    fn saw_request(&self, method: &str, path: &str) -> bool {
+        self.request_count(method, path) > 0
+    }
+
+    /// How many requests with this method and path were served.
+    fn request_count(&self, method: &str, path: &str) -> usize {
+        self.served
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(served_method, served_path)| served_method == method && served_path == path)
+            .count()
     }
 
     /// Parks the `occurrence`-th matching request of one reconciliation until
@@ -5822,6 +5892,10 @@ impl FakeGlpi {
         deleted_user_search: bool,
         body: &[u8],
     ) -> (&'static str, String) {
+        self.served
+            .lock()
+            .unwrap()
+            .push((method.to_owned(), path.to_owned()));
         let mut state = self.state.lock().unwrap();
 
         if path == "/apirest.php/initSession" {
@@ -5868,6 +5942,7 @@ impl FakeGlpi {
             let rows: Vec<(u64, &str, &str)> = state
                 .users
                 .iter()
+                .filter(|(_, name)| !state.hidden_users.contains(name))
                 .map(|(id, name)| (*id, name.as_str(), "2"))
                 .collect();
             return ("200 OK", search_body(rows.len() as u64, &rows));
@@ -5929,13 +6004,30 @@ impl FakeGlpi {
             );
         }
         if path == "/apirest.php/User" && method == "POST" {
+            if let Some((status_line, failure_body)) = state.user_creation_failure {
+                return (status_line, failure_body.to_owned());
+            }
             let parsed: serde_json::Value =
                 serde_json::from_slice(body).expect("a JSON User creation body");
             let name = parsed["input"]["name"]
                 .as_str()
                 .expect("the creation body names the user")
                 .to_owned();
+            if state.reject_duplicate_user_names && state.hidden_users.contains(&name) {
+                // The account exists but was hidden from the lookup. GLPI's own
+                // uniqueness constraint refuses the creation, and the login
+                // becomes visible so the authoritative re-resolution finds it.
+                state.hidden_users.retain(|hidden| hidden != &name);
+                return (
+                    "400 Bad Request",
+                    r#"["ERROR_GLPI_ADD","the login already exists"]"#.to_owned(),
+                );
+            }
             if state.reject_duplicate_user_names && state.user_id(&name).is_some() {
+                // Exactly GLPI 11.0.9's single-item add rejection: `400` with
+                // the two-element `[status_code, message]` array its
+                // `returnError($message, 400, "ERROR_GLPI_ADD", false)` writes.
+                // That branch runs only when `add()` inserted nothing.
                 return (
                     "400 Bad Request",
                     r#"["ERROR_GLPI_ADD","the login already exists"]"#.to_owned(),
@@ -5943,7 +6035,15 @@ impl FakeGlpi {
             }
             let id = state.take_id();
             state.users.push((id, name));
-            return ("201 Created", format!(r#"{{"id":{id},"message":""}}"#));
+            // The user really exists from here on, whichever body is returned.
+            return match state.user_creation_response {
+                UserCreationResponse::Contract => {
+                    ("201 Created", format!(r#"{{"id":{id},"message":""}}"#))
+                }
+                UserCreationResponse::MalformedSuccessBody => {
+                    ("201 Created", r#"{"created":true}"#.to_owned())
+                }
+            };
         }
         if path == "/apirest.php/Profile_User" && method == "POST" {
             let parsed: serde_json::Value =
@@ -6078,6 +6178,11 @@ struct Overlap {
     second: Arc<GlpiAdapter>,
     server: Option<JoinHandle<()>>,
 }
+
+/// What one `User` absence proof costs in requests: the active lookup plus the
+/// `is_deleted=1` lookup ADR 0009 requires before deciding a login is absent. An
+/// authoritative re-resolution costs the same again.
+const INITIAL_USER_ABSENCE_LOOKUPS: usize = 2;
 
 const FIRST_TOKEN: &str = "app-token-first";
 const SECOND_TOKEN: &str = "app-token-second";
@@ -6536,4 +6641,199 @@ async fn await_fake_step_second(overlap: &Overlap) -> ReconciliationOutcome {
     )
     .await
     .expect("the uncontended reconciliation succeeds")
+}
+
+// --- Ambiguous missing-user creation results ---------------------------------
+//
+// Only GLPI's documented single-item add rejection — `400` with the
+// `["ERROR_GLPI_ADD", message]` array its `returnError(..., 400,
+// "ERROR_GLPI_ADD", false)` writes — proves that nothing was inserted, because
+// that branch runs only when `add()` returned `false`. Every other creation
+// result is ambiguous and must fail closed rather than be read as a benign
+// concurrent rejection.
+
+/// A `201` whose body breaks the creation contract must fail, even though the
+/// user really was created and a fresh lookup would find exactly one account.
+///
+/// This is the decisive regression: treating every creation failure as a
+/// possible concurrent rejection would let this request re-resolve the login,
+/// find the single account it had itself just created, and report an outcome it
+/// cannot justify — `Unchanged` if it credited the creation to someone else, or
+/// `Changed` on an unproven mutation. The ambiguity is in whether *this*
+/// request performed the mutation, so the only safe answer is failure.
+#[tokio::test]
+async fn a_malformed_successful_user_creation_response_fails_closed() {
+    let fake = FakeGlpi::new(&[], &[]).with_malformed_user_creation_response();
+    let overlap = Overlap::with_fake(fake).await;
+
+    let outcome = await_fake_server_step(
+        "the reconciliation",
+        reconcile_identity(&overlap.first, "newcomer", &technician_envelope(true)),
+    )
+    .await;
+
+    assert!(
+        outcome.is_err(),
+        "an unparsable creation success is an ambiguous mutation result"
+    );
+    // The side effect really happened and a fresh lookup would resolve it, which
+    // is exactly what must not be mistaken for a safe concurrent rejection.
+    assert_eq!(
+        overlap.fake.user_count("newcomer"),
+        1,
+        "the user really was created, so a lookup would find exactly one account"
+    );
+    assert_eq!(
+        overlap
+            .fake
+            .request_count("GET", "/apirest.php/search/User"),
+        INITIAL_USER_ABSENCE_LOOKUPS,
+        "an ambiguous success must not trigger the authoritative re-resolution"
+    );
+    // Nothing was reconciled on top of that ambiguous result.
+    assert!(
+        overlap.fake.physical_triples("newcomer").is_empty(),
+        "no Profile_User mutation may start after an ambiguous creation result"
+    );
+    assert!(
+        !overlap
+            .fake
+            .saw_request("POST", "/apirest.php/Profile_User"),
+        "no Profile_User creation request may be sent at all"
+    );
+    assert!(
+        !overlap
+            .fake
+            .saw_request("GET", "/apirest.php/search/Profile_User"),
+        "reconciliation must stop before it even reads the assignment set"
+    );
+
+    overlap.finish().await;
+}
+
+/// A server error during creation is not a proven rejection either.
+#[tokio::test]
+async fn a_server_error_during_user_creation_fails_closed() {
+    let fake =
+        FakeGlpi::new(&[], &[]).with_user_creation_failure("500 Internal Server Error", "{}");
+    let overlap = Overlap::with_fake(fake).await;
+
+    let outcome = await_fake_server_step(
+        "the reconciliation",
+        reconcile_identity(&overlap.first, "newcomer", &technician_envelope(true)),
+    )
+    .await;
+
+    assert!(outcome.is_err(), "a server error proves nothing");
+    assert_eq!(overlap.fake.user_count("newcomer"), 0);
+    assert_eq!(
+        overlap
+            .fake
+            .request_count("GET", "/apirest.php/search/User"),
+        INITIAL_USER_ABSENCE_LOOKUPS,
+        "no authoritative re-resolution may follow an unproven rejection"
+    );
+    assert!(
+        !overlap
+            .fake
+            .saw_request("GET", "/apirest.php/search/Profile_User"),
+        "no assignment read may follow either"
+    );
+
+    overlap.finish().await;
+}
+
+/// A `400` whose body is not GLPI's add-rejection contract fails closed.
+///
+/// The status alone is not the proof: the proof is the machine-readable status
+/// code in the response array. A different documented code, the multi-item
+/// partial-add code, or any other shape leaves it unknown whether a row was
+/// inserted.
+#[tokio::test]
+async fn a_bad_request_that_is_not_the_glpi_add_rejection_fails_closed() {
+    for (label, body) in [
+        (
+            "the multi-item partial-add code",
+            r#"["ERROR_GLPI_PARTIAL_ADD","partial"]"#,
+        ),
+        (
+            "a different documented code",
+            r#"["ERROR_ITEM_NOT_FOUND","missing"]"#,
+        ),
+        ("the generic error code", r#"["ERROR","bad request"]"#),
+        ("a non-array error body", r#"{"message":"bad request"}"#),
+    ] {
+        let fake = FakeGlpi::new(&[], &[]).with_user_creation_failure("400 Bad Request", body);
+        let overlap = Overlap::with_fake(fake).await;
+
+        let outcome = await_fake_server_step(
+            "the reconciliation",
+            reconcile_identity(&overlap.first, "newcomer", &technician_envelope(true)),
+        )
+        .await;
+
+        assert!(outcome.is_err(), "{label} must fail closed");
+        assert_eq!(
+            overlap
+                .fake
+                .request_count("GET", "/apirest.php/search/User"),
+            INITIAL_USER_ABSENCE_LOOKUPS,
+            "{label} must not trigger the authoritative re-resolution"
+        );
+        assert!(
+            !overlap
+                .fake
+                .saw_request("GET", "/apirest.php/search/Profile_User"),
+            "{label} must not enter the recovery path"
+        );
+
+        overlap.finish().await;
+    }
+}
+
+/// The exact supported rejection does recover, which is what makes the tests
+/// above a real distinction rather than a blanket refusal.
+///
+/// The login already exists, GLPI answers its documented add rejection, the
+/// fresh exact lookup resolves one account, and reconciliation continues and
+/// succeeds against it without claiming a mutation of its own.
+#[tokio::test]
+async fn the_documented_glpi_add_rejection_recovers_against_one_resolvable_account() {
+    // The account exists but the adapter is told it does not, so it attempts
+    // the creation and receives the proven rejection.
+    let overlap = Overlap::with_fake(
+        FakeGlpi::new(
+            &[(30, "newcomer")],
+            &[assignment(1, 30, FAKE_TECHNICIAN_ID, true)],
+        )
+        .with_hidden_user("newcomer"),
+    )
+    .await;
+
+    let outcome = await_fake_server_step(
+        "the reconciliation",
+        reconcile_identity(&overlap.first, "newcomer", &technician_envelope(true)),
+    )
+    .await
+    .expect("a proven rejection with one resolvable account must recover");
+
+    assert_eq!(
+        outcome,
+        ReconciliationOutcome::Unchanged,
+        "this request performed no confirmed mutation of its own"
+    );
+    assert_eq!(overlap.fake.user_count("newcomer"), 1);
+    assert_eq!(
+        overlap.fake.physical_triples("newcomer"),
+        vec![(FAKE_ENTITY_ID, FAKE_TECHNICIAN_ID, true)]
+    );
+    assert_eq!(
+        overlap
+            .fake
+            .request_count("GET", "/apirest.php/search/User"),
+        2 * INITIAL_USER_ABSENCE_LOOKUPS,
+        "the proven rejection is resolved by exactly one further authoritative lookup"
+    );
+
+    overlap.finish().await;
 }
