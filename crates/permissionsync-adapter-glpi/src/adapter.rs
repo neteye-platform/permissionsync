@@ -240,19 +240,16 @@ async fn reconcile_with_session(
     let existing_user_id =
         search::resolve_user_id(config, session, &user_options, username, context).await?;
 
-    let (user_id, mut changed) = match existing_user_id {
-        Some(id) => (id, false),
+    // `effective_mutations` counts mutations GLPI actually confirmed, never
+    // mutations a plan merely intended. Under ADR 0007 a plan is computed from
+    // an observed snapshot that another legitimate reconciliation may already
+    // have invalidated, so `Changed` may only be reported for work this request
+    // provably performed.
+    let (user_id, mut effective_mutations) = match existing_user_id {
+        Some(id) => (id, 0_usize),
         None => {
-            let deadline = effective_deadline(context, config.operation_timeout)?;
-            let id = mutation::create_user(
-                config,
-                session,
-                username,
-                &config.authentication_source,
-                deadline,
-            )
-            .await?;
-            (id, true)
+            create_user_and_resolve_outcome(config, session, &user_options, username, context)
+                .await?
         }
     };
 
@@ -285,14 +282,19 @@ async fn reconcile_with_session(
         })
         .collect::<Result<_, GlpiFailure>>()?;
 
+    // The plan is an advisory calculation from the snapshot above, not an
+    // exclusive transaction. Every removal targets one concrete physical row
+    // id observed in that snapshot, never "whatever now matches this semantic
+    // assignment", so a stale snapshot can never widen a deletion; and every
+    // mutation below must return its exact documented success shape, so a row
+    // another reconciliation removed or replaced fails this request instead of
+    // being reinterpreted as benign.
     let reconciliation_plan = plan::compute(&current, &desired_resolved);
-    if !reconciliation_plan.is_empty() {
-        changed = true;
-    }
 
     for assignment_id in &reconciliation_plan.removals {
         let deadline = effective_deadline(context, config.operation_timeout)?;
         mutation::delete_assignment(config, session, *assignment_id, deadline).await?;
+        effective_mutations += 1;
     }
 
     for addition in &reconciliation_plan.additions {
@@ -307,13 +309,103 @@ async fn reconcile_with_session(
             deadline,
         )
         .await?;
+        effective_mutations += 1;
     }
 
-    if changed {
+    // ADR 0009 final authoritative verification. The pre-mutation snapshot is
+    // deliberately not reused: another legitimate PermissionSync reconciliation
+    // for the same username may have mutated these rows since it was taken, so
+    // only a fresh complete read can establish that this request's canonical
+    // desired state is what the target actually holds. Success therefore means
+    // equality at this observation; it does not promise the state survives it.
+    check_context(context, context.deadline())?;
+    let verified = search::read_current_assignments(
+        config,
+        session,
+        &profile_user_options,
+        username,
+        user_id,
+        context,
+    )
+    .await?;
+    if !plan::is_canonical(&verified, &desired_resolved) {
+        return Err(GlpiFailure::VerificationFailed);
+    }
+
+    if effective_mutations > 0 {
         Ok(ReconciliationOutcome::Changed)
     } else {
         Ok(ReconciliationOutcome::Unchanged)
     }
+}
+
+/// Creates the missing synchronized user, then proves the account it created is
+/// the one that now answers the exact username.
+///
+/// # Why an unconfirmed creation can never be recovered from
+///
+/// Two concurrent reconciliations may both observe the username as absent, and
+/// it is tempting to read a refused creation as proof that the other one won.
+/// The selected GLPI V1 create operation supports no such inference. Its
+/// `createItems` wraps the item's own `add` in a `RuntimeException` catch and
+/// reports a single-item failure as `400` with the add-rejection status code,
+/// but `CommonDBTM::add` inserts the row first and only then runs history
+/// logging, `post_addItem`, cache invalidation, action messages, automatic
+/// infocom work, item hooks and webhooks before returning the new id. For
+/// `User`, `post_addItem` alone performs email synchronization, LDAP group
+/// synchronization and rule application. Anything in that tail — including
+/// deployment plugins and hooks, which are precisely why this distinction
+/// matters — can throw after the insert already happened.
+///
+/// So a failed creation does not prove that no row exists, and a fresh lookup
+/// finding one account cannot say whether this request or another one created
+/// it. Reporting `Changed` would claim an unproven mutation and `Unchanged`
+/// would disown a mutation this request may have performed, so the only honest
+/// answer is failure. ADR 0003 already covers what happens next: there is no
+/// retry, and a later legitimate synchronization observes whatever persisted
+/// and converges from it.
+///
+/// Only the strict creation contract continues: `201` with a valid created id,
+/// followed by one fresh exact lookup returning exactly that same account. The
+/// lookup is what proves this request owns the assignments it is about to
+/// reconcile; it is not a recovery mechanism, and it never runs after an
+/// unconfirmed creation.
+///
+/// This resolves one target mutation inside the same reconciliation. It is not
+/// an automatic retry: the creation is attempted at most once and nothing is
+/// re-run.
+///
+/// Returns the owning user id and how many mutations this request performed.
+async fn create_user_and_resolve_outcome(
+    config: &ValidatedConfig,
+    session: &GlpiSession,
+    user_options: &search::SearchOptions,
+    username: &str,
+    context: &SynchronizationContext<'_>,
+) -> Result<(u64, usize), GlpiFailure> {
+    let deadline = effective_deadline(context, config.operation_timeout)?;
+    // Every creation failure propagates as it stands, so nothing below this
+    // point can run on an ambiguous creation result.
+    let created_id = mutation::create_user(
+        config,
+        session,
+        username,
+        &config.authentication_source,
+        deadline,
+    )
+    .await?;
+
+    let resolved =
+        search::resolve_user_id(config, session, user_options, username, context).await?;
+
+    // Exactly one account must answer the username, and it must be the account
+    // this creation returned. A different account, or none, leaves ownership
+    // unprovable.
+    if resolved != Some(created_id) {
+        return Err(GlpiFailure::UserCreationFailed);
+    }
+
+    Ok((created_id, 1))
 }
 
 async fn resolve_search_options(

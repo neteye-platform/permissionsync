@@ -240,12 +240,30 @@ impl Error for TargetAdapterError {
 }
 
 /// The externally observable result of successful target reconciliation.
+///
+/// Both variants state the same thing about the target: at the adapter's final
+/// authoritative observation before returning, the state it owns exactly
+/// matched this request's desired state. They differ only in whether this
+/// request performed any of the work.
+///
+/// That guarantee is deliberately narrow. Reconciliations may overlap,
+/// including reconciliations of the same identity on the same target, and
+/// PermissionSync orders none of them, so neither variant promises that the
+/// state survives that observation: another legitimate concurrent
+/// reconciliation may change it immediately afterwards. There is no global
+/// ordering and no last-writer-wins rule.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use]
 pub enum ReconciliationOutcome {
-    /// The adapter changed target state to converge on the desired state.
+    /// This reconciliation performed at least one mutation the target confirmed,
+    /// and its final authoritative observation matched its desired state.
     Changed,
-    /// The target was already in the desired state.
+    /// This reconciliation performed no confirmed mutation, and its final
+    /// authoritative observation matched its desired state.
+    ///
+    /// This does not imply the state was already correct when the request
+    /// arrived: a concurrent legitimate reconciliation may have established it
+    /// in the meantime, leaving this request nothing to do.
     Unchanged,
 }
 

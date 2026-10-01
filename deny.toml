@@ -12,14 +12,26 @@ multiple-versions = "deny"
 wildcards = "deny"
 skip = [
   { crate = "core-foundation@0.9.4", reason = "transitive only: system-configuration 0.7.0 (via hickory-resolver) still requires 0.9 while native-tls 0.2.18 (via security-framework 3.7.0) requires 0.10; remove once system-configuration adopts core-foundation 0.10" },
+  { crate = "getrandom@0.3.4", reason = "transitive only: rand 0.9.5 (via metrics-util 0.20.4 and opentelemetry_sdk 0.33.0) still requires getrandom 0.3 while rand 0.10.3 (via hickory-net) and tempfile 3.27.0 use getrandom 0.4; remove once those crates adopt rand 0.10" },
+  { crate = "hashbrown@0.16.1", reason = "transitive only: metrics-util 0.20.4 (via metrics-exporter-prometheus 0.18.3) still requires hashbrown 0.16 while indexmap 2.14.2 uses hashbrown 0.17; remove once metrics-util adopts hashbrown 0.17" },
+  { crate = "r-efi@5.3.0", reason = "transitive only: getrandom 0.3.4 still requires r-efi 5 while getrandom 0.4.3 uses r-efi 6; remove together with the getrandom 0.3 skip above" },
+  { crate = "rand@0.9.5", reason = "transitive only: metrics-util 0.20.4 (via metrics-exporter-prometheus 0.18.3) and opentelemetry_sdk 0.33.0 still require rand 0.9 while hickory-net 0.26.3 uses rand 0.10; remove once both adopt rand 0.10" },
+  { crate = "rand_core@0.9.5", reason = "transitive only: rand 0.9.5 requires rand_core 0.9 while rand 0.10.3 uses rand_core 0.10; remove together with the rand 0.9 skip above" },
   { crate = "syn@2.0.119", reason = "transitive only: openssl-macros, jni-macros, and jni-sys-macros still require syn 2 while async-trait, displaydoc, futures-macro, and serde_derive use syn 3; remove once those proc-macro crates adopt syn 3" },
 ]
 
 [licenses]
 allow = [
   "Apache-2.0",
+  # Required by matchit 0.8.4, the request-path matcher of the ADR-0011-selected
+  # Axum router, whose license expression is "MIT AND BSD-3-Clause" and so
+  # requires both terms.
+  "BSD-3-Clause",
   "MIT",
   "Unicode-3.0",
+  # Required by foldhash 0.2.0, the default hasher of hashbrown 0.16 as used by
+  # metrics-util 0.20.4 behind the ADR-0011-selected Prometheus exporter.
+  "Zlib",
 ]
 confidence-threshold = 0.93
 exceptions = []

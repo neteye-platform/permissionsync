@@ -937,7 +937,10 @@ fn oversized_script() -> Vec<ScriptedResponse> {
         ok(&profile_user_item_body(99, 30, 40, 50, 0)), // 13: item read (not canonical -> plan has work: 1 removal + 1 addition)
         deleted(99),                                    // 14: DELETE Profile_User/99 (removal)
         created(r#"{"id":100,"message":"created"}"#),   // 15: POST Profile_User (addition)
-        ok("true"),                                     // 16: killSession
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(1, &[(100, "jdoe")])), // 16: final search
+        ok(&profile_user_item_body(100, 30, 20, 10, 1)),    // 17: final item read
+        ok("true"),                                         // 18: killSession
     ];
     // Extra trailing entries that must never be consumed in tests that
     // cancel earlier than this point.
@@ -983,7 +986,10 @@ async fn full_reconciliation_creates_the_missing_assignment_and_returns_changed(
         ok(&search_body(1, &[(30, "jdoe", "2")])), // search User
         ok(&profile_user_search_body(0, &[])), // search Profile_User (candidate discovery: none)
         created(r#"{"id":99,"message":"created"}"#), // POST Profile_User
-        ok("true"),                           // killSession
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 1)),
+        ok("true"), // killSession
     ];
 
     let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
@@ -1087,7 +1093,10 @@ async fn desired_entity_selector_resolving_to_root_entity_id_zero_succeeds() {
         ok(&search_body(1, &[(30, "jdoe", "2")])), // search User
         ok(&profile_user_search_body(0, &[])), // search Profile_User (candidate discovery: none)
         created(r#"{"id":99,"message":"created"}"#), // POST Profile_User
-        ok("true"),                           // killSession
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 0, 1)),
+        ok("true"), // killSession
     ];
 
     let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
@@ -1318,6 +1327,9 @@ async fn existing_user_is_unchanged_with_an_explicit_authentication_source() {
         // Item read of that candidate row's raw fields; already the
         // canonical row.
         ok(&profile_user_item_body(99, 30, 20, 10, 1)),
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 1)),
         ok("true"), // killSession
     ];
 
@@ -1466,6 +1478,9 @@ async fn duplicate_desired_permissions_with_already_canonical_current_state_is_u
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 1)),
+        // ADR 0009 final authoritative verification read.
         ok(&profile_user_search_body(1, &[(99, "jdoe")])),
         ok(&profile_user_item_body(99, 30, 20, 10, 1)),
         ok("true"),
@@ -1651,8 +1666,12 @@ async fn missing_user_with_explicit_source_sends_the_exact_authentication_pair()
         ])),
         ok(&search_body(0, &[])), // search User: zero exact matches
         created(r#"{"id":55,"message":"created"}"#), // POST User
+        // The creation outcome is resolved authoritatively before it is used.
+        ok(&search_body(1, &[(55, "jdoe", "2")])),
         ok(&profile_user_search_body(0, &[])), // read_current_assignments: none
-        ok("true"),               // killSession
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(0, &[])),
+        ok("true"), // killSession
     ];
 
     let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
@@ -1694,8 +1713,12 @@ async fn missing_user_with_default_source_omits_authentication_fields() {
         ])),
         ok(&search_body(0, &[])), // search User: zero exact matches
         created(r#"{"id":55,"message":"created"}"#), // POST User
+        // The creation outcome is resolved authoritatively before it is used.
+        ok(&search_body(1, &[(55, "jdoe", "2")])),
         ok(&profile_user_search_body(0, &[])), // read_current_assignments: none
-        ok("true"),               // killSession
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(0, &[])),
+        ok("true"), // killSession
     ];
 
     let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
@@ -1789,6 +1812,10 @@ async fn case_sensitive_lookalike_does_not_count_as_an_exact_user_match() {
         // case-sensitive exact match counts.
         ok(&search_body(1, &[(30, "JDOE", "2")])),
         created(r#"{"id":61,"message":"created"}"#), // POST User: created because "JDOE" != "jdoe"
+        // The creation outcome is resolved authoritatively before it is used.
+        ok(&search_body(1, &[(61, "jdoe", "2")])),
+        ok(&profile_user_search_body(0, &[])),
+        // ADR 0009 final authoritative verification read.
         ok(&profile_user_search_body(0, &[])),
         ok("true"),
     ];
@@ -2001,6 +2028,8 @@ async fn user_lookup_reads_every_page_before_deciding() {
         partial(&page_one),
         partial(&page_two),
         ok(&profile_user_search_body(0, &[])),
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(0, &[])),
         ok("true"),
     ];
 
@@ -2039,16 +2068,25 @@ async fn user_creation_failure_makes_zero_profile_user_mutation_requests() {
         ])),
         ok(&search_body(0, &[])),
         json_response("500 Internal Server Error", "{}"), // POST User fails
-        ok("true"),                                       // killSession still attempted
+        // No authoritative re-resolution follows: no failed creation response
+        // may be recovered from, so reconciliation fails straight away.
+        ok("true"), // killSession still attempted
     ];
 
     let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
     let outcome = reconcile(&adapter, &empty_desired_envelope()).await;
-    server
+    let recorded = server
         .await
         .expect("scripted server completed exactly its script");
 
     assert!(outcome.is_err());
+    for request in &recorded {
+        let (_, path, _) = parsed_request_line(&request.0);
+        assert!(
+            !path.starts_with("/apirest.php/Profile_User"),
+            "a failed user creation must make no Profile_User request: {path}"
+        );
+    }
 }
 
 /// Missing user plus an empty desired state still creates the user and
@@ -2074,6 +2112,10 @@ async fn missing_user_creation_with_empty_desired_state_is_still_changed() {
         ])),
         ok(&search_body(0, &[])),
         created(r#"{"id":70,"message":"created"}"#),
+        // The creation outcome is resolved authoritatively before it is used.
+        ok(&search_body(1, &[(70, "jdoe", "2")])),
+        ok(&profile_user_search_body(0, &[])),
+        // ADR 0009 final authoritative verification read.
         ok(&profile_user_search_body(0, &[])),
         ok("true"),
     ];
@@ -2190,6 +2232,9 @@ async fn nested_looking_entity_completename_resolves_as_one_opaque_exact_match()
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         ok(&profile_user_search_body(0, &[])),
         created(r#"{"id":99,"message":"created"}"#),
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 11, 1)),
         ok("true"),
     ];
 
@@ -2380,6 +2425,8 @@ async fn current_assignment_discovery_reads_every_page_before_planning() {
     for index in 0..50 {
         full_script.push(deleted(2000 + index));
     }
+    // ADR 0009 final authoritative verification read: every row was removed.
+    full_script.push(ok(&profile_user_search_body(0, &[])));
     full_script.push(ok("true")); // killSession
 
     let server = tokio::spawn(run_scripted_server(
@@ -2523,6 +2570,9 @@ async fn zero_entity_search_id_resolves_successfully_as_the_root_entity() {
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         ok(&profile_user_search_body(0, &[])),
         created(r#"{"id":99,"message":"created"}"#),
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 0, 1)),
         ok("true"),
     ];
 
@@ -2723,6 +2773,8 @@ async fn zero_profile_user_raw_entity_id_is_accepted_as_the_glpi_root_entity() {
         ok(&profile_user_search_body(1, &[(99, "jdoe")])),
         ok(&profile_user_item_body(99, 30, 20, 0, 0)),
         deleted(99),
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(0, &[])),
         ok("true"),
     ];
 
@@ -2734,7 +2786,10 @@ async fn zero_profile_user_raw_entity_id_is_accepted_as_the_glpi_root_entity() {
 
     assert_eq!(outcome, ReconciliationOutcome::Changed);
     assert_request(&recorded[8], "DELETE", "/apirest.php/Profile_User/99");
-    assert_request(&recorded[9], "GET", "/apirest.php/killSession");
+    // The final authoritative verification read sits between the removal and
+    // cleanup, so `killSession` is now the eleventh request.
+    assert_request(&recorded[9], "GET", "/apirest.php/search/Profile_User");
+    assert_request(&recorded[10], "GET", "/apirest.php/killSession");
 }
 
 /// Malformed pagination metadata (an empty page while rows remain
@@ -2867,7 +2922,10 @@ async fn desired_true_with_true_and_false_current_rows_removes_only_the_false_ro
         ok(&profile_user_item_body(99, 30, 20, 10, 1)), // canonical: true
         ok(&profile_user_item_body(100, 30, 20, 10, 0)), // opposite: false
         deleted(100),                                   // DELETE Profile_User/100
-        ok("true"),                                     // killSession
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 1)),
+        ok("true"), // killSession
     ];
 
     let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
@@ -2936,6 +2994,9 @@ async fn desired_false_with_duplicate_false_and_true_current_rows_retains_one_fa
         ok(&profile_user_item_body(101, 30, 20, 10, 1)), // wrong-recursive true
         deleted(100),
         deleted(101),
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 0)),
         ok("true"),
     ];
 
@@ -2985,7 +3046,9 @@ async fn undesired_pair_with_mixed_recursive_rows_is_fully_removed() {
         ok(&profile_user_item_body(100, 30, 20, 10, 0)),
         deleted(99),  // DELETE Profile_User/99
         deleted(100), // DELETE Profile_User/100
-        ok("true"),   // killSession
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(0, &[])),
+        ok("true"), // killSession
     ];
 
     let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
@@ -3025,6 +3088,8 @@ async fn removing_an_undesired_assignment_does_not_issue_any_creation_post() {
         ok(&profile_user_search_body(1, &[(99, "jdoe")])),
         ok(&profile_user_item_body(99, 30, 20, 10, 1)),
         deleted(99),
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(0, &[])),
         ok("true"),
     ];
 
@@ -3105,7 +3170,14 @@ async fn all_removals_precede_all_additions_one_mutation_per_request() {
         deleted(2),                                   // DELETE Profile_User/2
         created(r#"{"id":200,"message":"created"}"#), // POST addition (10,20)
         created(r#"{"id":201,"message":"created"}"#), // POST addition (30,40)
-        ok("true"),                                   // killSession
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(
+            2,
+            &[(200, "jdoe"), (201, "jdoe")],
+        )),
+        ok(&profile_user_item_body(200, 50, 20, 10, 1)),
+        ok(&profile_user_item_body(201, 50, 40, 30, 0)),
+        ok("true"), // killSession
     ];
 
     let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
@@ -3274,7 +3346,10 @@ async fn a_later_reconciliation_converges_and_becomes_unchanged() {
         ok(&profile_user_item_body(99, 30, 20, 10, 1)),
         ok(&profile_user_item_body(100, 30, 20, 10, 1)), // exact duplicate
         deleted(100),                                    // DELETE the duplicate
-        ok("true"),                                      // killSession
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 1)),
+        ok("true"), // killSession
     ];
     let server_one = tokio::spawn(run_scripted_server(listener, identity.acceptor, script_one));
     let outcome_one = reconcile(&adapter, &one_permission_envelope())
@@ -3311,6 +3386,9 @@ async fn a_later_reconciliation_converges_and_becomes_unchanged() {
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 1)),
+        // ADR 0009 final authoritative verification read.
         ok(&profile_user_search_body(1, &[(99, "jdoe")])),
         ok(&profile_user_item_body(99, 30, 20, 10, 1)),
         ok("true"),
@@ -3606,6 +3684,8 @@ async fn init_session_and_subsequent_calls_use_the_correct_distinct_headers() {
         ])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         ok(&profile_user_search_body(0, &[])),
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(0, &[])),
         ok("true"),
     ];
 
@@ -3663,6 +3743,8 @@ async fn separate_reconciliations_use_separate_session_tokens() {
                 ("2", "Profile_User.User.name"),
             ])),
             ok(&search_body(1, &[(30, "jdoe", "2")])),
+            ok(&profile_user_search_body(0, &[])),
+            // ADR 0009 final authoritative verification read.
             ok(&profile_user_search_body(0, &[])),
             ok("true"),
         ];
@@ -4104,9 +4186,13 @@ async fn cancellation_before_cleanup_suppresses_kill_session_without_failing() {
     let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
     let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
     let completed = Arc::new(AtomicUsize::new(0));
+    // Completed after the addition (15) and the two requests of the mandatory
+    // ADR 0009 final authoritative verification read (16, 17). Cancellation
+    // observed before that verification would fail the reconciliation instead,
+    // because success may never be reported against an unverified state.
     let cancellation = CancelAfterRequests {
         completed: Arc::clone(&completed),
-        threshold: 15,
+        threshold: 17,
     };
 
     let server = tokio::spawn(run_counted_scripted_server(
@@ -4124,7 +4210,7 @@ async fn cancellation_before_cleanup_suppresses_kill_session_without_failing() {
         ReconciliationOutcome::Changed,
         "cancellation must suppress cleanup without failing an already-successful reconciliation"
     );
-    assert_eq!(completed.load(Ordering::SeqCst), 15);
+    assert_eq!(completed.load(Ordering::SeqCst), 17);
 }
 
 /// Cancellation observed between pages of one paginated `Profile_User`
@@ -4375,11 +4461,12 @@ async fn cancellation_flip_between_cleanup_eligibility_check_and_kill_session_su
     let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
     let adapter = adapter_for(port, identity.trust_anchor_pem.clone());
     let completed = Arc::new(AtomicUsize::new(0));
-    // 15 requests complete the primary reconciliation (see `oversized_script`
-    // comments): the 16th would be `killSession`.
+    // 17 requests complete the primary reconciliation, including the mandatory
+    // ADR 0009 final authoritative verification read (see `oversized_script`
+    // comments): the 18th would be `killSession`.
     let cancellation = CancelOnSecondReadAfterThreshold {
         completed: Arc::clone(&completed),
-        threshold: 15,
+        threshold: 17,
         reads_after_threshold: AtomicUsize::new(0),
     };
 
@@ -4404,7 +4491,7 @@ async fn cancellation_flip_between_cleanup_eligibility_check_and_kill_session_su
     );
     assert_eq!(
         completed.load(Ordering::SeqCst),
-        15,
+        17,
         "killSession must never be sent once cancellation is observed inside the race window \
          between the eligibility check and the pre-kill_session deadline recomputation"
     );
@@ -4607,6 +4694,9 @@ async fn entity_resolution_reads_every_page_before_matching() {
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         ok(&profile_user_search_body(0, &[])),
         created(r#"{"id":99,"message":"created"}"#),
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 1)),
         ok("true"),
     ];
 
@@ -4964,6 +5054,9 @@ async fn profile_resolution_reads_every_page_before_matching() {
         ok(&search_body(1, &[(30, "jdoe", "2")])),
         ok(&profile_user_search_body(0, &[])),
         created(r#"{"id":99,"message":"created"}"#),
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(1, &[(99, "jdoe")])),
+        ok(&profile_user_item_body(99, 30, 20, 10, 1)),
         ok("true"),
     ];
 
@@ -5186,6 +5279,9 @@ async fn reconciliation_after_partial_user_creation_failure_converges_then_becom
         ok(&search_body(1, &[(55, "jdoe", "2")])),
         ok(&profile_user_search_body(0, &[])),
         created(r#"{"id":200,"message":"created"}"#),
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(1, &[(200, "jdoe")])),
+        ok(&profile_user_item_body(200, 55, 20, 10, 1)),
         ok("true"),
     ];
     let server_one = tokio::spawn(run_scripted_server(listener, identity.acceptor, script_one));
@@ -5223,6 +5319,9 @@ async fn reconciliation_after_partial_user_creation_failure_converges_then_becom
         ok(&search_body(1, &[(10, "Root Entity > IT", "2")])),
         ok(&search_body(1, &[(20, "Technician", "2")])),
         ok(&search_body(1, &[(55, "jdoe", "2")])),
+        ok(&profile_user_search_body(1, &[(200, "jdoe")])),
+        ok(&profile_user_item_body(200, 55, 20, 10, 1)),
+        // ADR 0009 final authoritative verification read.
         ok(&profile_user_search_body(1, &[(200, "jdoe")])),
         ok(&profile_user_item_body(200, 55, 20, 10, 1)),
         ok("true"),
@@ -5354,6 +5453,13 @@ async fn reconciliation_after_add_phase_partial_failure_converges_then_becomes_u
         ok(&profile_user_search_body(1, &[(100, "jdoe")])),
         ok(&profile_user_item_body(100, 30, 20, 10, 1)),
         created(r#"{"id":101,"message":"created"}"#), // add missing (11,21)
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(
+            2,
+            &[(100, "jdoe"), (101, "jdoe")],
+        )),
+        ok(&profile_user_item_body(100, 30, 20, 10, 1)),
+        ok(&profile_user_item_body(101, 30, 21, 11, 0)),
         ok("true"),
     ];
     let server_one = tokio::spawn(run_scripted_server(listener, identity.acceptor, script_one));
@@ -5394,6 +5500,13 @@ async fn reconciliation_after_add_phase_partial_failure_converges_then_becomes_u
         )),
         ok(&search_body(1, &[(21, "Read-Only", "2")])),
         ok(&search_body(1, &[(30, "jdoe", "2")])),
+        ok(&profile_user_search_body(
+            2,
+            &[(100, "jdoe"), (101, "jdoe")],
+        )),
+        ok(&profile_user_item_body(100, 30, 20, 10, 1)),
+        ok(&profile_user_item_body(101, 30, 21, 11, 0)),
+        // ADR 0009 final authoritative verification read.
         ok(&profile_user_search_body(
             2,
             &[(100, "jdoe"), (101, "jdoe")],
@@ -5448,11 +5561,16 @@ async fn glpi_default_assignment_after_user_creation_is_cleaned_up() {
         ok(&search_body(1, &[(20, "Technician", "2")])),
         ok(&search_body(0, &[])),                    // search User: absent
         created(r#"{"id":55,"message":"created"}"#), // POST User
+        // The creation outcome is resolved authoritatively before it is used.
+        ok(&search_body(1, &[(55, "jdoe", "2")])),
         ok(&profile_user_search_body(1, &[(200, "jdoe")])), // GLPI created a default row
-        ok(&profile_user_item_body(200, 55, 99, 99, 0)), // an undesired pair
-        deleted(200),                                // the undesired default row is removed
-        created(r#"{"id":201,"message":"created"}"#), // the desired assignment is added
-        ok("true"),                                  // killSession
+        ok(&profile_user_item_body(200, 55, 99, 99, 0)),    // an undesired pair
+        deleted(200),                                       // the undesired default row is removed
+        created(r#"{"id":201,"message":"created"}"#),       // the desired assignment is added
+        // ADR 0009 final authoritative verification read.
+        ok(&profile_user_search_body(1, &[(201, "jdoe")])),
+        ok(&profile_user_item_body(201, 55, 20, 10, 1)),
+        ok("true"), // killSession
     ];
 
     let server = tokio::spawn(run_scripted_server(listener, identity.acceptor, script));
@@ -5479,4 +5597,1369 @@ impl TryAcceptNonblocking for TcpListener {
             Poll::Pending => Err(std::io::ErrorKind::WouldBlock),
         }
     }
+}
+
+// --- Concurrent reconciliation of one synchronized identity -------------------
+//
+// ADR 0007 requires a compliant adapter to tolerate another legitimate
+// PermissionSync reconciliation mutating the same target subject while one
+// reconciliation is running, and ADR 0009 requires the GLPI adapter to finish
+// with a fresh authoritative read before reporting success. The tests below
+// exercise that against a stateful fake GLPI that really holds the
+// `Profile_User` rows, so two concurrent reconciliations interfere exactly as
+// they would against a real backend.
+//
+// Every interleaving is forced with explicit channels. The fake computes or
+// applies each request's effect, then optionally parks that request at a
+// registered gate until the test releases it, so the test — not the scheduler —
+// decides the order. Nothing sleeps, and the two reconciliations are told apart
+// by their configured `App-Token`, never by arrival order.
+
+/// One physical `Profile_User` row held by the stateful fake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FakeAssignment {
+    id: u64,
+    users_id: u64,
+    profiles_id: u64,
+    entities_id: u64,
+    is_recursive: bool,
+}
+
+const FAKE_ENTITY_ID: u64 = 10;
+const FAKE_ENTITY_NAME: &str = "Root Entity > IT";
+const FAKE_TECHNICIAN_ID: u64 = 20;
+const FAKE_READ_ONLY_ID: u64 = 21;
+
+/// The mutable target state the fake GLPI serves.
+struct FakeState {
+    users: Vec<(u64, String)>,
+    assignments: Vec<FakeAssignment>,
+    next_id: u64,
+    /// Whether the fake refuses a second `User` with an existing exact login.
+    ///
+    /// GLPI 11.0.9 carries `UNIQUE KEY unicityloginauth (name, authtype,
+    /// auths_id)` on `glpi_users`, so a real backend does refuse one. The
+    /// adapter nevertheless relies on no uniqueness guarantee, and both
+    /// settings are exercised.
+    reject_duplicate_user_names: bool,
+    /// How the fake answers a `POST /User` that it accepts.
+    user_creation_response: UserCreationResponse,
+    /// An exact `(status line, body)` every `POST /User` answers with instead of
+    /// creating anything.
+    user_creation_failure: Option<(&'static str, &'static str)>,
+    /// Logins the `User` search hides, so the adapter believes an existing
+    /// account is absent and attempts to create it.
+    hidden_users: Vec<String>,
+}
+
+/// How the stateful fake answers an accepted `POST /User`.
+///
+/// Both failure shapes insert the user first, which is exactly the GLPI 11.0.9
+/// ambiguity: `CommonDBTM::add` inserts the row before its post-add tail runs,
+/// and anything in that tail can throw, after which `createItems` reports a
+/// failure for a user that nevertheless exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UserCreationResponse {
+    /// GLPI's documented creation contract: `201` with `{"id":…,"message":…}`.
+    Contract,
+    /// `201` after really inserting the user, but with a body that does not
+    /// satisfy the creation contract.
+    MalformedSuccessBody,
+    /// `400` with GLPI's add-rejection body after really inserting the user.
+    AddRejectionAfterInsert,
+}
+
+impl FakeState {
+    fn new(users: &[(u64, &str)], assignments: &[FakeAssignment]) -> Self {
+        let next_id = assignments
+            .iter()
+            .map(|assignment| assignment.id)
+            .chain(users.iter().map(|(id, _)| *id))
+            .max()
+            .unwrap_or(0)
+            + 1000;
+        Self {
+            users: users
+                .iter()
+                .map(|(id, name)| (*id, (*name).to_owned()))
+                .collect(),
+            assignments: assignments.to_vec(),
+            next_id,
+            reject_duplicate_user_names: true,
+            user_creation_response: UserCreationResponse::Contract,
+            user_creation_failure: None,
+            hidden_users: Vec::new(),
+        }
+    }
+
+    fn take_id(&mut self) -> u64 {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    fn user_id(&self, name: &str) -> Option<u64> {
+        self.users
+            .iter()
+            .find(|(_, user)| user == name)
+            .map(|(id, _)| *id)
+    }
+
+    fn rows_for(&self, name: &str) -> Vec<FakeAssignment> {
+        let ids: Vec<u64> = self
+            .users
+            .iter()
+            .filter(|(_, user)| user == name)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut rows: Vec<FakeAssignment> = self
+            .assignments
+            .iter()
+            .copied()
+            .filter(|assignment| ids.contains(&assignment.users_id))
+            .collect();
+        rows.sort_by_key(|assignment| assignment.id);
+        rows
+    }
+
+    /// The canonical `(entities_id, profiles_id, is_recursive)` triples a
+    /// username's physical rows represent, one entry per physical row, so a
+    /// duplicate row is visible as a repeated entry.
+    fn physical_triples(&self, name: &str) -> Vec<(u64, u64, bool)> {
+        self.rows_for(name)
+            .into_iter()
+            .map(|assignment| {
+                (
+                    assignment.entities_id,
+                    assignment.profiles_id,
+                    assignment.is_recursive,
+                )
+            })
+            .collect()
+    }
+}
+
+/// A one-shot interleaving gate: the fake parks one matching request until the
+/// test releases it.
+struct FakeGate {
+    /// The `App-Token` of the reconciliation this gate applies to.
+    app_token: String,
+    method: &'static str,
+    path: String,
+    /// Which matching request to park, counting from one.
+    occurrence: usize,
+    seen: usize,
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    release: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Registers a gate and returns the handles that observe and release it.
+struct GateHandle {
+    reached: tokio::sync::mpsc::UnboundedReceiver<()>,
+    release: tokio::sync::watch::Sender<bool>,
+}
+
+impl GateHandle {
+    /// Waits until the fake has parked the gated request.
+    async fn reached(&mut self) {
+        await_fake_server_step("a gated GLPI request to be parked", self.reached.recv())
+            .await
+            .expect("the fake server holds the gate sender");
+    }
+
+    fn release(&self) {
+        self.release.send(true).expect("the gate is still parked");
+    }
+}
+
+#[derive(Clone)]
+struct FakeGlpi {
+    state: Arc<std::sync::Mutex<FakeState>>,
+    gates: Arc<std::sync::Mutex<Vec<FakeGate>>>,
+    /// Every `(method, path)` the fake served, so a test can assert that a
+    /// request was never made at all.
+    served: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+}
+
+impl FakeGlpi {
+    fn new(users: &[(u64, &str)], assignments: &[FakeAssignment]) -> Self {
+        Self {
+            state: Arc::new(std::sync::Mutex::new(FakeState::new(users, assignments))),
+            gates: Arc::new(std::sync::Mutex::new(Vec::new())),
+            served: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn with_duplicate_user_names_allowed(self) -> Self {
+        self.state.lock().unwrap().reject_duplicate_user_names = false;
+        self
+    }
+
+    /// Makes an accepted `POST /User` really insert the user and then answer
+    /// `201` with a body that breaks the creation contract.
+    fn with_malformed_user_creation_response(self) -> Self {
+        self.state.lock().unwrap().user_creation_response =
+            UserCreationResponse::MalformedSuccessBody;
+        self
+    }
+
+    /// Makes an accepted `POST /User` really insert the user and then answer
+    /// GLPI's add rejection, modelling a throw from the post-add tail.
+    fn with_add_rejection_after_insert(self) -> Self {
+        self.state.lock().unwrap().user_creation_response =
+            UserCreationResponse::AddRejectionAfterInsert;
+        self
+    }
+
+    /// Makes every `POST /User` answer exactly this response and create nothing.
+    fn with_user_creation_failure(self, status_line: &'static str, body: &'static str) -> Self {
+        self.state.lock().unwrap().user_creation_failure = Some((status_line, body));
+        self
+    }
+
+    /// Hides one existing login from the `User` search, so the adapter believes
+    /// it is absent and attempts the creation that GLPI then rejects.
+    fn with_hidden_user(self, username: &str) -> Self {
+        self.state
+            .lock()
+            .unwrap()
+            .hidden_users
+            .push(username.to_owned());
+        self
+    }
+
+    /// Whether any request with this method and path was served.
+    fn saw_request(&self, method: &str, path: &str) -> bool {
+        self.request_count(method, path) > 0
+    }
+
+    /// How many requests with this method and path were served.
+    fn request_count(&self, method: &str, path: &str) -> usize {
+        self.served
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(served_method, served_path)| served_method == method && served_path == path)
+            .count()
+    }
+
+    /// Parks the `occurrence`-th matching request of one reconciliation until
+    /// the returned handle releases it. The request's effect is already
+    /// computed or applied when it parks, so a gated read has taken its
+    /// snapshot and a gated mutation has been performed.
+    fn gate(
+        &self,
+        app_token: &str,
+        method: &'static str,
+        path: &str,
+        occurrence: usize,
+    ) -> GateHandle {
+        let (reached_sender, reached) = tokio::sync::mpsc::unbounded_channel();
+        let (release, release_receiver) = tokio::sync::watch::channel(false);
+        self.gates.lock().unwrap().push(FakeGate {
+            app_token: app_token.to_owned(),
+            method,
+            path: path.to_owned(),
+            occurrence,
+            seen: 0,
+            reached: reached_sender,
+            release: release_receiver,
+        });
+        GateHandle { reached, release }
+    }
+
+    fn physical_triples(&self, name: &str) -> Vec<(u64, u64, bool)> {
+        self.state.lock().unwrap().physical_triples(name)
+    }
+
+    fn user_count(&self, name: &str) -> usize {
+        let state = self.state.lock().unwrap();
+        state.users.iter().filter(|(_, user)| user == name).count()
+    }
+
+    /// Adds one physical row directly, modelling a concurrent effect the test
+    /// does not need a second reconciliation to produce.
+    fn insert_row(&self, users_id: u64, profiles_id: u64, entities_id: u64, is_recursive: bool) {
+        let mut state = self.state.lock().unwrap();
+        let id = state.take_id();
+        state.assignments.push(FakeAssignment {
+            id,
+            users_id,
+            profiles_id,
+            entities_id,
+            is_recursive,
+        });
+    }
+
+    /// Computes the response for one request, applying any mutation it carries.
+    ///
+    /// `deleted_user_search` is the `is_deleted=1` User lookup the adapter uses
+    /// to prove absence: the fake holds no deleted accounts, so it answers zero
+    /// results, exactly as the scripted fake does.
+    fn respond(
+        &self,
+        method: &str,
+        path: &str,
+        deleted_user_search: bool,
+        body: &[u8],
+    ) -> (&'static str, String) {
+        self.served
+            .lock()
+            .unwrap()
+            .push((method.to_owned(), path.to_owned()));
+        let mut state = self.state.lock().unwrap();
+
+        if path == "/apirest.php/initSession" {
+            return ("200 OK", r#"{"session_token": "fake-session"}"#.to_owned());
+        }
+        if path == "/apirest.php/changeActiveEntities" || path == "/apirest.php/killSession" {
+            return ("200 OK", "true".to_owned());
+        }
+        if path == "/apirest.php/getFullSession" {
+            return ("200 OK", full_session_body(1));
+        }
+        if let Some(itemtype) = path.strip_prefix("/apirest.php/listSearchOptions/") {
+            let entries: &[(&str, &str)] = match itemtype {
+                "Entity" => &[("1", "Entity.id"), ("2", "Entity.completename")],
+                "Profile" => &[("1", "Profile.id"), ("2", "Profile.name")],
+                "User" => &[("1", "User.id"), ("2", "User.name")],
+                "Profile_User" => &[("1", "Profile_User.id"), ("2", "Profile_User.User.name")],
+                other => panic!("unexpected listSearchOptions itemtype {other}"),
+            };
+            return ("200 OK", search_options_body(entries));
+        }
+        if path == "/apirest.php/search/Entity" {
+            return (
+                "200 OK",
+                search_body(1, &[(FAKE_ENTITY_ID, FAKE_ENTITY_NAME, "2")]),
+            );
+        }
+        if path == "/apirest.php/search/Profile" {
+            return (
+                "200 OK",
+                search_body(
+                    2,
+                    &[
+                        (FAKE_TECHNICIAN_ID, "Technician", "2"),
+                        (FAKE_READ_ONLY_ID, "Read-Only", "2"),
+                    ],
+                ),
+            );
+        }
+        if path == "/apirest.php/search/User" {
+            if deleted_user_search {
+                return ("200 OK", search_body(0, &[]));
+            }
+            let rows: Vec<(u64, &str, &str)> = state
+                .users
+                .iter()
+                .filter(|(_, name)| !state.hidden_users.contains(name))
+                .map(|(id, name)| (*id, name.as_str(), "2"))
+                .collect();
+            return ("200 OK", search_body(rows.len() as u64, &rows));
+        }
+        if path == "/apirest.php/search/Profile_User" {
+            let mut rows: Vec<(u64, &str)> = Vec::new();
+            let assignments = state.assignments.clone();
+            for assignment in &assignments {
+                if let Some((_, name)) = state
+                    .users
+                    .iter()
+                    .find(|(id, _)| *id == assignment.users_id)
+                {
+                    rows.push((assignment.id, name.as_str()));
+                }
+            }
+            rows.sort_by_key(|(id, _)| *id);
+            return ("200 OK", profile_user_search_body(rows.len() as u64, &rows));
+        }
+        if let Some(id) = path.strip_prefix("/apirest.php/Profile_User/") {
+            let id: u64 = id.parse().expect("a numeric Profile_User id");
+            if method == "DELETE" {
+                let before = state.assignments.len();
+                state.assignments.retain(|assignment| assignment.id != id);
+                if state.assignments.len() == before {
+                    // GLPI cannot delete a row that is no longer there. The
+                    // adapter must treat this as a failure, never as a benign
+                    // concurrent effect it may assume away.
+                    return (
+                        "400 Bad Request",
+                        r#"["ERROR_ITEM_NOT_FOUND","the item was not found"]"#.to_owned(),
+                    );
+                }
+                return ("200 OK", format!(r#"[{{"{id}":true,"message":""}}]"#));
+            }
+            let Some(assignment) = state
+                .assignments
+                .iter()
+                .find(|assignment| assignment.id == id)
+                .copied()
+            else {
+                // A row a stale snapshot still lists but that another
+                // reconciliation has removed. GLPI answers not-found, and the
+                // adapter must fail closed rather than infer anything from it.
+                return (
+                    "400 Bad Request",
+                    r#"["ERROR_ITEM_NOT_FOUND","the item was not found"]"#.to_owned(),
+                );
+            };
+            return (
+                "200 OK",
+                profile_user_item_body(
+                    assignment.id,
+                    assignment.users_id,
+                    assignment.profiles_id,
+                    assignment.entities_id,
+                    u64::from(assignment.is_recursive),
+                ),
+            );
+        }
+        if path == "/apirest.php/User" && method == "POST" {
+            if let Some((status_line, failure_body)) = state.user_creation_failure {
+                return (status_line, failure_body.to_owned());
+            }
+            let parsed: serde_json::Value =
+                serde_json::from_slice(body).expect("a JSON User creation body");
+            let name = parsed["input"]["name"]
+                .as_str()
+                .expect("the creation body names the user")
+                .to_owned();
+            if state.reject_duplicate_user_names && state.hidden_users.contains(&name) {
+                // The account exists but was hidden from the lookup, so GLPI's
+                // own uniqueness constraint refuses the creation. The login
+                // becomes visible, which is what a re-resolution would find —
+                // and the adapter must still not perform one.
+                state.hidden_users.retain(|hidden| hidden != &name);
+                return (
+                    "400 Bad Request",
+                    r#"["ERROR_GLPI_ADD","the login already exists"]"#.to_owned(),
+                );
+            }
+            if state.reject_duplicate_user_names && state.user_id(&name).is_some() {
+                // GLPI 11.0.9's single-item add rejection: `400` with the
+                // two-element `[status_code, message]` array its `returnError`
+                // writes. Here the uniqueness constraint really did reject the
+                // insert, but the response looks identical to one emitted after
+                // a successful insert whose post-add work then failed, which is
+                // why the adapter may not read it either way.
+                return (
+                    "400 Bad Request",
+                    r#"["ERROR_GLPI_ADD","the login already exists"]"#.to_owned(),
+                );
+            }
+            let id = state.take_id();
+            state.users.push((id, name));
+            // The user really exists from here on, whichever body is returned.
+            return match state.user_creation_response {
+                UserCreationResponse::Contract => {
+                    ("201 Created", format!(r#"{{"id":{id},"message":""}}"#))
+                }
+                UserCreationResponse::MalformedSuccessBody => {
+                    ("201 Created", r#"{"created":true}"#.to_owned())
+                }
+                UserCreationResponse::AddRejectionAfterInsert => (
+                    "400 Bad Request",
+                    r#"["ERROR_GLPI_ADD","post-add work failed"]"#.to_owned(),
+                ),
+            };
+        }
+        if path == "/apirest.php/Profile_User" && method == "POST" {
+            let parsed: serde_json::Value =
+                serde_json::from_slice(body).expect("a JSON Profile_User creation body");
+            let input = &parsed["input"];
+            let id = state.take_id();
+            // Deliberately no uniqueness constraint: a duplicate physical row
+            // is created, exactly as GLPI does, so the adapter's final
+            // verification is what must detect it.
+            state.assignments.push(FakeAssignment {
+                id,
+                users_id: input["users_id"].as_u64().expect("users_id"),
+                profiles_id: input["profiles_id"].as_u64().expect("profiles_id"),
+                entities_id: input["entities_id"].as_u64().expect("entities_id"),
+                is_recursive: input["is_recursive"].as_bool().expect("is_recursive"),
+            });
+            return ("201 Created", format!(r#"{{"id":{id},"message":""}}"#));
+        }
+        panic!("unexpected GLPI request: {method} {path}");
+    }
+
+    /// Returns the release receiver of a gate this request must park at.
+    fn gate_for(
+        &self,
+        app_token: &str,
+        method: &str,
+        path: &str,
+    ) -> Option<tokio::sync::watch::Receiver<bool>> {
+        let mut gates = self.gates.lock().unwrap();
+        for gate in gates.iter_mut() {
+            if gate.app_token == app_token && gate.method == method && gate.path == path {
+                gate.seen += 1;
+                if gate.seen == gate.occurrence {
+                    let _ = gate.reached.send(());
+                    return Some(gate.release.clone());
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Serves the stateful fake until aborted, one request per connection and every
+/// connection concurrently, so two reconciliations really do overlap.
+async fn run_stateful_server(listener: TcpListener, acceptor: TlsAcceptor, fake: FakeGlpi) {
+    loop {
+        let Ok((socket, _)) = listener.accept().await else {
+            return;
+        };
+        let acceptor = acceptor.clone();
+        let fake = fake.clone();
+        tokio::spawn(async move {
+            let Ok(mut stream) = acceptor.accept(socket).await else {
+                return;
+            };
+            let request = read_request(&mut stream).await;
+            assert_outgoing_wire_contract(&request);
+            let (method, path, _) = parsed_request_line(&request.0);
+            let app_token = header_value(&request, "app-token")
+                .expect("every GLPI request carries its App-Token")
+                .to_owned();
+
+            // The effect is computed or applied first, so a parked read holds a
+            // snapshot and a parked mutation has already happened.
+            let deleted_user_search = is_deleted_user_search(&request);
+            let (status_line, body) = fake.respond(&method, &path, deleted_user_search, &request.2);
+            // The `is_deleted=1` absence proof is never a gate target: it shares
+            // its path with the active lookup and carries no state of its own.
+            if let Some(mut release) = (!deleted_user_search)
+                .then(|| fake.gate_for(&app_token, &method, &path))
+                .flatten()
+            {
+                let _ = release.wait_for(|released| *released).await;
+            }
+
+            let head = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut bytes = head.into_bytes();
+            bytes.extend_from_slice(body.as_bytes());
+            let _ = stream.write_all(&bytes).await;
+            let _ = stream.shutdown().await;
+        });
+    }
+}
+
+fn adapter_with_app_token(port: u16, trust_anchor_pem: Vec<u8>, app_token: &str) -> GlpiAdapter {
+    GlpiAdapter::new(GlpiAdapterConfig {
+        endpoint: format!("https://{LOOPBACK_ADDRESS}:{port}/apirest.php"),
+        app_token: GlpiAppToken::new(app_token.to_owned()),
+        user_token: GlpiUserToken::new("user-token".to_owned()),
+        operation_timeout: Duration::from_secs(5),
+        additional_trust_anchors_pem: vec![trust_anchor_pem],
+        authentication_source: GlpiAuthenticationSource::default(),
+    })
+    .expect("valid GLPI adapter configuration")
+}
+
+async fn reconcile_identity(
+    adapter: &GlpiAdapter,
+    username: &str,
+    envelope: &DesiredStateEnvelope,
+) -> Result<ReconciliationOutcome, permissionsync_core::TargetAdapterError> {
+    let identity = IdentityContext::new(username.to_owned(), vec![]);
+    let cancellation = NeverCancelled;
+    let context = SynchronizationContext::new(far_future_deadline(), &cancellation);
+    adapter
+        .reconcile(TargetAdapterRequest::new(&identity, envelope, context))
+        .await
+}
+
+fn technician_envelope(recursive: bool) -> DesiredStateEnvelope {
+    envelope_json(&format!(
+        r#"{{"permissions": [{{"entity": "{FAKE_ENTITY_NAME}", "profile": "Technician", "recursive": {recursive}}}]}}"#
+    ))
+}
+
+fn read_only_envelope() -> DesiredStateEnvelope {
+    envelope_json(&format!(
+        r#"{{"permissions": [{{"entity": "{FAKE_ENTITY_NAME}", "profile": "Read-Only", "recursive": true}}]}}"#
+    ))
+}
+
+/// A concurrency scenario over the stateful fake: two reconciliations
+/// distinguished by their `App-Token`, with the fake served until the test ends.
+struct Overlap {
+    fake: FakeGlpi,
+    /// Shared so one reconciliation can run in its own task while the other
+    /// runs on the test task. `GlpiAdapter` itself stays non-`Clone`.
+    first: Arc<GlpiAdapter>,
+    second: Arc<GlpiAdapter>,
+    server: Option<JoinHandle<()>>,
+}
+
+/// What one `User` absence proof costs in requests: the active lookup plus the
+/// `is_deleted=1` lookup ADR 0009 requires before deciding a login is absent. An
+/// authoritative re-resolution costs the same again.
+const INITIAL_USER_ABSENCE_LOOKUPS: usize = 2;
+
+const FIRST_TOKEN: &str = "app-token-first";
+const SECOND_TOKEN: &str = "app-token-second";
+
+impl Overlap {
+    async fn start(users: &[(u64, &str)], assignments: &[FakeAssignment]) -> Self {
+        Self::with_fake(FakeGlpi::new(users, assignments)).await
+    }
+
+    async fn with_fake(fake: FakeGlpi) -> Self {
+        let listener = bind_loopback_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        let identity = build_test_identity(LOOPBACK_ADDRESS, ROOT_KEY_LABEL, LEAF_KEY_LABEL);
+        let first = Arc::new(adapter_with_app_token(
+            port,
+            identity.trust_anchor_pem.clone(),
+            FIRST_TOKEN,
+        ));
+        let second = Arc::new(adapter_with_app_token(
+            port,
+            identity.trust_anchor_pem.clone(),
+            SECOND_TOKEN,
+        ));
+        let server = tokio::spawn(run_stateful_server(
+            listener,
+            identity.acceptor,
+            fake.clone(),
+        ));
+        Self {
+            fake,
+            first,
+            second,
+            server: Some(server),
+        }
+    }
+
+    async fn finish(mut self) {
+        if let Some(server) = self.server.take() {
+            abort_fake_server(server, "stateful fake server").await;
+        }
+    }
+}
+
+fn assignment(id: u64, users_id: u64, profiles_id: u64, is_recursive: bool) -> FakeAssignment {
+    FakeAssignment {
+        id,
+        users_id,
+        profiles_id,
+        entities_id: FAKE_ENTITY_ID,
+        is_recursive,
+    }
+}
+
+/// Test A — a plan computed from a snapshot another reconciliation has already
+/// invalidated must not be applied as if it were still valid.
+///
+/// The first reconciliation's plan removes the physical row it observed. The
+/// second reconciliation removes that exact row first, so the first
+/// reconciliation's removal targets a row that no longer exists. GLPI cannot
+/// delete it, and the adapter must report that failure rather than assume the
+/// missing row was a benign concurrent effect.
+#[tokio::test]
+async fn a_stale_removal_plan_is_not_applied_as_if_it_were_still_valid() {
+    let overlap = Overlap::start(
+        &[(30, "jdoe")],
+        &[assignment(1, 30, FAKE_TECHNICIAN_ID, false)],
+    )
+    .await;
+    // Park the first reconciliation once its complete snapshot is in hand.
+    let mut gate = overlap
+        .fake
+        .gate(FIRST_TOKEN, "GET", "/apirest.php/Profile_User/1", 1);
+
+    let first = tokio::spawn({
+        let adapter = Arc::clone(&overlap.first);
+        async move { reconcile_identity(&adapter, "jdoe", &technician_envelope(true)).await }
+    });
+    gate.reached().await;
+
+    // The second reconciliation runs to completion against the same row.
+    let second = await_fake_server_step(
+        "the second reconciliation",
+        reconcile_identity(&overlap.second, "jdoe", &technician_envelope(true)),
+    )
+    .await
+    .expect("the uncontended reconciliation succeeds");
+    assert_eq!(second, ReconciliationOutcome::Changed);
+
+    gate.release();
+    let first = await_fake_server_step("the first reconciliation", first)
+        .await
+        .expect("the first reconciliation task must not panic");
+    assert!(
+        first.is_err(),
+        "a removal of a row another reconciliation already removed must fail, not succeed"
+    );
+
+    // No rollback and no retry: the second reconciliation's canonical row is
+    // exactly what remains.
+    assert_eq!(
+        overlap.fake.physical_triples("jdoe"),
+        vec![(FAKE_ENTITY_ID, FAKE_TECHNICIAN_ID, true)]
+    );
+    overlap.finish().await;
+}
+
+/// Test B — the final authoritative read detects a conflicting desired state.
+///
+/// The first reconciliation's own mutation succeeds, and the second
+/// reconciliation then legitimately establishes a different desired state. The
+/// first reconciliation must fail rather than report `Changed`, because its
+/// desired state is not what the target holds at its final observation. The
+/// test deliberately asserts nothing about which request "wins".
+#[tokio::test]
+async fn final_verification_detects_a_conflicting_concurrent_desired_state() {
+    let overlap = Overlap::start(&[(30, "jdoe")], &[]).await;
+    // Park the first reconciliation right after its own addition was applied.
+    let mut gate = overlap
+        .fake
+        .gate(FIRST_TOKEN, "POST", "/apirest.php/Profile_User", 1);
+
+    let first = tokio::spawn({
+        let adapter = Arc::clone(&overlap.first);
+        async move { reconcile_identity(&adapter, "jdoe", &technician_envelope(true)).await }
+    });
+    gate.reached().await;
+
+    let second = await_fake_server_step(
+        "the second reconciliation",
+        reconcile_identity(&overlap.second, "jdoe", &read_only_envelope()),
+    )
+    .await
+    .expect("the uncontended reconciliation succeeds");
+    assert_eq!(second, ReconciliationOutcome::Changed);
+
+    gate.release();
+    let first = await_fake_server_step("the first reconciliation", first)
+        .await
+        .expect("the first reconciliation task must not panic");
+    assert!(
+        first.is_err(),
+        "a reconciliation whose desired state is not the final authoritative state must fail"
+    );
+    assert_eq!(
+        overlap.fake.physical_triples("jdoe"),
+        vec![(FAKE_ENTITY_ID, FAKE_READ_ONLY_ID, true)],
+        "the other legitimate desired state stands; nothing is rolled back or retried"
+    );
+    overlap.finish().await;
+}
+
+/// Test C — two reconciliations wanting the same assignment set.
+///
+/// GLPI accepts a second physically identical `Profile_User` row, so the
+/// concurrent creations really do produce a noncanonical duplicate. The
+/// reconciliation that observes it must fail; it may not report success against
+/// a state ADR 0009 does not call canonical.
+#[tokio::test]
+async fn concurrent_identical_desired_state_is_not_a_false_success() {
+    let overlap = Overlap::start(&[(30, "jdoe")], &[]).await;
+    let mut gate = overlap
+        .fake
+        .gate(FIRST_TOKEN, "GET", "/apirest.php/search/Profile_User", 1);
+
+    let first = tokio::spawn({
+        let adapter = Arc::clone(&overlap.first);
+        async move { reconcile_identity(&adapter, "jdoe", &technician_envelope(true)).await }
+    });
+    gate.reached().await;
+
+    let second = await_fake_server_step(
+        "the second reconciliation",
+        reconcile_identity(&overlap.second, "jdoe", &technician_envelope(true)),
+    )
+    .await
+    .expect("the uncontended reconciliation succeeds");
+    assert_eq!(second, ReconciliationOutcome::Changed);
+
+    gate.release();
+    let first = await_fake_server_step("the first reconciliation", first)
+        .await
+        .expect("the first reconciliation task must not panic");
+    assert!(
+        first.is_err(),
+        "a duplicate physical row is not the canonical final state, so this must fail"
+    );
+    assert_eq!(
+        overlap.fake.physical_triples("jdoe"),
+        vec![
+            (FAKE_ENTITY_ID, FAKE_TECHNICIAN_ID, true),
+            (FAKE_ENTITY_ID, FAKE_TECHNICIAN_ID, true)
+        ],
+        "both creations really happened, which is exactly why the failure is honest"
+    );
+    overlap.finish().await;
+}
+
+/// Test D — an empty plan may not become `Unchanged` on the strength of an old
+/// snapshot alone.
+///
+/// The first reconciliation observes exactly its desired state, so it performs
+/// no mutation at all. The second reconciliation then empties the assignment
+/// set. The first reconciliation's final authoritative read must catch that.
+#[tokio::test]
+async fn an_empty_plan_does_not_report_unchanged_against_a_stale_snapshot() {
+    let overlap = Overlap::start(
+        &[(30, "jdoe")],
+        &[assignment(1, 30, FAKE_TECHNICIAN_ID, true)],
+    )
+    .await;
+    let mut gate = overlap
+        .fake
+        .gate(FIRST_TOKEN, "GET", "/apirest.php/Profile_User/1", 1);
+
+    let first = tokio::spawn({
+        let adapter = Arc::clone(&overlap.first);
+        async move { reconcile_identity(&adapter, "jdoe", &technician_envelope(true)).await }
+    });
+    gate.reached().await;
+
+    let second = await_fake_server_step(
+        "the second reconciliation",
+        reconcile_identity(&overlap.second, "jdoe", &empty_desired_envelope()),
+    )
+    .await
+    .expect("the uncontended reconciliation succeeds");
+    assert_eq!(second, ReconciliationOutcome::Changed);
+
+    gate.release();
+    let first = await_fake_server_step("the first reconciliation", first)
+        .await
+        .expect("the first reconciliation task must not panic");
+    assert!(
+        first.is_err(),
+        "an empty plan must still be verified against the target, not reported Unchanged"
+    );
+    assert!(overlap.fake.physical_triples("jdoe").is_empty());
+    overlap.finish().await;
+}
+
+/// Test E — a duplicate physical row fails verification even though the
+/// normalized semantic access is identical.
+///
+/// The concurrent effect is injected directly, so the only divergence is the
+/// second physical row: semantically the user has exactly the desired
+/// permission either way, and ADR 0009 still requires exactly one row.
+#[tokio::test]
+async fn final_verification_rejects_a_duplicate_row_with_identical_semantic_access() {
+    let overlap = Overlap::start(
+        &[(30, "jdoe")],
+        &[assignment(1, 30, FAKE_TECHNICIAN_ID, true)],
+    )
+    .await;
+    let mut gate = overlap
+        .fake
+        .gate(FIRST_TOKEN, "GET", "/apirest.php/Profile_User/1", 1);
+
+    let first = tokio::spawn({
+        let adapter = Arc::clone(&overlap.first);
+        async move { reconcile_identity(&adapter, "jdoe", &technician_envelope(true)).await }
+    });
+    gate.reached().await;
+    overlap
+        .fake
+        .insert_row(30, FAKE_TECHNICIAN_ID, FAKE_ENTITY_ID, true);
+    gate.release();
+
+    let first = await_fake_server_step("the first reconciliation", first)
+        .await
+        .expect("the first reconciliation task must not panic");
+    assert!(
+        first.is_err(),
+        "one physical row per desired pair is the contract, whatever the semantics"
+    );
+    overlap.finish().await;
+}
+
+/// Test F — a concurrent recursive-value change is caught by the final
+/// canonical physical comparison.
+#[tokio::test]
+async fn final_verification_checks_the_canonical_recursive_value() {
+    let overlap = Overlap::start(
+        &[(30, "jdoe")],
+        &[assignment(1, 30, FAKE_TECHNICIAN_ID, true)],
+    )
+    .await;
+    let mut gate = overlap
+        .fake
+        .gate(FIRST_TOKEN, "GET", "/apirest.php/Profile_User/1", 1);
+
+    // The first reconciliation wants recursive access and already has it.
+    let first = tokio::spawn({
+        let adapter = Arc::clone(&overlap.first);
+        async move { reconcile_identity(&adapter, "jdoe", &technician_envelope(true)).await }
+    });
+    gate.reached().await;
+
+    // The second reconciliation legitimately wants the non-recursive form.
+    let second = await_fake_server_step(
+        "the second reconciliation",
+        reconcile_identity(&overlap.second, "jdoe", &technician_envelope(false)),
+    )
+    .await
+    .expect("the uncontended reconciliation succeeds");
+    assert_eq!(second, ReconciliationOutcome::Changed);
+
+    gate.release();
+    let first = await_fake_server_step("the first reconciliation", first)
+        .await
+        .expect("the first reconciliation task must not panic");
+    assert!(
+        first.is_err(),
+        "a noncanonical recursive value must fail verification"
+    );
+    assert_eq!(
+        overlap.fake.physical_triples("jdoe"),
+        vec![(FAKE_ENTITY_ID, FAKE_TECHNICIAN_ID, false)]
+    );
+    overlap.finish().await;
+}
+
+/// Test G — reconciliations for unrelated users stay concurrent.
+///
+/// Nothing introduced for concurrency safety may serialize by identity: while
+/// one user's reconciliation is parked mid-flight, another user's must run to
+/// completion.
+#[tokio::test]
+async fn reconciliations_for_unrelated_users_are_not_serialized() {
+    let overlap = Overlap::start(&[(30, "jdoe"), (31, "asmith")], &[]).await;
+    let mut gate = overlap
+        .fake
+        .gate(FIRST_TOKEN, "GET", "/apirest.php/search/Profile_User", 1);
+
+    let first = tokio::spawn({
+        let adapter = Arc::clone(&overlap.first);
+        async move { reconcile_identity(&adapter, "jdoe", &technician_envelope(true)).await }
+    });
+    gate.reached().await;
+
+    // Proven while the other user's reconciliation is provably parked.
+    let second = await_fake_server_step(
+        "the unrelated user's reconciliation",
+        reconcile_identity(&overlap.second, "asmith", &technician_envelope(true)),
+    )
+    .await
+    .expect("an unrelated user must not be blocked");
+    assert_eq!(second, ReconciliationOutcome::Changed);
+
+    gate.release();
+    let first = await_fake_server_step("the first reconciliation", first)
+        .await
+        .expect("the first reconciliation task must not panic")
+        .expect("the parked reconciliation succeeds once released");
+    assert_eq!(first, ReconciliationOutcome::Changed);
+    assert_eq!(
+        overlap.fake.physical_triples("jdoe"),
+        vec![(FAKE_ENTITY_ID, FAKE_TECHNICIAN_ID, true)]
+    );
+    assert_eq!(
+        overlap.fake.physical_triples("asmith"),
+        vec![(FAKE_ENTITY_ID, FAKE_TECHNICIAN_ID, true)]
+    );
+    overlap.finish().await;
+}
+
+/// A genuinely concurrent user creation: the loser must fail closed.
+///
+/// Both reconciliations observe the login as absent, the second creates it, and
+/// GLPI's uniqueness constraint then refuses the first. A fresh lookup would
+/// resolve exactly one account, and it really was another reconciliation that
+/// created it — yet the response cannot distinguish that from a creation of this
+/// request's own that threw after inserting. The adapter therefore performs no
+/// re-resolution and fails, leaving the other request's successful outcome
+/// untouched. ADR 0003's later-convergence model is what repairs this request's
+/// intent, not a retry here.
+#[tokio::test]
+async fn a_refused_concurrent_user_creation_fails_closed_without_re_resolution() {
+    let overlap = Overlap::start(&[], &[]).await;
+    // Park the first reconciliation holding the "absent" user snapshot.
+    let mut gate = overlap
+        .fake
+        .gate(FIRST_TOKEN, "GET", "/apirest.php/search/User", 1);
+
+    let first = tokio::spawn({
+        let adapter = Arc::clone(&overlap.first);
+        async move { reconcile_identity(&adapter, "newcomer", &technician_envelope(true)).await }
+    });
+    gate.reached().await;
+
+    let second = await_fake_server_step(
+        "the second reconciliation",
+        reconcile_identity(&overlap.second, "newcomer", &technician_envelope(true)),
+    )
+    .await
+    .expect("the uncontended reconciliation succeeds");
+    assert_eq!(second, ReconciliationOutcome::Changed);
+
+    gate.release();
+    let first = await_fake_server_step("the first reconciliation", first)
+        .await
+        .expect("the first reconciliation task must not panic");
+    assert!(
+        first.is_err(),
+        "the refused creation is unprovable and must not continue"
+    );
+    assert_eq!(
+        overlap.fake.user_count("newcomer"),
+        1,
+        "exactly one logical user exists, created by the other reconciliation"
+    );
+    // The other reconciliation's verified outcome stands untouched.
+    assert_eq!(
+        overlap.fake.physical_triples("newcomer"),
+        vec![(FAKE_ENTITY_ID, FAKE_TECHNICIAN_ID, true)]
+    );
+
+    overlap.finish().await;
+}
+
+/// A target that does not refuse a duplicate login fails closed instead.
+///
+/// The adapter relies on no GLPI uniqueness guarantee. Where both creations
+/// succeed, two logical users exist, ownership of the assignments is
+/// unprovable, and the reconciliation must fail rather than reconcile one of
+/// them.
+#[tokio::test]
+async fn a_duplicate_login_the_target_accepts_fails_closed() {
+    let overlap =
+        Overlap::with_fake(FakeGlpi::new(&[], &[]).with_duplicate_user_names_allowed()).await;
+    let mut gate = overlap
+        .fake
+        .gate(FIRST_TOKEN, "GET", "/apirest.php/search/User", 1);
+
+    let first = tokio::spawn({
+        let adapter = Arc::clone(&overlap.first);
+        async move { reconcile_identity(&adapter, "newcomer", &empty_desired_envelope()).await }
+    });
+    gate.reached().await;
+
+    let second = await_fake_step_second(&overlap).await;
+    assert_eq!(second, ReconciliationOutcome::Changed);
+
+    gate.release();
+    let first = await_fake_server_step("the first reconciliation", first)
+        .await
+        .expect("the first reconciliation task must not panic");
+    assert!(
+        first.is_err(),
+        "two logical users with the same login make ownership unprovable"
+    );
+    assert_eq!(overlap.fake.user_count("newcomer"), 2);
+    overlap.finish().await;
+}
+
+async fn await_fake_step_second(overlap: &Overlap) -> ReconciliationOutcome {
+    await_fake_server_step(
+        "the second reconciliation",
+        reconcile_identity(&overlap.second, "newcomer", &empty_desired_envelope()),
+    )
+    .await
+    .expect("the uncontended reconciliation succeeds")
+}
+
+// --- Ambiguous missing-user creation results ---------------------------------
+//
+// No failed or rejected GLPI `User` creation response proves that the request
+// left no persistent side effect. The add rejection is ambiguous too: GLPI
+// inserts the row before its post-add work runs, so a throw anywhere in that
+// tail — deployment plugins and hooks included — reports a failed create for a
+// user that already exists.
+//
+// Only the strict confirmed creation contract may continue. Every other result
+// fails closed, performing neither a username re-resolution nor any
+// `Profile_User` work.
+
+/// A `201` whose body breaks the creation contract must fail, even though the
+/// user really was created and a fresh lookup would find exactly one account.
+///
+/// This is the decisive regression: treating every creation failure as a
+/// possible concurrent rejection would let this request re-resolve the login,
+/// find the single account it had itself just created, and report an outcome it
+/// cannot justify — `Unchanged` if it credited the creation to someone else, or
+/// `Changed` on an unproven mutation. The ambiguity is in whether *this*
+/// request performed the mutation, so the only safe answer is failure.
+#[tokio::test]
+async fn a_malformed_successful_user_creation_response_fails_closed() {
+    let fake = FakeGlpi::new(&[], &[]).with_malformed_user_creation_response();
+    let overlap = Overlap::with_fake(fake).await;
+
+    let outcome = await_fake_server_step(
+        "the reconciliation",
+        reconcile_identity(&overlap.first, "newcomer", &technician_envelope(true)),
+    )
+    .await;
+
+    assert!(
+        outcome.is_err(),
+        "an unparsable creation success is an ambiguous mutation result"
+    );
+    // The side effect really happened and a fresh lookup would resolve it, which
+    // is exactly what must not be mistaken for a safe concurrent rejection.
+    assert_eq!(
+        overlap.fake.user_count("newcomer"),
+        1,
+        "the user really was created, so a lookup would find exactly one account"
+    );
+    assert_eq!(
+        overlap
+            .fake
+            .request_count("GET", "/apirest.php/search/User"),
+        INITIAL_USER_ABSENCE_LOOKUPS,
+        "an ambiguous success must not trigger the authoritative re-resolution"
+    );
+    // Nothing was reconciled on top of that ambiguous result.
+    assert!(
+        overlap.fake.physical_triples("newcomer").is_empty(),
+        "no Profile_User mutation may start after an ambiguous creation result"
+    );
+    assert!(
+        !overlap
+            .fake
+            .saw_request("POST", "/apirest.php/Profile_User"),
+        "no Profile_User creation request may be sent at all"
+    );
+    assert!(
+        !overlap
+            .fake
+            .saw_request("GET", "/apirest.php/search/Profile_User"),
+        "reconciliation must stop before it even reads the assignment set"
+    );
+
+    overlap.finish().await;
+}
+
+/// A server error during creation is not a proven rejection either.
+#[tokio::test]
+async fn a_server_error_during_user_creation_fails_closed() {
+    let fake =
+        FakeGlpi::new(&[], &[]).with_user_creation_failure("500 Internal Server Error", "{}");
+    let overlap = Overlap::with_fake(fake).await;
+
+    let outcome = await_fake_server_step(
+        "the reconciliation",
+        reconcile_identity(&overlap.first, "newcomer", &technician_envelope(true)),
+    )
+    .await;
+
+    assert!(outcome.is_err(), "a server error proves nothing");
+    assert_eq!(overlap.fake.user_count("newcomer"), 0);
+    assert_eq!(
+        overlap
+            .fake
+            .request_count("GET", "/apirest.php/search/User"),
+        INITIAL_USER_ABSENCE_LOOKUPS,
+        "no authoritative re-resolution may follow an unproven rejection"
+    );
+    assert!(
+        !overlap
+            .fake
+            .saw_request("GET", "/apirest.php/search/Profile_User"),
+        "no assignment read may follow either"
+    );
+
+    overlap.finish().await;
+}
+
+/// Other `400` creation responses fail closed as well.
+///
+/// No response shape is a recoverable category: whichever status code or body a
+/// rejected create carries, it leaves unknown whether a row was inserted.
+#[tokio::test]
+async fn other_bad_request_creation_responses_fail_closed() {
+    for (label, body) in [
+        (
+            "the multi-item partial-add code",
+            r#"["ERROR_GLPI_PARTIAL_ADD","partial"]"#,
+        ),
+        (
+            "a different documented code",
+            r#"["ERROR_ITEM_NOT_FOUND","missing"]"#,
+        ),
+        ("the generic error code", r#"["ERROR","bad request"]"#),
+        ("a non-array error body", r#"{"message":"bad request"}"#),
+    ] {
+        let fake = FakeGlpi::new(&[], &[]).with_user_creation_failure("400 Bad Request", body);
+        let overlap = Overlap::with_fake(fake).await;
+
+        let outcome = await_fake_server_step(
+            "the reconciliation",
+            reconcile_identity(&overlap.first, "newcomer", &technician_envelope(true)),
+        )
+        .await;
+
+        assert!(outcome.is_err(), "{label} must fail closed");
+        assert_eq!(
+            overlap
+                .fake
+                .request_count("GET", "/apirest.php/search/User"),
+            INITIAL_USER_ABSENCE_LOOKUPS,
+            "{label} must not trigger the authoritative re-resolution"
+        );
+        assert!(
+            !overlap
+                .fake
+                .saw_request("GET", "/apirest.php/search/Profile_User"),
+            "{label} must not enter the recovery path"
+        );
+
+        overlap.finish().await;
+    }
+}
+
+/// The decisive regression: `ERROR_GLPI_ADD` after a real insertion must fail
+/// closed, and must not trigger any re-resolution.
+///
+/// GLPI 11.0.9 inserts the row in `CommonDBTM::add` before running history
+/// logging, `post_addItem`, cache invalidation, hooks and webhooks, and
+/// `createItems` catches a `RuntimeException` from any of that and reports a
+/// single-item failure as `400` with the add-rejection status code. The user
+/// therefore exists while the response says the create failed, so that response
+/// proves nothing about whether a row was inserted — and nothing about which
+/// request inserted it.
+///
+/// Treating it as a proven refusal would make this request continue against an
+/// account it may itself have created, and report an outcome it cannot justify.
+#[tokio::test]
+async fn an_error_glpi_add_after_a_real_user_side_effect_fails_closed() {
+    let overlap =
+        Overlap::with_fake(FakeGlpi::new(&[], &[]).with_add_rejection_after_insert()).await;
+
+    let outcome = await_fake_server_step(
+        "the reconciliation",
+        reconcile_identity(&overlap.first, "newcomer", &technician_envelope(true)),
+    )
+    .await;
+
+    assert!(
+        outcome.is_err(),
+        "an unconfirmed creation must fail, whatever the response says"
+    );
+    // The persistent side effect really exists, which is the whole point: a
+    // fresh lookup would now find exactly one matching account.
+    assert_eq!(
+        overlap.fake.user_count("newcomer"),
+        1,
+        "the user was really inserted before the failure response"
+    );
+    assert_eq!(
+        overlap
+            .fake
+            .request_count("GET", "/apirest.php/search/User"),
+        INITIAL_USER_ABSENCE_LOOKUPS,
+        "no re-resolution may follow an unconfirmed creation"
+    );
+    assert!(
+        !overlap
+            .fake
+            .saw_request("GET", "/apirest.php/search/Profile_User"),
+        "no assignment read may follow an unconfirmed creation"
+    );
+    assert!(
+        !overlap
+            .fake
+            .saw_request("POST", "/apirest.php/Profile_User"),
+        "no assignment mutation may follow an unconfirmed creation"
+    );
+    assert!(overlap.fake.physical_triples("newcomer").is_empty());
+
+    overlap.finish().await;
+}
+
+/// An existing login that the lookup could not see is no exception.
+///
+/// Here the account really does belong to another writer, GLPI answers its own
+/// uniqueness rejection, and one fresh lookup would resolve exactly one
+/// account. The adapter must still fail: the same response shape cannot be told
+/// apart from the one above, where the row came from this very request.
+#[tokio::test]
+async fn an_error_glpi_add_for_an_existing_hidden_login_still_fails_closed() {
+    let overlap = Overlap::with_fake(
+        FakeGlpi::new(
+            &[(30, "newcomer")],
+            &[assignment(1, 30, FAKE_TECHNICIAN_ID, true)],
+        )
+        .with_hidden_user("newcomer"),
+    )
+    .await;
+
+    let outcome = await_fake_server_step(
+        "the reconciliation",
+        reconcile_identity(&overlap.first, "newcomer", &technician_envelope(true)),
+    )
+    .await;
+
+    assert!(
+        outcome.is_err(),
+        "a rejection must not be read as another reconciliation having created the account"
+    );
+    assert_eq!(
+        overlap
+            .fake
+            .request_count("GET", "/apirest.php/search/User"),
+        INITIAL_USER_ABSENCE_LOOKUPS,
+        "no re-resolution may follow the rejection"
+    );
+    assert!(
+        !overlap
+            .fake
+            .saw_request("GET", "/apirest.php/search/Profile_User"),
+        "no assignment work may follow the rejection"
+    );
+    // The other writer's state is left exactly as it was: no rollback, no
+    // convergence attempt, and nothing for this request to claim.
+    assert_eq!(
+        overlap.fake.physical_triples("newcomer"),
+        vec![(FAKE_ENTITY_ID, FAKE_TECHNICIAN_ID, true)]
+    );
+
+    overlap.finish().await;
+}
+
+/// A confirmed `201` whose fresh lookup resolves a different account fails too.
+///
+/// The creation contract alone is not enough: the lookup must prove that the
+/// account now answering the username is the one this request created.
+#[tokio::test]
+async fn a_confirmed_creation_whose_lookup_resolves_another_account_fails_closed() {
+    let overlap =
+        Overlap::with_fake(FakeGlpi::new(&[], &[]).with_duplicate_user_names_allowed()).await;
+    // Park the first reconciliation holding the "absent" user snapshot, so both
+    // reconciliations go on to create the same login.
+    let mut gate = overlap
+        .fake
+        .gate(FIRST_TOKEN, "GET", "/apirest.php/search/User", 1);
+
+    let first = tokio::spawn({
+        let adapter = Arc::clone(&overlap.first);
+        async move { reconcile_identity(&adapter, "newcomer", &technician_envelope(true)).await }
+    });
+    gate.reached().await;
+
+    let second = await_fake_server_step(
+        "the second reconciliation",
+        reconcile_identity(&overlap.second, "newcomer", &technician_envelope(true)),
+    )
+    .await
+    .expect("the uncontended reconciliation succeeds");
+    assert_eq!(second, ReconciliationOutcome::Changed);
+
+    // The first reconciliation's own creation is confirmed, but the login now
+    // resolves to two accounts, so it cannot prove it owns the assignments.
+    gate.release();
+    let first = await_fake_server_step("the first reconciliation", first)
+        .await
+        .expect("the first reconciliation task must not panic");
+    assert!(
+        first.is_err(),
+        "a confirmed creation whose login no longer resolves uniquely must fail"
+    );
+    assert_eq!(overlap.fake.user_count("newcomer"), 2);
+
+    overlap.finish().await;
 }

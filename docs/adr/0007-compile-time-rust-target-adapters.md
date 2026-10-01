@@ -131,6 +131,70 @@ unchanged (`unchanged`) without exposing exactly what resource was created or
 modified. One reconciliation may make multiple target calls; there is no
 automatic retry or rollback.
 
+#### Concurrency-aware reconciliation
+
+Adapter reconciliation runs under a bounded process-wide synchronization
+capacity, but several invocations may overlap, including invocations for the
+same synchronized identity on the same backend, and including invocations
+handled by different replicas. Under
+[ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md)
+PermissionSync assigns them no ordering, and under
+[ADR 0006](0006-runtime-configuration-oci-and-observability.md) it provides no
+identity-level serialization. A compliant Target Adapter is therefore
+concurrency-aware and MUST NOT assume that reading current state, computing a
+plan, and applying that plan runs against an exclusive or stable target
+snapshot. Each compliant adapter:
+
+- MUST tolerate another legitimate reconciliation modifying the same target
+  subject concurrently;
+- MUST NOT rely on process-local exclusivity;
+- MUST NOT require Core to serialize reconciliation by identity;
+- MUST NOT create a distributed lock, shared coordination state, or an implicit
+  requirement for either;
+- MUST treat its current-state read as a snapshot that may become stale
+  immediately, and treat a plan derived from it as an advisory calculation
+  rather than an exclusive transaction;
+- MUST design target mutations so a stale snapshot cannot justify an unsafe
+  assumption, preferring a concrete observed target identity over re-resolving
+  a mutation target from stale data;
+- SHOULD use target-native atomicity, uniqueness, conditional writes, or
+  conflict detection where the target actually provides them, and MUST NOT
+  assume such a mechanism exists;
+- MAY treat an intended operation as already satisfied only where it can prove
+  the intended effect from authoritative target state, and where the target
+  contract proves that interpretation safe;
+- MUST fail closed rather than reinterpret an ambiguous concurrent target
+  result as success, so an ambiguous failure remains a failure;
+- MUST NOT perform rollback or compensating mutations based on a stale
+  snapshot unless the target contract explicitly proves that compensation
+  safe;
+- MUST NOT retry blindly, and MUST still obey the single-attempt, no-automatic-
+  retry contract of ADR 0003;
+- MUST perform an authoritative final-state verification before reporting a
+  successful reconciliation.
+
+That final verification is part of the one adapter reconciliation invocation
+and is not a retry. Its meaning is exact and deliberately narrow: a successful
+`changed` or `unchanged` result means that, at the adapter's final
+authoritative observation before returning success, the target state the
+adapter owns exactly matched that request's desired state. It does not promise
+that the state survives that observation. Another legitimate concurrent
+reconciliation may change it immediately afterwards, which is permitted:
+concurrent requests have no defined global ordering, there is no last-writer-
+wins semantic, successful concurrent requests establish no durable ordering
+relationship with each other, and a response does not freeze target state. A
+later non-concurrent synchronization must still converge the target toward its
+own desired state.
+
+What an adapter MUST NOT do to close that window is introduce coordination
+PermissionSync does not have: identity serialization in Core, a process-local
+lock presented as a cross-replica guarantee, implicit distributed or shared
+coordination, or repeating its work until its own desired state prevails.
+Target-native atomicity, conditional writes, transactions, uniqueness, and
+conflict detection remain allowed and preferred wherever the target contract
+actually provides them, because those are properties of the target rather than
+coordination PermissionSync invents.
+
 Once a request enters the selected-target synchronization path, a successful
 `200` or selected-target `204` requires successful completion of both the
 Provider invocation and selected Target Adapter invocation. Earlier failures may
@@ -318,6 +382,25 @@ converges to the desired state, and produces no duplicate or unintended
 additional effect.
 D. Simulate a downstream timeout/cancellation -> the adapter returns within its
 bounded contract, and no detached or background reconciliation continues.
+
+Because reconciliation is concurrency-aware, every supported adapter must also
+be tested, with deterministic interleavings forced by explicit synchronization
+rather than timing, for at least:
+
+E. A plan computed from a snapshot another legitimate reconciliation has
+already invalidated -> the adapter does not apply or report it as if the
+snapshot still held.
+F. A concurrent reconciliation establishing a different desired state -> the
+final authoritative verification detects it and the reconciliation fails; the
+test asserts no global winner.
+G. A concurrent reconciliation establishing the same desired state -> either the
+target's own proven semantics make the operation safe, or the divergence is
+detected by final verification; no false success against a noncanonical state.
+H. An initially empty plan whose target state changes before the adapter
+returns -> the adapter does not report `unchanged` on the strength of its
+earlier snapshot alone.
+I. Reconciliations for unrelated synchronized identities -> they still progress
+concurrently, proving nothing serialized by identity was introduced.
 
 These tests use deterministic, hermetic fakes and require no real downstream
 service in PR CI. They assume no automatic caller retry and provide no

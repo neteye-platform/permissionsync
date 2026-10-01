@@ -167,6 +167,39 @@ The adapter matches the username exactly against the GLPI `User.name` login and
 fails if lookup returns more than one exact match. It uses a result only when
 exactly one exact match exists.
 
+Two concurrent reconciliations may both observe the username as absent. Because
+the selected GLPI V1 create operation provides no response that PermissionSync
+can use to prove that a failed or rejected create had no persistent effect, only
+a strictly confirmed successful creation may continue.
+
+The selected API reports a single-item create failure with the add-rejection
+status code whenever it observes the create as failed, but the item's own add
+inserts the row before running history logging, post-add work, cache
+invalidation, action messages, automatic infocom work, item hooks and webhooks,
+and any of that tail may fail after the insert already happened. Deployment
+plugins and hooks are part of that tail, which is precisely why the distinction
+matters. The response therefore proves neither that a row exists nor that one
+does not, and a fresh lookup finding one account cannot establish which request
+created it.
+
+A creation is confirmed only by the strict creation-response contract: the
+created-item status with a valid positive created id. After a confirmed
+creation the adapter performs one fresh exact lookup and continues only when
+exactly one matching account exists and its id equals the id that creation
+returned. That lookup proves this request owns the assignments it is about to
+reconcile; it is not a recovery mechanism.
+
+Any unconfirmed creation result is an adapter failure on the existing
+target-local server-side path: the add rejection, any other client or server
+status, a success response that does not satisfy the creation contract, a
+response-body or size failure, a transport failure, cancellation, and deadline
+expiry alike. PermissionSync does not retry, does not re-resolve the username in
+order to continue, does not attempt to infer which concurrent request created
+the account, and starts no assignment reconciliation from that ambiguous result.
+A later legitimate synchronization observes whatever target state persisted and
+converges it under
+[ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md).
+
 GLPI's search `equals` operator is not a strict-string guarantee and is
 paginated. The adapter must retrieve all relevant pages, then perform its own
 exact, case-sensitive string comparison for user, entity, and profile
@@ -183,8 +216,9 @@ preserved username as `name` and only the target-configuration user-provisioning
 fields required for the deployment-selected GLPI authentication source,
 including `authtype` and `auths_id` when needed. Those fields are never
 Provider payload. The adapter never creates a password and does not synchronize
-unrelated user attributes. If creation fails, reconciliation fails, no
-`Profile_User` mutation starts, and there is no automatic retry or fallback.
+unrelated user attributes. Unless creation is confirmed and resolved as the rule
+above requires, reconciliation fails, no `Profile_User` mutation starts, and
+there is no automatic retry or fallback.
 GLPI may apply its own defaults, rules, or dynamic assignment during creation;
 authoritative `Profile_User` reconciliation removes any assignment not desired.
 
@@ -228,6 +262,26 @@ nevertheless owns every `Profile_User` row for the synchronized user. GLPI rules
 LDAP synchronization, or another writer must not concurrently manage those
 assignments.
 
+That restriction is about independent ownership systems — GLPI rules, LDAP
+synchronization, administrators, and other automation acting as another
+authoritative writer of these rows — and it remains a deployment requirement.
+It does not mean PermissionSync reconciliations are serialized with each other.
+Concurrent PermissionSync GLPI reconciliations of the same username ARE
+permitted: [ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md)
+allows repeated legitimate requests to overlap and
+[ADR 0006](0006-runtime-configuration-oci-and-observability.md) provides no
+identity-level serialization across replicas. Each such reconciliation uses its
+own request-scoped GLPI session, the complete `Profile_User` read below is an
+observed snapshot only, another reconciliation may mutate the same rows after
+that read, and removal and addition planning therefore cannot assume
+exclusivity. The GLPI V1 operation set selected below contains no conditional
+write, revision field, entity tag, transactional batch mutation, or uniqueness
+constraint on the assignment tuple that would make the read-plan-write sequence
+exclusive, so the adapter relies on no such mechanism and instead satisfies the
+concurrency requirements of
+[ADR 0007](0007-compile-time-rust-target-adapters.md) through the final
+authoritative verification below.
+
 The canonical final state contains exactly one physical row for every desired
 `(entity, profile)` pair, with `is_recursive` set to its canonical value.
 
@@ -259,12 +313,41 @@ does not start.
 | Plan    | **REMOVE** `Root Entity > Legacy` / `Read-Only` / `false`       |
 | Plan    | **ADD** `Root Entity > IT > Operations` / `Read-Only` / `false` |
 
-The final state is exactly the canonical desired state. Successful reconciliation
-returns `Unchanged` only when the user already existed and its physical
-assignment set already had exactly one canonical row for each desired pair. It
-returns `Changed` when it creates the user or successfully adds or removes an
-assignment. These are the existing `ReconciliationOutcome` values; no GLPI
-detail is returned to the caller.
+Before reporting any successful reconciliation the adapter MUST re-check
+cancellation and the remaining budget and then perform a fresh complete
+authoritative read of the owned `Profile_User` set, with the same completeness
+guarantees the current-state read requires. The pre-mutation snapshot is never
+reused for this. That actual state is canonicalized and interpreted exactly as
+this record defines and compared with this request's canonical resolved desired
+state; success requires exact equality, so the comparison rejects an undesired
+assignment, a missing desired assignment, a duplicate physical row, a mixed or
+noncanonical `is_recursive` value, and every other divergence this record owns.
+Comparing only normalized semantic access is insufficient: exactly one
+canonical physical row per desired pair is the contract.
+
+Success is defined at that observation and not beyond it. A successful
+reconciliation returns `Changed` only when it performed one or more effective
+mutations — a mutation GLPI confirmed with its documented success response,
+namely the missing-user creation, an assignment deletion, or an assignment
+creation — AND its final authoritative observation exactly equals the canonical
+desired assignment set. It returns `Unchanged` only when it performed no
+effective mutation AND that same equality holds. `Changed` is never derived
+from a plan having been non-empty, because a concurrent reconciliation can make
+a planned mutation redundant or impossible before it is issued.
+
+If the final authoritative state does not equal this request's canonical
+desired state, reconciliation is an adapter failure on the existing
+target-local server-side path, which selected-target synchronization reports as
+`500`. The adapter does not retry, does not roll back, and does not attempt to
+win against the concurrent request: another reconciliation may have
+legitimately established another desired state, and that is allowed. This
+sequence also remains possible and acceptable: a reconciliation verifies
+equality, a concurrent reconciliation then mutates the target, and the first
+reconciliation still returns success. Success means equality at the final
+authoritative observation, never durability after it.
+
+These are the existing `ReconciliationOutcome` values; no GLPI detail, and no
+concurrency detail, is returned to the caller.
 
 ### GLPI API and authentication
 
@@ -358,8 +441,25 @@ or retries. At minimum, they must prove:
   with no user creation;
 - a missing user plus an empty desired state is created and finishes with no
   assignments;
-- GLPI-rejected missing-user creation is an adapter failure with no
-  `Profile_User` mutation;
+- every successful reconciliation ends with the fresh complete authoritative
+  read, and a final state that is not exactly the canonical desired state is an
+  adapter failure rather than `Changed` or `Unchanged`;
+- the ADR 0007 concurrency cases, with interleavings forced by explicit
+  synchronization rather than timing: a stale removal plan, a conflicting
+  concurrent desired state, an identical concurrent desired state, an initially
+  empty plan invalidated before return, a duplicate physical row whose
+  normalized semantic access is identical, a concurrent `is_recursive` change,
+  unrelated usernames still reconciling concurrently, and both outcomes of the
+  concurrent missing-user creation;
+- every unconfirmed missing-user creation result is an adapter failure that
+  performs no username re-resolution and no `Profile_User` work at all,
+  including a success response that breaks the creation contract after the user
+  was really inserted, the add rejection after the user was really inserted, the
+  add rejection for a login another writer already owned, and an arbitrary
+  server error;
+- a confirmed creation whose fresh exact lookup returns that same account is
+  allowed to continue, while one that returns a different account, no account,
+  or an ambiguous result fails;
 - failed missing-user creation has no automatic retry or fallback;
 - exact full-path entity resolution and exact profile-name resolution, including
   nested paths, missing and ambiguous references, pagination, lookalike or

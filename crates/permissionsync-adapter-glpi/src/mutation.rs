@@ -186,6 +186,12 @@ pub(crate) async fn create_user(
     )
     .await?;
 
+    // Only the strict creation contract — `201` plus a valid created id —
+    // confirms that this request created the user. Every other result is
+    // ambiguous about whether a row now exists, so none of them is
+    // distinguished here: the selected GLPI V1 create operation offers no
+    // response that proves a failed create left no persistent effect. See
+    // `create_user_and_resolve_outcome` for why that matters.
     if response.status != hyper::StatusCode::CREATED {
         return Err(GlpiFailure::UserCreationFailed);
     }
