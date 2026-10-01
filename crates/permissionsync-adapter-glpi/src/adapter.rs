@@ -339,26 +339,37 @@ async fn reconcile_with_session(
     }
 }
 
-/// Creates the missing synchronized user, then resolves the outcome of that one
-/// creation authoritatively.
+/// Creates the missing synchronized user, then proves the account it created is
+/// the one that now answers the exact username.
+///
+/// # Why an unconfirmed creation can never be recovered from
 ///
 /// Two concurrent reconciliations may both observe the username as absent, and
-/// the ADR 0009 operation set contains no conditional write that would let one
-/// creation win. Exactly two outcomes let reconciliation continue, and both
-/// require a fresh exact lookup to prove that one usable account now exists:
+/// it is tempting to read a refused creation as proof that the other one won.
+/// The selected GLPI V1 create operation supports no such inference. Its
+/// `createItems` wraps the item's own `add` in a `RuntimeException` catch and
+/// reports a single-item failure as `400` with the add-rejection status code,
+/// but `CommonDBTM::add` inserts the row first and only then runs history
+/// logging, `post_addItem`, cache invalidation, action messages, automatic
+/// infocom work, item hooks and webhooks before returning the new id. For
+/// `User`, `post_addItem` alone performs email synchronization, LDAP group
+/// synchronization and rule application. Anything in that tail — including
+/// deployment plugins and hooks, which are precisely why this distinction
+/// matters — can throw after the insert already happened.
 ///
-/// - this request's creation was confirmed by GLPI's strict creation contract
-///   and the lookup returns exactly that account;
-/// - GLPI proved it refused the creation without inserting anything
-///   ([`GlpiFailure::UserCreationRejected`]) and the lookup returns exactly one
-///   account, which another reconciliation created.
+/// So a failed creation does not prove that no row exists, and a fresh lookup
+/// finding one account cannot say whether this request or another one created
+/// it. Reporting `Changed` would claim an unproven mutation and `Unchanged`
+/// would disown a mutation this request may have performed, so the only honest
+/// answer is failure. ADR 0003 already covers what happens next: there is no
+/// retry, and a later legitimate synchronization observes whatever persisted
+/// and converges from it.
 ///
-/// Everything else fails closed, including an ambiguous creation result such as
-/// a `201` whose body does not satisfy the creation contract: GLPI may have
-/// inserted the user, so a lookup finding one account cannot tell whether this
-/// request performed that mutation, and reporting either `Changed` or
-/// `Unchanged` would be a guess. Cancellation, an expired budget, and transport
-/// failures likewise prove nothing about target state and propagate unchanged.
+/// Only the strict creation contract continues: `201` with a valid created id,
+/// followed by one fresh exact lookup returning exactly that same account. The
+/// lookup is what proves this request owns the assignments it is about to
+/// reconcile; it is not a recovery mechanism, and it never runs after an
+/// unconfirmed creation.
 ///
 /// This resolves one target mutation inside the same reconciliation. It is not
 /// an automatic retry: the creation is attempted at most once and nothing is
@@ -373,42 +384,28 @@ async fn create_user_and_resolve_outcome(
     context: &SynchronizationContext<'_>,
 ) -> Result<(u64, usize), GlpiFailure> {
     let deadline = effective_deadline(context, config.operation_timeout)?;
-    let created = match mutation::create_user(
+    // Every creation failure propagates as it stands, so nothing below this
+    // point can run on an ambiguous creation result.
+    let created_id = mutation::create_user(
         config,
         session,
         username,
         &config.authentication_source,
         deadline,
     )
-    .await
-    {
-        Ok(id) => Some(id),
-        // GLPI proved it refused the creation without inserting a row, which is
-        // exactly what a concurrently created login produces. This is the only
-        // failure whose outcome may be resolved by re-reading target state.
-        Err(GlpiFailure::UserCreationRejected) => None,
-        // Every other failure is ambiguous or unrelated and stays a failure: an
-        // unparsable success body, an unexpected status, cancellation, an
-        // expired budget, or a transport failure.
-        Err(other) => return Err(other),
-    };
+    .await?;
 
     let resolved =
         search::resolve_user_id(config, session, user_options, username, context).await?;
 
-    match (created, resolved) {
-        // This request created the one user that now answers the exact lookup,
-        // so it owns the reconciliation and the creation was an effective
-        // mutation GLPI confirmed.
-        (Some(created_id), Some(resolved_id)) if created_id == resolved_id => Ok((created_id, 1)),
-        // The creation was proven refused and exactly one exact user now
-        // exists, so a concurrent reconciliation created it. Continue against
-        // that user without claiming a mutation of this request's own.
-        (None, Some(resolved_id)) => Ok((resolved_id, 0)),
-        // A confirmed creation while a different user answers the exact lookup,
-        // or no user at all: unprovable ownership.
-        (Some(_) | None, _) => Err(GlpiFailure::UserCreationFailed),
+    // Exactly one account must answer the username, and it must be the account
+    // this creation returned. A different account, or none, leaves ownership
+    // unprovable.
+    if resolved != Some(created_id) {
+        return Err(GlpiFailure::UserCreationFailed);
     }
+
+    Ok((created_id, 1))
 }
 
 async fn resolve_search_options(

@@ -167,40 +167,38 @@ The adapter matches the username exactly against the GLPI `User.name` login and
 fails if lookup returns more than one exact match. It uses a result only when
 exactly one exact match exists.
 
-Two concurrent reconciliations may both observe the username as absent, and the
-selected GLPI V1 operation set offers no conditional creation. After attempting
-the missing-user creation the adapter resolves that one attempt's outcome
-authoritatively with a fresh exact lookup, and continues in exactly two cases:
+Two concurrent reconciliations may both observe the username as absent. Because
+the selected GLPI V1 create operation provides no response that PermissionSync
+can use to prove that a failed or rejected create had no persistent effect, only
+a strictly confirmed successful creation may continue.
 
-- GLPI confirmed this request's creation under the strict creation-response
-  contract and the lookup returns exactly that account;
-- GLPI proved it refused the creation without inserting anything and the lookup
-  returns exactly one account, which another reconciliation created.
+The selected API reports a single-item create failure with the add-rejection
+status code whenever it observes the create as failed, but the item's own add
+inserts the row before running history logging, post-add work, cache
+invalidation, action messages, automatic infocom work, item hooks and webhooks,
+and any of that tail may fail after the insert already happened. Deployment
+plugins and hooks are part of that tail, which is precisely why the distinction
+matters. The response therefore proves neither that a row exists nor that one
+does not, and a fresh lookup finding one account cannot establish which request
+created it.
 
-The proof of refusal is a specific machine-readable response, not merely a
-failure: `400` whose body is the two-element `[status_code, message]` array
-carrying the status code for a rejected single-item add. The selected GLPI V1
-API emits that only where the item's own add returned false or the rights check
-refused it, so no row was inserted by this request. The multi-item partial-add
-status code is deliberately not accepted, because this adapter never sends
-multi-item input. Only the status code is inspected; the accompanying
-human-readable message is never parsed, compared, logged, or retained.
+A creation is confirmed only by the strict creation-response contract: the
+created-item status with a valid positive created id. After a confirmed
+creation the adapter performs one fresh exact lookup and continues only when
+exactly one matching account exists and its id equals the id that creation
+returned. That lookup proves this request owns the assignments it is about to
+reconcile; it is not a recovery mechanism.
 
-Every other outcome is unprovable ownership and fails closed, so two logical
-users are never both reconciled: a creation GLPI confirmed while a different
-account answers the exact lookup, more than one exact match, no account at all,
-and — importantly — any ambiguous creation result such as a success response
-that does not satisfy the creation contract. In that last case the account may
-well have been created, so a lookup finding one account cannot establish whether
-this request performed that mutation, and neither `Changed` nor `Unchanged`
-could be justified. A cancellation, expired budget, or transport failure during
-creation likewise proves nothing about target state and is reported as it
-stands.
-
-The adapter therefore depends on no GLPI login-uniqueness guarantee; it depends
-only on being able to tell a proven refusal apart from every other result. This
-resolves one target mutation inside the same reconciliation and is not an
-automatic retry.
+Any unconfirmed creation result is an adapter failure on the existing
+target-local server-side path: the add rejection, any other client or server
+status, a success response that does not satisfy the creation contract, a
+response-body or size failure, a transport failure, cancellation, and deadline
+expiry alike. PermissionSync does not retry, does not re-resolve the username in
+order to continue, does not attempt to infer which concurrent request created
+the account, and starts no assignment reconciliation from that ambiguous result.
+A later legitimate synchronization observes whatever target state persisted and
+converges it under
+[ADR 0003](0003-at-most-once-delivery-and-idempotent-reconciliation.md).
 
 GLPI's search `equals` operator is not a strict-string guarantee and is
 paginated. The adapter must retrieve all relevant pages, then perform its own
@@ -218,10 +216,9 @@ preserved username as `name` and only the target-configuration user-provisioning
 fields required for the deployment-selected GLPI authentication source,
 including `authtype` and `auths_id` when needed. Those fields are never
 Provider payload. The adapter never creates a password and does not synchronize
-unrelated user attributes. If creation fails and the authoritative
-re-resolution above does not prove the one usable account that rule requires,
-reconciliation fails, no `Profile_User` mutation starts, and there is no
-automatic retry or fallback.
+unrelated user attributes. Unless creation is confirmed and resolved as the rule
+above requires, reconciliation fails, no `Profile_User` mutation starts, and
+there is no automatic retry or fallback.
 GLPI may apply its own defaults, rules, or dynamic assignment during creation;
 authoritative `Profile_User` reconciliation removes any assignment not desired.
 
@@ -454,12 +451,15 @@ or retries. At minimum, they must prove:
   normalized semantic access is identical, a concurrent `is_recursive` change,
   unrelated usernames still reconciling concurrently, and both outcomes of the
   concurrent missing-user creation;
-- GLPI-rejected missing-user creation whose authoritative re-resolution still
-  finds no account is an adapter failure with no `Profile_User` mutation;
-- only the proven single-item add rejection enters authoritative re-resolution:
-  a success response that breaks the creation contract, a server error, and a
-  `400` carrying any other status code all fail closed without re-resolving,
-  including when the account does exist and one fresh lookup would find it;
+- every unconfirmed missing-user creation result is an adapter failure that
+  performs no username re-resolution and no `Profile_User` work at all,
+  including a success response that breaks the creation contract after the user
+  was really inserted, the add rejection after the user was really inserted, the
+  add rejection for a login another writer already owned, and an arbitrary
+  server error;
+- a confirmed creation whose fresh exact lookup returns that same account is
+  allowed to continue, while one that returns a different account, no account,
+  or an ambiguous result fails;
 - failed missing-user creation has no automatic retry or fallback;
 - exact full-path entity resolution and exact profile-name resolution, including
   nested paths, missing and ambiguous references, pagination, lookalike or

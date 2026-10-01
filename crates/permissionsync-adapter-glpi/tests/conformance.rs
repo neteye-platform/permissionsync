@@ -5654,17 +5654,20 @@ struct FakeState {
 }
 
 /// How the stateful fake answers an accepted `POST /User`.
+///
+/// Both failure shapes insert the user first, which is exactly the GLPI 11.0.9
+/// ambiguity: `CommonDBTM::add` inserts the row before its post-add tail runs,
+/// and anything in that tail can throw, after which `createItems` reports a
+/// failure for a user that nevertheless exists.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UserCreationResponse {
     /// GLPI's documented creation contract: `201` with `{"id":…,"message":…}`.
     Contract,
     /// `201` after really inserting the user, but with a body that does not
     /// satisfy the creation contract.
-    ///
-    /// This is the ambiguous result the adapter must never reinterpret: the row
-    /// exists, so a fresh lookup finds exactly one account, yet nothing proves
-    /// whether this request created it.
     MalformedSuccessBody,
+    /// `400` with GLPI's add-rejection body after really inserting the user.
+    AddRejectionAfterInsert,
 }
 
 impl FakeState {
@@ -5797,6 +5800,14 @@ impl FakeGlpi {
     fn with_malformed_user_creation_response(self) -> Self {
         self.state.lock().unwrap().user_creation_response =
             UserCreationResponse::MalformedSuccessBody;
+        self
+    }
+
+    /// Makes an accepted `POST /User` really insert the user and then answer
+    /// GLPI's add rejection, modelling a throw from the post-add tail.
+    fn with_add_rejection_after_insert(self) -> Self {
+        self.state.lock().unwrap().user_creation_response =
+            UserCreationResponse::AddRejectionAfterInsert;
         self
     }
 
@@ -6014,9 +6025,10 @@ impl FakeGlpi {
                 .expect("the creation body names the user")
                 .to_owned();
             if state.reject_duplicate_user_names && state.hidden_users.contains(&name) {
-                // The account exists but was hidden from the lookup. GLPI's own
-                // uniqueness constraint refuses the creation, and the login
-                // becomes visible so the authoritative re-resolution finds it.
+                // The account exists but was hidden from the lookup, so GLPI's
+                // own uniqueness constraint refuses the creation. The login
+                // becomes visible, which is what a re-resolution would find —
+                // and the adapter must still not perform one.
                 state.hidden_users.retain(|hidden| hidden != &name);
                 return (
                     "400 Bad Request",
@@ -6043,6 +6055,10 @@ impl FakeGlpi {
                 UserCreationResponse::MalformedSuccessBody => {
                     ("201 Created", r#"{"created":true}"#.to_owned())
                 }
+                UserCreationResponse::AddRejectionAfterInsert => (
+                    "400 Bad Request",
+                    r#"["ERROR_GLPI_ADD","post-add work failed"]"#.to_owned(),
+                ),
             };
         }
         if path == "/apirest.php/Profile_User" && method == "POST" {
@@ -6548,15 +6564,18 @@ async fn reconciliations_for_unrelated_users_are_not_serialized() {
     overlap.finish().await;
 }
 
-/// A refused concurrent user creation is resolved authoritatively inside the
-/// same reconciliation, not retried.
+/// A genuinely concurrent user creation: the loser must fail closed.
 ///
-/// Both reconciliations observe the login as absent. The second creates it; the
-/// first is then refused by GLPI, re-resolves the login exactly once, finds
-/// exactly one exact match, and continues against it. Its desired state already
-/// holds, so it reports `Unchanged` without having mutated anything.
+/// Both reconciliations observe the login as absent, the second creates it, and
+/// GLPI's uniqueness constraint then refuses the first. A fresh lookup would
+/// resolve exactly one account, and it really was another reconciliation that
+/// created it — yet the response cannot distinguish that from a creation of this
+/// request's own that threw after inserting. The adapter therefore performs no
+/// re-resolution and fails, leaving the other request's successful outcome
+/// untouched. ADR 0003's later-convergence model is what repairs this request's
+/// intent, not a retry here.
 #[tokio::test]
-async fn a_refused_concurrent_user_creation_is_resolved_and_reconciliation_continues() {
+async fn a_refused_concurrent_user_creation_fails_closed_without_re_resolution() {
     let overlap = Overlap::start(&[], &[]).await;
     // Park the first reconciliation holding the "absent" user snapshot.
     let mut gate = overlap
@@ -6580,22 +6599,22 @@ async fn a_refused_concurrent_user_creation_is_resolved_and_reconciliation_conti
     gate.release();
     let first = await_fake_server_step("the first reconciliation", first)
         .await
-        .expect("the first reconciliation task must not panic")
-        .expect("a refused creation with one resolvable login must not fail");
-    assert_eq!(
-        first,
-        ReconciliationOutcome::Unchanged,
-        "this request mutated nothing, so its verified success is Unchanged"
+        .expect("the first reconciliation task must not panic");
+    assert!(
+        first.is_err(),
+        "the refused creation is unprovable and must not continue"
     );
     assert_eq!(
         overlap.fake.user_count("newcomer"),
         1,
-        "exactly one logical user may exist"
+        "exactly one logical user exists, created by the other reconciliation"
     );
+    // The other reconciliation's verified outcome stands untouched.
     assert_eq!(
         overlap.fake.physical_triples("newcomer"),
         vec![(FAKE_ENTITY_ID, FAKE_TECHNICIAN_ID, true)]
     );
+
     overlap.finish().await;
 }
 
@@ -6791,16 +6810,73 @@ async fn a_bad_request_that_is_not_the_glpi_add_rejection_fails_closed() {
     }
 }
 
-/// The exact supported rejection does recover, which is what makes the tests
-/// above a real distinction rather than a blanket refusal.
+/// The decisive regression: `ERROR_GLPI_ADD` after a real insertion must fail
+/// closed, and must not trigger any re-resolution.
 ///
-/// The login already exists, GLPI answers its documented add rejection, the
-/// fresh exact lookup resolves one account, and reconciliation continues and
-/// succeeds against it without claiming a mutation of its own.
+/// GLPI 11.0.9 inserts the row in `CommonDBTM::add` before running history
+/// logging, `post_addItem`, cache invalidation, hooks and webhooks, and
+/// `createItems` catches a `RuntimeException` from any of that and reports a
+/// single-item failure as `400` with the add-rejection status code. The user
+/// therefore exists while the response says the create failed, so that response
+/// proves nothing about whether a row was inserted — and nothing about which
+/// request inserted it.
+///
+/// Treating it as a proven refusal would make this request continue against an
+/// account it may itself have created, and report an outcome it cannot justify.
 #[tokio::test]
-async fn the_documented_glpi_add_rejection_recovers_against_one_resolvable_account() {
-    // The account exists but the adapter is told it does not, so it attempts
-    // the creation and receives the proven rejection.
+async fn an_error_glpi_add_after_a_real_user_side_effect_fails_closed() {
+    let overlap =
+        Overlap::with_fake(FakeGlpi::new(&[], &[]).with_add_rejection_after_insert()).await;
+
+    let outcome = await_fake_server_step(
+        "the reconciliation",
+        reconcile_identity(&overlap.first, "newcomer", &technician_envelope(true)),
+    )
+    .await;
+
+    assert!(
+        outcome.is_err(),
+        "an unconfirmed creation must fail, whatever the response says"
+    );
+    // The persistent side effect really exists, which is the whole point: a
+    // fresh lookup would now find exactly one matching account.
+    assert_eq!(
+        overlap.fake.user_count("newcomer"),
+        1,
+        "the user was really inserted before the failure response"
+    );
+    assert_eq!(
+        overlap
+            .fake
+            .request_count("GET", "/apirest.php/search/User"),
+        INITIAL_USER_ABSENCE_LOOKUPS,
+        "no re-resolution may follow an unconfirmed creation"
+    );
+    assert!(
+        !overlap
+            .fake
+            .saw_request("GET", "/apirest.php/search/Profile_User"),
+        "no assignment read may follow an unconfirmed creation"
+    );
+    assert!(
+        !overlap
+            .fake
+            .saw_request("POST", "/apirest.php/Profile_User"),
+        "no assignment mutation may follow an unconfirmed creation"
+    );
+    assert!(overlap.fake.physical_triples("newcomer").is_empty());
+
+    overlap.finish().await;
+}
+
+/// An existing login that the lookup could not see is no exception.
+///
+/// Here the account really does belong to another writer, GLPI answers its own
+/// uniqueness rejection, and one fresh lookup would resolve exactly one
+/// account. The adapter must still fail: the same response shape cannot be told
+/// apart from the one above, where the row came from this very request.
+#[tokio::test]
+async fn an_error_glpi_add_for_an_existing_hidden_login_still_fails_closed() {
     let overlap = Overlap::with_fake(
         FakeGlpi::new(
             &[(30, "newcomer")],
@@ -6814,26 +6890,74 @@ async fn the_documented_glpi_add_rejection_recovers_against_one_resolvable_accou
         "the reconciliation",
         reconcile_identity(&overlap.first, "newcomer", &technician_envelope(true)),
     )
-    .await
-    .expect("a proven rejection with one resolvable account must recover");
+    .await;
 
-    assert_eq!(
-        outcome,
-        ReconciliationOutcome::Unchanged,
-        "this request performed no confirmed mutation of its own"
-    );
-    assert_eq!(overlap.fake.user_count("newcomer"), 1);
-    assert_eq!(
-        overlap.fake.physical_triples("newcomer"),
-        vec![(FAKE_ENTITY_ID, FAKE_TECHNICIAN_ID, true)]
+    assert!(
+        outcome.is_err(),
+        "a rejection must not be read as another reconciliation having created the account"
     );
     assert_eq!(
         overlap
             .fake
             .request_count("GET", "/apirest.php/search/User"),
-        2 * INITIAL_USER_ABSENCE_LOOKUPS,
-        "the proven rejection is resolved by exactly one further authoritative lookup"
+        INITIAL_USER_ABSENCE_LOOKUPS,
+        "no re-resolution may follow the rejection"
     );
+    assert!(
+        !overlap
+            .fake
+            .saw_request("GET", "/apirest.php/search/Profile_User"),
+        "no assignment work may follow the rejection"
+    );
+    // The other writer's state is left exactly as it was: no rollback, no
+    // convergence attempt, and nothing for this request to claim.
+    assert_eq!(
+        overlap.fake.physical_triples("newcomer"),
+        vec![(FAKE_ENTITY_ID, FAKE_TECHNICIAN_ID, true)]
+    );
+
+    overlap.finish().await;
+}
+
+/// A confirmed `201` whose fresh lookup resolves a different account fails too.
+///
+/// The creation contract alone is not enough: the lookup must prove that the
+/// account now answering the username is the one this request created.
+#[tokio::test]
+async fn a_confirmed_creation_whose_lookup_resolves_another_account_fails_closed() {
+    let overlap =
+        Overlap::with_fake(FakeGlpi::new(&[], &[]).with_duplicate_user_names_allowed()).await;
+    // Park the first reconciliation holding the "absent" user snapshot, so both
+    // reconciliations go on to create the same login.
+    let mut gate = overlap
+        .fake
+        .gate(FIRST_TOKEN, "GET", "/apirest.php/search/User", 1);
+
+    let first = tokio::spawn({
+        let adapter = Arc::clone(&overlap.first);
+        async move { reconcile_identity(&adapter, "newcomer", &technician_envelope(true)).await }
+    });
+    gate.reached().await;
+
+    let second = await_fake_server_step(
+        "the second reconciliation",
+        reconcile_identity(&overlap.second, "newcomer", &technician_envelope(true)),
+    )
+    .await
+    .expect("the uncontended reconciliation succeeds");
+    assert_eq!(second, ReconciliationOutcome::Changed);
+
+    // The first reconciliation's own creation is confirmed, but the login now
+    // resolves to two accounts, so it cannot prove it owns the assignments.
+    gate.release();
+    let first = await_fake_server_step("the first reconciliation", first)
+        .await
+        .expect("the first reconciliation task must not panic");
+    assert!(
+        first.is_err(),
+        "a confirmed creation whose login no longer resolves uniquely must fail"
+    );
+    assert_eq!(overlap.fake.user_count("newcomer"), 2);
 
     overlap.finish().await;
 }

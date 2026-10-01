@@ -186,52 +186,17 @@ pub(crate) async fn create_user(
     )
     .await?;
 
-    // Only one response proves GLPI refused the creation without inserting a
-    // row; everything else, a malformed success body included, is an ambiguous
-    // result this adapter must not reinterpret.
-    if response.status == hyper::StatusCode::BAD_REQUEST && rejected_before_creation(&response.body)
-    {
-        return Err(GlpiFailure::UserCreationRejected);
-    }
+    // Only the strict creation contract — `201` plus a valid created id —
+    // confirms that this request created the user. Every other result is
+    // ambiguous about whether a row now exists, so none of them is
+    // distinguished here: the selected GLPI V1 create operation offers no
+    // response that proves a failed create left no persistent effect. See
+    // `create_user_and_resolve_outcome` for why that matters.
     if response.status != hyper::StatusCode::CREATED {
         return Err(GlpiFailure::UserCreationFailed);
     }
 
-    // A `201` whose body does not satisfy the strict creation contract is an
-    // ambiguous mutation result: GLPI may well have inserted the user. It stays
-    // `UserCreationFailed` so it can never reach the concurrent-create recovery
-    // path.
     parse_created_id(&response.body).map_err(|_| GlpiFailure::UserCreationFailed)
-}
-
-/// The GLPI add-rejection status code, which names a create that did not
-/// insert anything.
-const GLPI_ADD_REJECTED_STATUS_CODE: &str = "ERROR_GLPI_ADD";
-
-/// Whether a `400` response body is exactly GLPI's documented single-item
-/// add-rejection.
-///
-/// GLPI 11.0.9 reports a failed single-item creation as
-/// `returnError($message, 400, "ERROR_GLPI_ADD", false)`, which writes the
-/// two-element array `[status_code, message]`. That branch is reached only when
-/// the item's `add()` returned `false` or the rights check refused it, so no row
-/// was inserted by this request. The partial-add code is deliberately not
-/// accepted: it belongs to multi-item input, which this adapter never sends.
-///
-/// Only the machine-readable status code is inspected. The accompanying
-/// human-readable message is never parsed, compared, or retained, because it is
-/// localized GLPI text that may carry target detail.
-fn rejected_before_creation(body: &[u8]) -> bool {
-    let Ok(parsed) = serde_json::from_slice::<Value>(body) else {
-        return false;
-    };
-    let Some(entries) = parsed.as_array() else {
-        return false;
-    };
-    // Exactly `[status_code, message]`, with the message present but unread.
-    entries.len() == 2
-        && entries[0].as_str() == Some(GLPI_ADD_REJECTED_STATUS_CODE)
-        && entries[1].is_string()
 }
 
 /// Creates exactly one `Profile_User` assignment row.
@@ -308,7 +273,7 @@ pub(crate) async fn delete_assignment(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_created_id, parse_deleted_assignment, rejected_before_creation};
+    use super::{parse_created_id, parse_deleted_assignment};
 
     #[test]
     fn creation_response_requires_a_positive_id_and_message() {
@@ -336,42 +301,6 @@ mod tests {
                 .expect("documented extension"),
             42
         );
-    }
-
-    /// Only GLPI's documented single-item add rejection proves that no row was
-    /// inserted. Nothing else may be read that way, so the classifier is
-    /// deliberately exact rather than lenient.
-    #[test]
-    fn only_the_documented_add_rejection_proves_nothing_was_created() {
-        assert!(rejected_before_creation(
-            br#"["ERROR_GLPI_ADD","the login already exists"]"#
-        ));
-        // The message content is never inspected, only its presence and type.
-        assert!(rejected_before_creation(br#"["ERROR_GLPI_ADD",""]"#));
-
-        for body in [
-            // The partial-add code belongs to multi-item input, which this
-            // adapter never sends.
-            br#"["ERROR_GLPI_PARTIAL_ADD","partial"]"#.as_slice(),
-            // Any other documented error code is a different condition.
-            br#"["ERROR_ITEM_NOT_FOUND","missing"]"#.as_slice(),
-            br#"["ERROR","bad request"]"#.as_slice(),
-            // Shapes that are not the two-element error array at all.
-            br#"["ERROR_GLPI_ADD"]"#.as_slice(),
-            br#"["ERROR_GLPI_ADD","message","extra"]"#.as_slice(),
-            br#"["ERROR_GLPI_ADD",null]"#.as_slice(),
-            br#"["ERROR_GLPI_ADD",{"message":"object"}]"#.as_slice(),
-            br#"{"0":"ERROR_GLPI_ADD","1":"message"}"#.as_slice(),
-            br#""ERROR_GLPI_ADD""#.as_slice(),
-            br#"[]"#.as_slice(),
-            b"not json".as_slice(),
-            b"".as_slice(),
-        ] {
-            assert!(
-                !rejected_before_creation(body),
-                "must not be read as a proven rejection: {body:?}"
-            );
-        }
     }
 
     #[test]
