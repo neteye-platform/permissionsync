@@ -22,6 +22,11 @@
 //! parks on `permits` and is woken as soon as a permit frees, so a legitimate
 //! waiter can still proceed inside its own budget.
 //!
+//! Holding a permit is not yet admission: every acquisition, immediate or
+//! awaited, is finalized by [`InboundAdmission::finalize`], which re-reads the
+//! lifecycle and the request's deadline and releases the permit rather than
+//! admitting a request once shutdown has begun.
+//!
 //! A request that obtains neither is refused immediately. It is never parked,
 //! never sleeps to its deadline, and never occupies any other application
 //! waiting area, so saturation cannot create a second population outside these
@@ -178,6 +183,29 @@ impl InboundAdmission {
         self.waiters.available_permits()
     }
 
+    /// Test-only raw permit acquisition, bypassing the admission decision.
+    ///
+    /// It exists so a test can hold a permit the way both acquisition paths do
+    /// just before [`Self::finalize`] runs, and then drive that decision
+    /// directly instead of trying to reproduce the race with timing.
+    #[cfg(test)]
+    pub(crate) fn acquire_permit_for_test(&self) -> OwnedSemaphorePermit {
+        Arc::clone(&self.permits)
+            .try_acquire_owned()
+            .expect("a free permit")
+    }
+
+    /// Test-only access to the shared admission decision.
+    #[cfg(test)]
+    pub(crate) fn finalize_for_test(
+        &self,
+        permit: OwnedSemaphorePermit,
+        deadline: Instant,
+        lifecycle: &Lifecycle,
+    ) -> Admission {
+        self.finalize(permit, deadline, lifecycle)
+    }
+
     /// Subscribes to the test-only observation of the bounded populations.
     ///
     /// Tests use this to establish, structurally rather than by timing, that a
@@ -211,7 +239,7 @@ impl InboundAdmission {
 
         let permits = Arc::clone(&self.permits);
         if let Ok(permit) = permits.clone().try_acquire_owned() {
-            return Admission::Admitted(self.admitted(permit));
+            return self.finalize(permit, deadline, lifecycle);
         }
 
         counter!(ADMISSION_SATURATED_TOTAL).increment(1);
@@ -241,12 +269,45 @@ impl InboundAdmission {
         drop(waiter_slot);
 
         match admitted {
-            Some(permit) => Admission::Admitted(self.admitted(permit)),
+            Some(permit) => self.finalize(permit, deadline, lifecycle),
             None => {
                 counter!(ADMISSION_ABANDONED_TOTAL).increment(1);
                 Admission::NotAdmitted
             }
         }
+    }
+
+    /// Decides whether an already-acquired permit may actually admit its
+    /// request, and releases it if not.
+    ///
+    /// Acquiring a permit is not the admission decision, because shutdown can
+    /// begin between the check that found the process serving and the
+    /// acquisition that followed it. Both acquisition paths therefore end here,
+    /// and this lifecycle read is the admission linearization point: observing
+    /// serving state orders this admission before any later
+    /// [`Lifecycle::begin_shutdown`] store, and observing shutdown releases the
+    /// permit instead. Because `shutting_down` is stored and loaded with
+    /// `SeqCst`, those two outcomes are the only ones possible.
+    ///
+    /// The request's own absolute deadline is re-checked for the same reason:
+    /// it may have expired while the permit was being obtained. Neither
+    /// rejection enters the in-flight gauge or the admitted population, and
+    /// both are counted as abandoned exactly like the pre-acquisition checks.
+    fn finalize(
+        &self,
+        permit: OwnedSemaphorePermit,
+        deadline: Instant,
+        lifecycle: &Lifecycle,
+    ) -> Admission {
+        if lifecycle.is_shutting_down() || Instant::now() >= deadline {
+            // Dropping the permit returns it before any admitted state exists,
+            // so a request rejected here owns nothing.
+            drop(permit);
+            counter!(ADMISSION_ABANDONED_TOTAL).increment(1);
+            return Admission::NotAdmitted;
+        }
+
+        Admission::Admitted(self.admitted(permit))
     }
 
     fn admitted(&self, permit: OwnedSemaphorePermit) -> AdmittedRequest {
@@ -381,8 +442,11 @@ impl Observer {
 #[cfg(test)]
 mod tests {
     use std::{
+        future::{Future, poll_fn},
         num::NonZeroUsize,
+        pin::Pin,
         sync::Arc,
+        task::Poll,
         time::{Duration, Instant},
     };
 
@@ -397,6 +461,15 @@ mod tests {
     /// A bound that only ever fires when the implementation is wrong; it never
     /// establishes ordering, which the observation channel does.
     const DEADLOCK_BOUND: Duration = Duration::from_secs(10);
+
+    /// Polls a future exactly once, so a test can park a waiter
+    /// deterministically instead of assuming the scheduler ran it.
+    async fn poll_once<F>(future: &mut Pin<Box<F>>) -> Poll<F::Output>
+    where
+        F: Future,
+    {
+        poll_fn(|context| Poll::Ready(future.as_mut().poll(context))).await
+    }
 
     fn nonzero(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).expect("test values are positive")
@@ -692,5 +765,129 @@ mod tests {
             admission.admit(far_future(), &lifecycle).await,
             Admission::Admitted(_)
         ));
+    }
+    /// The decisive shutdown race: a permit acquired while the process was
+    /// still serving must not admit its request once shutdown has begun.
+    ///
+    /// Both acquisition paths end in the same finalization, so driving it
+    /// directly proves the property for both without reproducing the timing.
+    #[test]
+    fn a_permit_acquired_before_shutdown_does_not_admit_after_it() {
+        let admission = admission(1);
+        let lifecycle = Lifecycle::new();
+        let mut observation = admission.observe();
+
+        // Held exactly as both paths hold it immediately before deciding.
+        let permit = admission.acquire_permit_for_test();
+        assert_eq!(admission.available_permits(), 0);
+
+        // Shutdown wins the race.
+        lifecycle.begin_shutdown();
+
+        let decision =
+            admission.finalize_for_test(permit, Instant::now() + DEADLOCK_BOUND, &lifecycle);
+
+        assert!(
+            matches!(decision, Admission::NotAdmitted),
+            "a request may not be admitted once shutdown has begun"
+        );
+        assert_eq!(
+            admission.available_permits(),
+            1,
+            "the permit must be released, not held by a rejected request"
+        );
+        assert_eq!(
+            *observation.borrow_and_update(),
+            AdmissionObservation::default(),
+            "no request may enter the admitted population"
+        );
+    }
+
+    /// The same finalization also catches a deadline that expired while the
+    /// permit was being obtained.
+    #[test]
+    fn a_permit_acquired_for_an_expired_request_does_not_admit_it() {
+        let admission = admission(1);
+        let lifecycle = Lifecycle::new();
+        let mut observation = admission.observe();
+
+        let permit = admission.acquire_permit_for_test();
+        let expired = Instant::now() - Duration::from_secs(1);
+
+        let decision = admission.finalize_for_test(permit, expired, &lifecycle);
+
+        assert!(matches!(decision, Admission::NotAdmitted));
+        assert_eq!(admission.available_permits(), 1);
+        assert_eq!(
+            *observation.borrow_and_update(),
+            AdmissionObservation::default()
+        );
+    }
+
+    /// Finalization still admits a request that really is within its budget
+    /// while the process is serving, so the checks above reject nothing else.
+    #[test]
+    fn a_permit_acquired_while_serving_admits_its_request() {
+        let admission = admission(1);
+        let lifecycle = Lifecycle::new();
+
+        let permit = admission.acquire_permit_for_test();
+        let decision =
+            admission.finalize_for_test(permit, Instant::now() + DEADLOCK_BOUND, &lifecycle);
+
+        let admitted = match decision {
+            Admission::Admitted(admitted) => admitted,
+            Admission::NotAdmitted | Admission::RefusedWithoutWaiting => {
+                panic!("a serving process within budget must admit")
+            }
+        };
+        assert_eq!(admission.available_permits(), 0);
+        drop(admitted);
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    /// The waiter path must share that finalization, so a waiter woken by a
+    /// freed permit during draining is not admitted either.
+    ///
+    /// The wait is released by shutdown rather than by the permit here, which
+    /// is the ordering ADR 0011 requires; the assertion that matters is that
+    /// nothing was admitted and nothing was retained.
+    #[tokio::test]
+    async fn a_waiter_woken_during_shutdown_is_not_admitted() {
+        let admission = admission(1);
+        let lifecycle = Lifecycle::new();
+        let held = match admission
+            .admit(Instant::now() + DEADLOCK_BOUND, &lifecycle)
+            .await
+        {
+            Admission::Admitted(admitted) => admitted,
+            Admission::NotAdmitted | Admission::RefusedWithoutWaiting => {
+                panic!("the first request must be admitted")
+            }
+        };
+
+        let mut waiting = Box::pin(admission.admit(Instant::now() + DEADLOCK_BOUND, &lifecycle));
+        // One poll parks the waiter deterministically.
+        assert!(
+            poll_once(&mut waiting).await.is_pending(),
+            "the saturated request must park"
+        );
+
+        lifecycle.begin_shutdown();
+        drop(held);
+
+        let decision = tokio::time::timeout(DEADLOCK_BOUND, waiting)
+            .await
+            .expect("the released waiter must answer");
+        assert!(
+            matches!(decision, Admission::NotAdmitted),
+            "a waiter must not be admitted during draining"
+        );
+        assert_eq!(
+            admission.available_permits(),
+            1,
+            "no permit may survive the rejected waiter"
+        );
+        assert_eq!(admission.available_waiter_slots(), 1);
     }
 }

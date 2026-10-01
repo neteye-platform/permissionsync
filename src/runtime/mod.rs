@@ -38,7 +38,7 @@ use permissionsync_auth::TechnicalCallerAuthenticator;
 use permissionsync_core::{LogicalTarget, SynchronizationContext};
 use tokio::{
     net::{TcpListener, TcpStream},
-    signal::unix::{SignalKind, signal},
+    signal::unix::{Signal, SignalKind, signal},
     sync::oneshot,
     task::JoinSet,
     time::{sleep, timeout},
@@ -210,6 +210,13 @@ async fn bind_and_serve(
         .await
         .map_err(|_| RuntimeFailure::ListenerUnavailable)?;
 
+    // ADR 0011 makes `SIGTERM` and `SIGINT` handling mandatory on Linux, so
+    // both handlers are installed before anything is served. A process that
+    // could not install them cannot shut down gracefully, and serving requests
+    // it could only ever terminate abruptly would be worse than refusing to
+    // start.
+    let signals = register_termination_signals()?;
+
     info!(
         target: "permissionsync::runtime",
         tracing_export = tracing_enabled,
@@ -223,7 +230,7 @@ async fn bind_and_serve(
     // bounded, asynchronous, and non-gating.
     let (serving_started, serving_has_started) = oneshot::channel();
     let warm_up = spawn_verifier_warm_up(state, metadata_operation_timeout, serving_has_started);
-    let signals = tokio::spawn(signal_shutdown(Arc::clone(&lifecycle)));
+    let signals = tokio::spawn(signal_shutdown(signals, Arc::clone(&lifecycle)));
 
     let served = serve(
         listener,
@@ -592,26 +599,64 @@ async fn terminate_after_fatal_accept_failure(
     RuntimeFailure::ListenerAcceptFailed
 }
 
+/// The installed termination-signal handlers.
+///
+/// Holding both as a value is what makes registration a startup step rather
+/// than something the signal task discovers too late to report: this cannot be
+/// constructed unless both handlers exist.
+pub(crate) struct TerminationSignals {
+    terminate: Signal,
+    interrupt: Signal,
+}
+
+/// Installs the `SIGTERM` and `SIGINT` handlers ADR 0011 requires.
+///
+/// Both are mandatory, so a failure to install either is a fatal startup
+/// failure rather than a silently disabled graceful shutdown. The underlying
+/// operating-system error is deliberately discarded: the returned category
+/// names only which part of the runtime refused to continue.
+fn register_termination_signals() -> Result<TerminationSignals, RuntimeFailure> {
+    register_termination_signals_with(signal)
+}
+
+/// Installs both handlers through `register`, so the failure mapping can be
+/// exercised without a host that actually refuses registration.
+///
+/// This is the whole abstraction: one function pointer, used only to decide
+/// which of the two registrations fails. It adds no signal indirection to the
+/// serving path.
+fn register_termination_signals_with(
+    register: fn(SignalKind) -> std::io::Result<Signal>,
+) -> Result<TerminationSignals, RuntimeFailure> {
+    let terminate =
+        register(SignalKind::terminate()).map_err(|_| RuntimeFailure::SignalRegistrationFailed)?;
+    let interrupt =
+        register(SignalKind::interrupt()).map_err(|_| RuntimeFailure::SignalRegistrationFailed)?;
+
+    Ok(TerminationSignals {
+        terminate,
+        interrupt,
+    })
+}
+
 /// Translates a termination signal into the start of shutdown.
 ///
 /// Signal handling is an owned task rather than part of the accept loop, so the
 /// accept loop observes exactly one thing — that shutdown has begun — whatever
-/// requested it.
-async fn signal_shutdown(lifecycle: Arc<Lifecycle>) {
-    await_termination_signal().await;
+/// requested it. The handlers are already installed, so this task can only ever
+/// wait: it never discovers a registration failure it would be unable to
+/// report.
+async fn signal_shutdown(signals: TerminationSignals, lifecycle: Arc<Lifecycle>) {
+    await_termination_signal(signals).await;
     lifecycle.begin_shutdown();
 }
 
-/// Waits for `SIGTERM` or `SIGINT`.
-async fn await_termination_signal() {
-    let mut terminate = match signal(SignalKind::terminate()) {
-        Ok(terminate) => terminate,
-        Err(_) => return std::future::pending().await,
-    };
-    let mut interrupt = match signal(SignalKind::interrupt()) {
-        Ok(interrupt) => interrupt,
-        Err(_) => return std::future::pending().await,
-    };
+/// Waits for `SIGTERM` or `SIGINT` on the already-installed handlers.
+async fn await_termination_signal(signals: TerminationSignals) {
+    let TerminationSignals {
+        mut terminate,
+        mut interrupt,
+    } = signals;
 
     tokio::select! {
         _ = terminate.recv() => {}
@@ -705,6 +750,14 @@ pub(crate) async fn serve_connection_for_test(
     header_read_timeout: Duration,
 ) {
     serve_connection(stream, router, lifecycle, header_read_timeout).await;
+}
+
+/// Test-only access to the termination-signal registration mapping.
+#[cfg(test)]
+pub(crate) fn register_termination_signals_with_for_test(
+    register: fn(SignalKind) -> std::io::Result<Signal>,
+) -> Result<TerminationSignals, RuntimeFailure> {
+    register_termination_signals_with(register)
 }
 
 /// Test-only accessor for the fixed header-read bound the runtime serves with.

@@ -49,6 +49,11 @@ pub(crate) enum RuntimeFailure {
     ObservabilityUnavailable,
     /// The configured listener could not be bound.
     ListenerUnavailable,
+    /// A required termination-signal handler could not be installed.
+    ///
+    /// ADR 0011 makes `SIGTERM` and `SIGINT` handling mandatory, so a process
+    /// that cannot install both never begins serving.
+    SignalRegistrationFailed,
     /// The bound listener repeatedly failed to accept connections, so it can no
     /// longer produce work and the process must terminate.
     ListenerAcceptFailed,
@@ -80,6 +85,9 @@ impl fmt::Display for RuntimeFailure {
             Self::InvalidComposition => "the configured application composition is unusable",
             Self::ObservabilityUnavailable => "required observability could not be initialized",
             Self::ListenerUnavailable => "the configured listener could not be bound",
+            Self::SignalRegistrationFailed => {
+                "the required termination-signal handlers could not be installed"
+            }
             Self::ListenerAcceptFailed => {
                 "the listener repeatedly failed to accept connections and serving stopped"
             }
@@ -131,6 +139,7 @@ mod tests {
             RuntimeFailure::InvalidComposition,
             RuntimeFailure::ObservabilityUnavailable,
             RuntimeFailure::ListenerUnavailable,
+            RuntimeFailure::SignalRegistrationFailed,
             RuntimeFailure::ListenerAcceptFailed,
             RuntimeFailure::RuntimeUnavailable,
         ] {

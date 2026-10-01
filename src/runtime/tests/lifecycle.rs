@@ -1290,3 +1290,69 @@ async fn warm_up_performs_no_work_when_serving_never_starts() {
 
     jwks.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Mandatory termination-signal registration
+// ---------------------------------------------------------------------------
+
+/// A registration failure must become the fixed fatal category, so it can
+/// neither park a task forever nor let the process report a normal exit.
+///
+/// Both positions are covered: the runtime installs `SIGTERM` first and `SIGINT`
+/// second, and either failing is equally fatal. The injected registrar also
+/// proves no raw operating-system error survives into the reported category.
+#[tokio::test]
+async fn a_failed_termination_signal_registration_is_fatal() {
+    use tokio::signal::unix::{Signal, SignalKind};
+
+    fn terminate_fails(kind: SignalKind) -> std::io::Result<Signal> {
+        if kind == SignalKind::terminate() {
+            return Err(std::io::Error::other("sentinel-signal-os-error"));
+        }
+        tokio::signal::unix::signal(kind)
+    }
+
+    fn interrupt_fails(kind: SignalKind) -> std::io::Result<Signal> {
+        if kind == SignalKind::interrupt() {
+            return Err(std::io::Error::other("sentinel-signal-os-error"));
+        }
+        tokio::signal::unix::signal(kind)
+    }
+
+    for (position, registrar) in [
+        (
+            "SIGTERM",
+            terminate_fails as fn(SignalKind) -> std::io::Result<Signal>,
+        ),
+        (
+            "SIGINT",
+            interrupt_fails as fn(SignalKind) -> std::io::Result<Signal>,
+        ),
+    ] {
+        let failure = crate::runtime::register_termination_signals_with_for_test(registrar)
+            .err()
+            .unwrap_or_else(|| panic!("a failed {position} registration must not succeed"));
+
+        assert_eq!(
+            failure,
+            RuntimeFailure::SignalRegistrationFailed,
+            "a failed {position} registration must report the fixed fatal category"
+        );
+        let rendered = format!("{failure} {failure:?}");
+        assert!(
+            !rendered.contains("sentinel-signal-os-error"),
+            "the operating-system error must not survive into {rendered}"
+        );
+    }
+}
+
+/// With both handlers installable, registration succeeds, which is what lets
+/// serving begin at all.
+#[tokio::test]
+async fn successful_termination_signal_registration_allows_serving() {
+    assert!(
+        crate::runtime::register_termination_signals_with_for_test(tokio::signal::unix::signal)
+            .is_ok(),
+        "the supported Linux runtime must install both handlers"
+    );
+}
