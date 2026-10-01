@@ -1,0 +1,18 @@
+# Deliberate allowlist: everything is excluded first, then exactly the files
+# the locked release build needs are restored. A developer-local file, an
+# editor directory, a generated credential, or a new top-level artifact can
+# therefore never reach the build context by accident.
+*
+
+# Required by `cargo build --release --locked --bin permissionsync`.
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates
+!src
+
+# Test and integration material inside the restored trees. None of it is
+# needed to build the executable, and keeping it out of the context keeps
+# disposable-environment fixtures away from the builder entirely.
+crates/**/integration
+crates/**/tests

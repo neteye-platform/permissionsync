@@ -16,8 +16,9 @@ bounded inbound admission and synchronization capacity, health, readiness and
 metrics endpoints, graceful shutdown, structured logging, Prometheus metrics,
 and optional OTLP trace export.
 
-A real supported-Keycloak deployment contract suite is described below.
-OCI and Kubernetes packaging remain future work.
+It is packaged as a minimal, non-root production OCI image, with a reference
+Kubernetes deployment contract and a real supported-Keycloak contract suite,
+both described below.
 
 ## Running the service
 
@@ -185,6 +186,110 @@ cancels the remaining request contexts, terminates and awaits its remaining
 tasks, and performs a bounded trace flush when tracing is enabled. Final
 telemetry may be lost if the exporter is still unavailable.
 
+## Container image
+
+PermissionSync ships as one generic, immutable, versioned OCI image. It embeds
+no deployment URL, credential, permission data, target instance, or environment
+trust: the image is identical for every deployment, and everything specific to
+one is runtime configuration.
+
+Build it locally from the repository root:
+
+```sh
+docker build --file Dockerfile --tag permissionsync:local .
+```
+
+The build is a two-stage [Dockerfile](Dockerfile). The builder is the official
+Rust image, pinned by the same version as
+[rust-toolchain.toml](rust-toolchain.toml) and by digest, and it runs
+`cargo build --release --locked --bin permissionsync`. The runtime stage is a
+distroless base carrying only the executable plus the C runtime, OpenSSL, and
+system trust store the binary links against. It has no shell, package manager,
+compiler, Cargo state, source tree, or test material, and no configuration or
+trust material of any kind.
+
+Run it with the configuration mounted from outside the image:
+
+```sh
+docker run --rm \
+  --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+  --publish 127.0.0.1:8443:8443 \
+  --env PERMISSIONSYNC_CONFIG_FILE=/etc/permissionsync/permissionsync.yaml \
+  --volume /etc/permissionsync/permissionsync.yaml:/etc/permissionsync/permissionsync.yaml:ro \
+  permissionsync:local
+```
+
+| Property      | Behaviour                                                                                            |
+| ------------- | ---------------------------------------------------------------------------------------------------- |
+| Entrypoint    | `/usr/local/bin/permissionsync`, exec form, so it is PID 1 and receives `SIGTERM`/`SIGINT` directly  |
+| User          | `65532:65532`, a dedicated unprivileged account declared numerically                                 |
+| Configuration | Required externally through `PERMISSIONSYNC_CONFIG_FILE`; the image sets no environment value at all |
+| Listener      | Whatever `listener.address` and `listener.port` select; no port is baked in, so there is no `EXPOSE` |
+| Filesystem    | Nothing is written, so a read-only root filesystem needs no writable path, not even `/tmp`           |
+| Private CA    | Only through `additional_trust_anchors_pem` in the mounted configuration                             |
+| Health check  | None in the image: Kubernetes is the supported platform and owns the probes below                    |
+| Platform      | `linux/amd64`, the only platform published and the only one validated in CI                          |
+
+The image carries the standard `org.opencontainers.image.title`,
+`description`, `source`, `url`, `documentation`, `licenses`, and `vendor`
+labels. The `version`, `revision`, and `created` labels are added by the
+publishing workflow from the release event, so a local build never claims a
+release identity it does not have.
+
+Released images are published to
+`ghcr.io/neteye-platform/permissionsync:<version>` for semantic version tags
+only. There is no mutable `latest` tag, and the publishing workflow prints the
+published digest. Select a release by its immutable digest
+(`…/permissionsync:1.2.3@sha256:…`) wherever operational tooling permits.
+
+After installation or upgrade, normal restart and recovery must not depend on
+public registry connectivity. That is deployment infrastructure, not
+PermissionSync application state: the deployment platform is responsible for
+retaining, mirroring, or caching the selected digest in deployment-local
+infrastructure or on offline installation media. This repository publishes an
+immutable image and nothing more — it implements no registry, mirror, or image
+cache, and GHCR availability is never part of PermissionSync's runtime
+correctness.
+
+## Kubernetes
+
+Kubernetes is the only explicitly supported deployment platform, and
+PermissionSync still depends on no Kubernetes API, object, discovery, or
+configuration semantics. Manifests and Helm charts are deployment-owned
+optional artifacts;
+[deploy/kubernetes/permissionsync.example.yaml](deploy/kubernetes/permissionsync.example.yaml)
+is a small placeholder-only **example** of the contract the platform must
+provide, not a mandatory production architecture and not PermissionSync's
+configuration API. Copy it, replace every placeholder, and own the result
+yourself.
+
+The supported deployment contract is:
+
+| Contract           | Requirement                                                                                |
+| ------------------ | ------------------------------------------------------------------------------------------ |
+| Configuration      | Exactly one external YAML document, mounted read-only                                      |
+| Configuration path | `PERMISSIONSYNC_CONFIG_FILE` pointing at that mounted file, and no other environment value |
+| Liveness           | `GET /healthz` on the configured listener port                                             |
+| Readiness          | `GET /readyz` on the same port                                                             |
+| Seccomp            | `seccompProfile.type: RuntimeDefault`                                                      |
+| User               | `runAsNonRoot: true` with the image's `runAsUser`/`runAsGroup` of `65532`                  |
+| Privileges         | `allowPrivilegeEscalation: false`, not privileged, all capabilities dropped                |
+| Filesystem         | `readOnlyRootFilesystem: true`; no writable path is required                               |
+| Host namespaces    | None: no host network, PID, or IPC, and no Kubernetes API token is mounted                 |
+| Termination        | `SIGTERM`, with `terminationGracePeriodSeconds` at least `shutdown.grace_milliseconds`     |
+| Image              | The published image pinned by immutable digest, kept available locally for restart         |
+
+Any volume source that presents the single document at the mounted path works.
+Kubernetes Secrets are **not** required, and PermissionSync neither requires nor
+understands a secret backend: a Secret, a ConfigMap, a projected volume, a CSI
+secrets-store volume, or an operator-managed volume are all equally valid. The
+example shows a Secret only because that document normally carries credentials
+and private trust material.
+
+Replicas, resource requests and limits, scheduling, Service and Ingress
+objects, and TLS termination in front of the listener are deployment concerns.
+The example shows resource bounds as placeholders for that reason.
+
 ## Supported Keycloak
 
 CI exercises exactly one supported Keycloak release, **26.8.0**, pinned by
@@ -230,6 +335,37 @@ cargo test -p permissionsync-auth --test real_keycloak --locked -- --ignored
 crates/permissionsync-auth/integration/keycloak/teardown.sh
 ```
 
+## Testing
+
+| Layer                       | What it covers                                                                                                | How to run                                                                |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Hermetic workspace tests    | Every contract that needs no external service, including the image and Kubernetes contract checks in `tests/` | `cargo test --workspace --all-features --locked`                          |
+| Real GLPI suite             | The production GLPI V1 reconciliation contract against a disposable GLPI                                      | [GLPI adapter test workflow](.github/workflows/glpi-adapter-tests.yaml)   |
+| Real Keycloak suite         | The supported-Keycloak authentication and metadata wire contract                                              | [Keycloak workflow](.github/workflows/keycloak-authentication-tests.yaml) |
+| OCI and deployment contract | The built production image, its hardening, its signal handling, and the Kubernetes example                    | [OCI workflow](.github/workflows/oci-image-tests.yaml)                    |
+
+The OCI workflow builds the production image, proves it statically
+(non-root numeric user, exec entrypoint, expected executable, no shell, no
+source, build, Cargo, configuration, or credential material, no preset
+configuration path), proves it fails fast without `PERMISSIONSYNC_CONFIG_FILE`,
+proves that with valid configuration and an unreachable metadata source it
+serves `/healthz` while `/readyz` stays `503`, and proves `SIGTERM` reaches the
+executable directly and terminates it cleanly inside a bounded window. It then
+runs the same image against the disposable HTTPS Keycloak with one mounted YAML
+document, waits for `/readyz` to become `200`, obtains a real Keycloak token,
+completes a targetless `POST /api/sync-user` as `204` without GLPI or a
+Provider, and terminates the container with `SIGTERM`. The Kubernetes example
+is validated with `kubeconform` in strict mode against a pinned Kubernetes
+schema version.
+
+Both container scripts live in [integration/oci/](integration/oci/) and take a
+built image reference, so they can be run locally:
+
+```sh
+docker build --file Dockerfile --tag permissionsync:local .
+integration/oci/image-contract.sh permissionsync:local
+```
+
 ## Development
 
 The exact Rust toolchain is defined in
@@ -254,10 +390,10 @@ Normal Cargo tests remain hermetic and require neither Docker, GLPI, nor
 Keycloak. The GLPI adapter has a dedicated disposable
 [real-GLPI integration layer](crates/permissionsync-adapter-glpi/integration/glpi/),
 and authentication has a dedicated disposable
-[real-Keycloak integration layer](crates/permissionsync-auth/integration/keycloak/).
-CI executes both, through the
-[GLPI adapter test workflow](.github/workflows/glpi-adapter-tests.yaml) and the
-[Keycloak authentication test workflow](.github/workflows/keycloak-authentication-tests.yaml).
+[real-Keycloak integration layer](crates/permissionsync-auth/integration/keycloak/);
+CI executes both, plus the container and deployment contract scripts in
+[integration/oci/](integration/oci/), through the workflows listed under
+[Testing](#testing).
 
 The dependency-policy check requires the exact, Renovate-managed
 `CARGO_DENY_VERSION` in

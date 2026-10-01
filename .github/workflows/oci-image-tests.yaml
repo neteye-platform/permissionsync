@@ -1,0 +1,75 @@
+name: OCI Image Tests
+
+on:
+  pull_request:
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+
+jobs:
+  oci-image-tests:
+    name: OCI Image Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Built and exercised locally in this job only; nothing is pushed, and no
+      # registry credential is available to pull-request validation.
+      IMAGE_REFERENCE: permissionsync:pull-request
+      # renovate: datasource=docker
+      KUBECONFORM_IMAGE: "ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e"
+      # kubeconform rejects a `v` prefix here, so the upstream tag's prefix is
+      # stripped when Renovate proposes a new Kubernetes release.
+      # renovate: datasource=github-releases depName=kubernetes/kubernetes extractVersion=^v(?<version>\d+\.\d+\.\d+)$
+      KUBERNETES_SCHEMA_VERSION: "1.37.1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Static schema and strict unknown-field validation of the reference
+      # deployment contract. The hermetic tests in tests/oci_packaging.rs own
+      # the contract's security, probe, configuration, and grace-period
+      # assertions; this step proves the objects themselves are well formed
+      # against a pinned Kubernetes schema set.
+      - name: Validate the Kubernetes deployment contract example
+        run: |
+          set -euo pipefail
+          docker run --rm --volume "${PWD}/deploy:/work/deploy:ro" --workdir /work \
+            "$KUBECONFORM_IMAGE" \
+            -strict -summary -verbose \
+            -kubernetes-version "$KUBERNETES_SCHEMA_VERSION" \
+            deploy/kubernetes/permissionsync.example.yaml
+
+      - name: Build the production image
+        run: |
+          set -euo pipefail
+          docker build --file Dockerfile --tag "$IMAGE_REFERENCE" .
+
+      - name: Prove the production image contract
+        run: ./integration/oci/image-contract.sh "$IMAGE_REFERENCE"
+
+      - name: Bootstrap disposable Keycloak environment
+        working-directory: crates/permissionsync-auth/integration/keycloak
+        run: ./bootstrap.sh
+
+      - name: Run the production-image deployment contract against real Keycloak
+        run: |
+          set -euo pipefail
+          set -a
+          # shellcheck disable=SC1090
+          source "$KEYCLOAK_TEST_RUNTIME_ENV"
+          set +a
+          ./integration/oci/keycloak-smoke.sh "$IMAGE_REFERENCE"
+
+      - name: Collect Keycloak container logs on failure
+        if: failure()
+        working-directory: crates/permissionsync-auth/integration/keycloak
+        run: ./diagnostics.sh
+
+      - name: Tear down the disposable environment
+        if: always()
+        working-directory: crates/permissionsync-auth/integration/keycloak
+        run: ./teardown.sh

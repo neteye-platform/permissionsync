@@ -1,4 +1,15 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["github>neteye-platform/repo-commons"]
+  "extends": ["github>neteye-platform/repo-commons"],
+  "customManagers": [
+    {
+      "description": "Container images used directly by workflow steps, which the github-actions manager does not detect",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.yaml$/"],
+      "matchStrings": [
+        "# renovate: datasource=docker\\s*\\n\\s*[A-Z0-9_]+: \"(?<depName>[^\":@]+):(?<currentValue>[^\"@]+)@(?<currentDigest>sha256:[0-9a-f]{64})\""
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ]
 }
