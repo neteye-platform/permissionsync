@@ -61,7 +61,7 @@ yaml_serde = { version = "=0.10.7", default-features = false, features = ["std"]
 
 [dev-dependencies]
 bytes = { version = "=1.12.1", default-features = false }
-http-body = { version = "=1.0.1", default-features = false }
+http-body = { version = "=1.1.0", default-features = false }
 josekit = { version = "=0.10.3", default-features = false }
 openssl = { version = "=0.10.81", default-features = false }
 serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
