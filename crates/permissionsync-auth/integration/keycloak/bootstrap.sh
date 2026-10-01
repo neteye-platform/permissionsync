@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Bootstrap a disposable supported-Keycloak 26.8.0 environment for the ignored
-# real contract suite.
+# Bootstrap the disposable supported-Keycloak environment for the ignored real
+# contract suite. docker-compose.yml pins the release it uses.
 #
 # diagnostics.sh and teardown.sh own failure diagnostics and destructive
 # cleanup, respectively. On a local failure after the runtime directory is
@@ -104,7 +104,17 @@ env_put KEYCLOAK_TEST_CA_PEM_PATH "${tls_dir}/ca.crt"
 env_put KEYCLOAK_TEST_COMPOSE_PROJECT "$project_name"
 env_put KEYCLOAK_TEST_RUNTIME_DIR "$runtime_dir"
 env_put KEYCLOAK_TEST_RUNTIME_ENV "$runtime_env"
-env_put KEYCLOAK_TEST_RELEASE '26.8.0'
+
+# The compose file's pinned image tag is the single declaration of the
+# supported release, so Renovate updating it there needs no second edit here.
+keycloak_release="$(sed -n \
+  's|^[[:space:]]*image:[[:space:]]*quay\.io/keycloak/keycloak:\([^@[:space:]]*\)@.*|\1|p' \
+  "${script_dir}/docker-compose.yml")"
+if [[ -z "$keycloak_release" ]]; then
+  printf '%s\n' 'Could not read the pinned Keycloak release from docker-compose.yml.' >&2
+  exit 1
+fi
+env_put KEYCLOAK_TEST_RELEASE "$keycloak_release"
 mask_secret "$admin_password"
 
 # Export the runtime-env locator to $GITHUB_ENV as soon as the runtime

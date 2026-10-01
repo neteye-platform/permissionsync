@@ -22,75 +22,6 @@ fn read(relative: &str) -> String {
     })
 }
 
-/// Returns the single `FROM` reference whose stage name matches `stage`.
-fn builder_image(dockerfile: &str, stage: &str) -> String {
-    let suffix = format!(" AS {stage}");
-    let mut matching = dockerfile
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("FROM ") && line.ends_with(&suffix));
-    let line = matching
-        .next()
-        .unwrap_or_else(|| panic!("the Dockerfile has no stage named {stage}"));
-    assert!(
-        matching.next().is_none(),
-        "the Dockerfile declares more than one stage named {stage}"
-    );
-    line["FROM ".len()..line.len() - suffix.len()].to_owned()
-}
-
-/// The toolchain version a `rust:<version>-<suite>` reference selects.
-fn rust_image_version(reference: &str) -> String {
-    let tag = reference
-        .split_once(':')
-        .expect("the builder image reference carries a tag")
-        .1;
-    let tag = tag.split_once('@').map_or(tag, |(tag, _)| tag);
-    tag.split_once('-')
-        .map_or(tag, |(version, _)| version)
-        .to_owned()
-}
-
-/// Reads `[toolchain] channel` from `rust-toolchain.toml`.
-///
-/// Deliberately a small textual read rather than a new TOML dependency: this
-/// change needs exactly one scalar out of one fixed, three-line repository
-/// file, and adding a direct dependency for it would not be justified.
-fn toolchain_channel() -> String {
-    let toolchain = read("rust-toolchain.toml");
-    let mut in_toolchain_table = false;
-    for line in toolchain.lines().map(str::trim) {
-        if line.starts_with('[') {
-            in_toolchain_table = line == "[toolchain]";
-            continue;
-        }
-        if !in_toolchain_table {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=')
-            && key.trim() == "channel"
-        {
-            return value.trim().trim_matches('"').to_owned();
-        }
-    }
-    panic!("rust-toolchain.toml declares no [toolchain] channel");
-}
-
-/// The Dockerfile has to name a Rust version in its builder tag, and Renovate
-/// bumps that tag independently of `rust-toolchain.toml`. This test is the
-/// reason that duplication is safe: the two values cannot drift silently, so a
-/// base-image bump either keeps the repository's toolchain contract or fails
-/// here until `rust-toolchain.toml` is updated with it.
-#[test]
-fn the_builder_image_uses_the_repository_toolchain_version() {
-    let builder = builder_image(&read("Dockerfile"), "build");
-    assert_eq!(
-        rust_image_version(&builder),
-        toolchain_channel(),
-        "the Dockerfile's Rust builder tag and rust-toolchain.toml must name the same version"
-    );
-}
-
 #[test]
 fn every_base_image_is_pinned_by_tag_and_immutable_digest() {
     let dockerfile = read("Dockerfile");
@@ -232,6 +163,34 @@ fn the_runtime_stage_declares_the_expected_execution_contract() {
             "{release_label} must come from CI-generated metadata, not a hardcoded label"
         );
     }
+}
+
+/// The builder must take its compiler from `rust-toolchain.toml` rather than
+/// from whatever the base image happens to ship, so the toolchain version is
+/// declared in exactly one place and a base-image bump cannot change it.
+#[test]
+fn the_builder_stage_installs_the_repository_toolchain_before_building() {
+    let builder = stage_instructions(&read("Dockerfile"), "build");
+    let position = |needle: &str| {
+        builder
+            .iter()
+            .position(|instruction| instruction.contains(needle))
+            .unwrap_or_else(|| panic!("the builder stage is missing {needle}"))
+    };
+    assert!(
+        position("COPY rust-toolchain.toml") < position("rustup toolchain install"),
+        "rust-toolchain.toml must be present before the toolchain is installed"
+    );
+    assert!(
+        position("rustup toolchain install") < position("cargo build"),
+        "the toolchain that file selects must be installed before the build"
+    );
+    assert!(
+        builder
+            .iter()
+            .any(|instruction| instruction.contains("cargo build --release --locked")),
+        "the executable must be built from the locked workspace in release mode"
+    );
 }
 
 /// Nothing deployment-specific may enter the build context in the first place.

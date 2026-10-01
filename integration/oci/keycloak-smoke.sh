@@ -98,10 +98,7 @@ CONFIGURATION
 chmod 644 "${work_dir}/permissionsync.yaml"
 
 printf '=== starting the production image with one externally mounted document ===\n'
-# The container joins the disposable Keycloak network, runs as the image's own
-# non-root user, and applies the same hardening as the Kubernetes deployment
-# contract example. `PERMISSIONSYNC_CONFIG_FILE` is the only environment value
-# supplied.
+# `PERMISSIONSYNC_CONFIG_FILE` is the only environment value supplied.
 container_id="$(docker run --detach \
   --network "$KEYCLOAK_TEST_COMPOSE_NETWORK" \
   --read-only \
@@ -136,9 +133,8 @@ done
 printf '/healthz: 200\n'
 
 printf '=== readiness once trusted verifier state exists ===\n'
-# Bounded polling, not a fixed sleep: readiness turns true only after the
-# bounded verifier warm-up has retrieved real JWKS from Keycloak over HTTPS
-# through the configured private trust anchor.
+# Readiness turns true only after the bounded verifier warm-up has retrieved
+# real JWKS from Keycloak over HTTPS through the configured trust anchor.
 deadline=$((SECONDS + 90))
 until [[ "$(status_of /readyz)" == '200' ]]; do
   if ((SECONDS > deadline)); then

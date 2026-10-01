@@ -31,7 +31,7 @@
 
 use std::{
     env, fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
 };
@@ -53,11 +53,6 @@ use permissionsync_auth::{
     TrustedVerifierState, VerificationCachePolicy,
 };
 use permissionsync_core::{CancellationSignal, SynchronizationContext};
-
-/// The one supported Keycloak release this suite documents. The disposable
-/// environment pins the same release by tag and immutable digest, so an
-/// upgrade has to pass this suite before it can be merged.
-const SUPPORTED_KEYCLOAK_RELEASE: &str = "26.8.0";
 
 /// The logical target the provisioned `permissionsync:<target>` scope selects.
 const SELECTED_LOGICAL_TARGET: &str = "glpi";
@@ -355,14 +350,34 @@ async fn discovery_document(environment: &RealKeycloakEnvironment) -> serde_json
     serde_json::from_slice(&body).expect("the discovery response is JSON")
 }
 
+fn compose_file() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("integration/keycloak/docker-compose.yml")
+}
+
+/// The supported Keycloak release, read from the compose file that pins it.
+/// That file is the single declaration of the release, so Renovate can update
+/// it without a second edit anywhere.
+fn pinned_keycloak_release() -> String {
+    let compose = fs::read_to_string(compose_file()).expect("the compose file could be read");
+    compose
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("image: quay.io/keycloak/keycloak:")
+        })
+        .filter_map(|reference| reference.split_once('@'))
+        .map(|(tag, _)| tag.to_owned())
+        .next()
+        .expect("the compose file pins the Keycloak image by tag and digest")
+}
+
 /// Runs one `docker compose` subcommand against this run's disposable project.
 ///
-/// The compose file is addressed explicitly from this crate's own directory so
-/// the command does not depend on the test process's working directory or on a
-/// particular compose implementation resolving a project by name alone.
+/// The compose file is addressed explicitly so the command does not depend on
+/// the test process's working directory, or on a particular compose
+/// implementation resolving a project by name alone.
 fn compose(environment: &RealKeycloakEnvironment, arguments: &[&str]) {
-    let compose_file =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("integration/keycloak/docker-compose.yml");
+    let compose_file = compose_file();
     let output = Command::new("docker")
         .args([
             "compose",
@@ -420,8 +435,9 @@ async fn authentication_error(
 async fn oidc_discovery_establishes_trusted_state_and_verifies_a_real_token() {
     let environment = real_environment();
     assert_eq!(
-        environment.release, SUPPORTED_KEYCLOAK_RELEASE,
-        "this suite documents the one supported Keycloak release it exercises"
+        environment.release,
+        pinned_keycloak_release(),
+        "the bootstrap must report the Keycloak release the compose file pins"
     );
 
     // The wire contract the production discovery path depends on: the

@@ -3,13 +3,16 @@
   "extends": ["github>neteye-platform/repo-commons"],
   "customManagers": [
     {
-      "description": "Container images used directly by workflow steps, which the github-actions manager does not detect",
+      "description": "kubeconform's targeted Kubernetes version, which no built-in manager reads out of a pre-commit hook argument",
       "customType": "regex",
-      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.yaml$/"],
+      "managerFilePatterns": ["/^\\.pre-commit-config\\.yaml$/"],
       "matchStrings": [
-        "# renovate: datasource=docker\\s*\\n\\s*[A-Z0-9_]+: \"(?<depName>[^\":@]+):(?<currentValue>[^\"@]+)@(?<currentDigest>sha256:[0-9a-f]{64})\""
+        "- -kubernetes-version\\s*\\n\\s*- \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
       ],
-      "datasourceTemplate": "docker"
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "kubernetes/kubernetes",
+      "versioningTemplate": "semver",
+      "extractVersionTemplate": "^v(?<version>\\d+\\.\\d+\\.\\d+)$"
     }
   ]
 }

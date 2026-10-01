@@ -185,9 +185,7 @@ targets: []
 CONFIGURATION
 chmod 644 "${work_dir}/permissionsync.yaml"
 
-# Exactly the hardening the Kubernetes deployment contract example applies:
-# read-only root filesystem, every capability dropped, no privilege
-# escalation, and the image's own non-root user.
+# Exactly the hardening the Kubernetes deployment contract example applies.
 container_id="$(docker run --detach \
   --read-only \
   --cap-drop=ALL \
@@ -197,9 +195,7 @@ container_id="$(docker run --detach \
   --volume "${work_dir}/permissionsync.yaml:/etc/permissionsync/permissionsync.yaml:ro,Z" \
   "$image")"
 
-# The host port was assigned by the container engine when the listener was
-# published with an empty host-port component, so it is discovered now rather
-# than preselected and raced against another process.
+# Discovered rather than preselected, so nothing races another process for it.
 port="$(docker inspect "$container_id" \
   --format '{{(index .NetworkSettings.Ports "8443/tcp" 0).HostPort}}')"
 if [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]]; then
@@ -208,8 +204,6 @@ if [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]]; then
 fi
 printf 'published listener port: %s\n' "$port"
 
-# Bounded readiness polling against the liveness endpoint; no fixed sleep is
-# used to decide that the process came up.
 deadline=$((SECONDS + 60))
 until [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' \
   "http://127.0.0.1:${port}/healthz" || true)" == '200' ]]; do
@@ -239,8 +233,7 @@ printf 'pid 1 path: %s\n' "$entry_path"
 
 printf '=== SIGTERM reaches the executable directly ===\n'
 docker kill --signal=TERM "$container_id" >/dev/null
-# Bounded wait on the container state, not a fixed sleep. A shell wrapper
-# would report 143 here; the executable's own handler returns success.
+# A shell wrapper would report 143 here; the executable's own handler exits 0.
 deadline=$((SECONDS + 30))
 until [[ "$(docker inspect "$container_id" --format '{{.State.Status}}')" == 'exited' ]]; do
   if ((SECONDS > deadline)); then

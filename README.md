@@ -127,7 +127,7 @@ is a fixed product value rather than a deployment knob, and it is unrelated to
 the configured overall request deadline, which starts only once a
 synchronization request reaches the transport handler.
 
-The *number* of simultaneously accepted connections is not bounded inside the
+The _number_ of simultaneously accepted connections is not bounded inside the
 process. A bound taken when a connection is accepted could not keep the
 operational endpoints reachable, because a connection's route is unknown until
 its first request head has been read and HTTP/1 keep-alive lets one connection
@@ -200,8 +200,9 @@ docker build --file Dockerfile --tag permissionsync:local .
 ```
 
 The build is a two-stage [Dockerfile](Dockerfile). The builder is the official
-Rust image, pinned by the same version as
-[rust-toolchain.toml](rust-toolchain.toml) and by digest, and it runs
+Rust image, pinned by tag and digest; it installs the toolchain
+[rust-toolchain.toml](rust-toolchain.toml) selects, so that file stays the only
+place the compiler version is declared, and then runs
 `cargo build --release --locked --bin permissionsync`. The runtime stage is a
 distroless base carrying only the executable plus the C runtime, OpenSSL, and
 system trust store the binary links against. It has no shell, package manager,
@@ -292,14 +293,16 @@ The example shows resource bounds as placeholders for that reason.
 
 ## Supported Keycloak
 
-CI exercises exactly one supported Keycloak release, **26.8.0**, pinned by
-release tag and immutable digest in
+CI exercises exactly one supported Keycloak release, pinned by release tag and
+immutable digest in
 [the disposable Keycloak environment](crates/permissionsync-auth/integration/keycloak/docker-compose.yml).
-That is the tested deployment baseline, not a claim that other releases are
-broken: PermissionSync's contract is the OIDC and JWT behaviour recorded in
-[ADR-0002](docs/adr/0002-receiver-side-jwt-verification.md), and any Keycloak
-that satisfies it works. Renovate proposes release and digest updates, and such
-an upgrade must pass the contract suite before it can be merged.
+That compose file is the single declaration of the release: the bootstrap and
+the contract suite both read it from there, so a Renovate update needs no
+second edit, and such an upgrade must pass the contract suite before it can be
+merged. That release is the tested deployment baseline, not a claim that other
+releases are broken: PermissionSync's contract is the OIDC and JWT behaviour
+recorded in [ADR-0002](docs/adr/0002-receiver-side-jwt-verification.md), and
+any Keycloak that satisfies it works.
 
 The suite proves, against a real Keycloak instance over real HTTPS, that both
 supported trusted-source modes work — OIDC discovery, where the discovered
@@ -354,9 +357,14 @@ executable directly and terminates it cleanly inside a bounded window. It then
 runs the same image against the disposable HTTPS Keycloak with one mounted YAML
 document, waits for `/readyz` to become `200`, obtains a real Keycloak token,
 completes a targetless `POST /api/sync-user` as `204` without GLPI or a
-Provider, and terminates the container with `SIGTERM`. The Kubernetes example
-is validated with `kubeconform` in strict mode against a pinned Kubernetes
-schema version.
+Provider, and terminates the container with `SIGTERM`.
+
+The Kubernetes example is validated separately, by the organization's
+[kubeconform hook](https://github.com/neteye-platform/kubeconform-precommit)
+configured in [.pre-commit-config.yaml](.pre-commit-config.yaml). It runs in
+strict mode against the targeted Kubernetes version, both in `prek run
+--all-files` locally and in the shared pull-request checks, so the tool stays
+pinned in one place.
 
 Both container scripts live in [integration/oci/](integration/oci/) and take a
 built image reference, so they can be run locally:
