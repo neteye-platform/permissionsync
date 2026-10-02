@@ -38,17 +38,17 @@ chmod 600 "$runtime_env" "$bootstrap_stdout" "$bootstrap_stderr" "$compose_base_
 # character) depending on whether it is backslash-escaped, so any value
 # containing CR, LF, or a backtick is rejected outright rather than encoded.
 env_put() {
-  local name="$1" value="$2" escaped
-  case "$value" in
-  *$'\r'* | *$'\n'* | *'`'*)
-    printf '%s\n' 'runtime.env write refused: a generated value contained a disallowed character (CR, LF, or backtick).' >&2
-    exit 1
-    ;;
-  esac
-  escaped="${value//\\/\\\\}"
-  escaped="${escaped//\"/\\\"}"
-  escaped="${escaped//\$/\\\$}"
-  printf '%s="%s"\n' "$name" "$escaped" >> "$runtime_env"
+    local name="$1" value="$2" escaped
+    case "$value" in
+    *$'\r'* | *$'\n'* | *'`'*)
+        printf '%s\n' 'runtime.env write refused: a generated value contained a disallowed character (CR, LF, or backtick).' >&2
+        exit 1
+        ;;
+    esac
+    escaped="${value//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    escaped="${escaped//\$/\\\$}"
+    printf '%s="%s"\n' "$name" "$escaped" >>"$runtime_env"
 }
 
 # Hermetic, no-Docker self-test hook for env_put()'s dual-consumer escaping.
@@ -57,12 +57,12 @@ env_put() {
 # NAME VALUE argument pairs, appends each through the real env_put(), then
 # prints the resulting runtime.env so the test can assert on it directly.
 if [[ "${PERMISSIONSYNC_BOOTSTRAP_ENV_PUT_SELFTEST:-}" == '1' ]]; then
-  while (($# >= 2)); do
-    env_put "$1" "$2"
-    shift 2
-  done
-  cat "$runtime_env"
-  exit 0
+    while (($# >= 2)); do
+        env_put "$1" "$2"
+        shift 2
+    done
+    cat "$runtime_env"
+    exit 0
 fi
 
 # GitHub `::add-mask::` workflow commands only make sense (and are only safe)
@@ -72,9 +72,9 @@ fi
 # echo the secret in the resulting error. Gate masking on GITHUB_ACTIONS so
 # local stdout never contains it.
 mask_secret() {
-  if [[ "${GITHUB_ACTIONS:-}" == 'true' ]]; then
-    printf '::add-mask::%s\n' "$1"
-  fi
+    if [[ "${GITHUB_ACTIONS:-}" == 'true' ]]; then
+        printf '::add-mask::%s\n' "$1"
+    fi
 }
 
 # If bootstrap fails after the runtime directory (and possibly containers)
@@ -83,16 +83,16 @@ mask_secret() {
 # anything here: diagnostics.sh/teardown.sh own that. The original bootstrap
 # exit status is preserved.
 report_recovery_on_failure() {
-  local status=$?
-  if ((status != 0)); then
-    {
-      printf '%s\n' 'Bootstrap failed after creating a disposable runtime directory.'
-      printf 'Runtime env locator: %s\n' "$runtime_env"
-      printf 'Diagnostics: GLPI_TEST_RUNTIME_ENV=%q ./diagnostics.sh\n' "$runtime_env"
-      printf 'Teardown:   GLPI_TEST_RUNTIME_ENV=%q ./teardown.sh\n' "$runtime_env"
-    } >&2
-  fi
-  exit "$status"
+    local status=$?
+    if ((status != 0)); then
+        {
+            printf '%s\n' 'Bootstrap failed after creating a disposable runtime directory.'
+            printf 'Runtime env locator: %s\n' "$runtime_env"
+            printf 'Diagnostics: GLPI_TEST_RUNTIME_ENV=%q ./diagnostics.sh\n' "$runtime_env"
+            printf 'Teardown:   GLPI_TEST_RUNTIME_ENV=%q ./teardown.sh\n' "$runtime_env"
+        } >&2
+    fi
+    exit "$status"
 }
 trap report_recovery_on_failure EXIT
 
@@ -109,26 +109,26 @@ env_put GLPI_TEST_RUNTIME_ENV "$runtime_env"
 # bootstrap.stderr/compose-base.stderr even if bootstrap fails below. This is
 # a filesystem path locator only; it is never a secret value.
 if [[ -n "${GITHUB_ENV:-}" ]]; then
-  printf 'GLPI_TEST_RUNTIME_ENV=%s\n' "$runtime_env" >> "$GITHUB_ENV"
+    printf 'GLPI_TEST_RUNTIME_ENV=%s\n' "$runtime_env" >>"$GITHUB_ENV"
 fi
 
 compose() {
-  docker compose --env-file "$runtime_env" -p "$project_name" "$@"
+    docker compose --env-file "$runtime_env" -p "$project_name" "$@"
 }
 
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
-  -keyout "${tls_dir}/ca.key" -out "${tls_dir}/ca.crt" \
-  -subj "/CN=permissionsync-glpi-real-integration-ca" >/dev/null 2>&1
+    -keyout "${tls_dir}/ca.key" -out "${tls_dir}/ca.crt" \
+    -subj "/CN=permissionsync-glpi-real-integration-ca" >/dev/null 2>&1
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-  -keyout "${tls_dir}/server.key" -out "${tls_dir}/server.csr" \
-  -subj "/CN=127.0.0.1" >/dev/null 2>&1
+    -keyout "${tls_dir}/server.key" -out "${tls_dir}/server.csr" \
+    -subj "/CN=127.0.0.1" >/dev/null 2>&1
 openssl x509 -req -in "${tls_dir}/server.csr" -CA "${tls_dir}/ca.crt" -CAkey "${tls_dir}/ca.key" \
-  -CAcreateserial -days 2 -out "${tls_dir}/server.crt" \
-  -extfile <(printf 'subjectAltName=IP:127.0.0.1') >/dev/null 2>&1
+    -CAcreateserial -days 2 -out "${tls_dir}/server.crt" \
+    -extfile <(printf 'subjectAltName=IP:127.0.0.1') >/dev/null 2>&1
 
 if ! compose up -d --wait --wait-timeout 180 db glpi >"$compose_base_stdout" 2>"$compose_base_stderr"; then
-  printf '%s\n' 'GLPI base containers did not start; captured output was redacted.' >&2
-  exit 1
+    printf '%s\n' 'GLPI base containers did not start; captured output was redacted.' >&2
+    exit 1
 fi
 
 # Docker assigned the host port when the compose file published it with an
@@ -137,8 +137,8 @@ fi
 http_port_mapping="$(compose port glpi 80)"
 http_port="${http_port_mapping##*:}"
 if [[ -z "$http_port" || ! "$http_port" =~ ^[0-9]+$ ]]; then
-  printf '%s\n' 'Could not determine the Docker-assigned GLPI HTTP host port.' >&2
-  exit 1
+    printf '%s\n' 'Could not determine the Docker-assigned GLPI HTTP host port.' >&2
+    exit 1
 fi
 env_put GLPI_TEST_HTTP_PORT "$http_port"
 # shellcheck disable=SC1090
@@ -146,11 +146,11 @@ source "$runtime_env"
 
 deadline=$((SECONDS + 120))
 until curl --fail --silent --show-error "http://127.0.0.1:${GLPI_TEST_HTTP_PORT}/status.php" >/dev/null; do
-  if ((SECONDS > deadline)); then
-    printf '%s\n' 'GLPI base HTTP readiness timed out.' >&2
-    exit 1
-  fi
-  sleep 2
+    if ((SECONDS > deadline)); then
+        printf '%s\n' 'GLPI base HTTP readiness timed out.' >&2
+        exit 1
+    fi
+    sleep 2
 done
 
 # The command string is intentionally single-quoted so GLPI_CONFIG_DIR expands
@@ -163,13 +163,13 @@ if ! compose exec -T glpi sh -c '
   status=$?
   [ "$status" -eq 0 ]
 '; then
-  printf '%s\n' 'GLPI HTTP is ready, but GLPI is uninstalled or database consistency failed.' >&2
-  exit 1
+    printf '%s\n' 'GLPI HTTP is ready, but GLPI is uninstalled or database consistency failed.' >&2
+    exit 1
 fi
 
 if ! compose exec -T glpi php bootstrap.php >"$bootstrap_stdout" 2>"$bootstrap_stderr"; then
-  printf '%s\n' 'GLPI PHP bootstrap failed; captured output was redacted.' >&2
-  exit 1
+    printf '%s\n' 'GLPI PHP bootstrap failed; captured output was redacted.' >&2
+    exit 1
 fi
 
 python3 - "$bootstrap_stdout" "$runtime_env" <<'PY'
@@ -221,26 +221,26 @@ killsession_log="${proxy_log_dir}/killsession.log"
 # The private runtime directory contains only this safe timestamp/method/
 # upstream-status log. Initialize it before nginx starts so the exclusive
 # cleanup test can require exactly one record without truncating a live log.
-: > "$killsession_log"
+: >"$killsession_log"
 chmod 666 "$killsession_log"
 
 if ! compose up -d --wait --wait-timeout 60 tls-proxy cleanup-proxy >/dev/null; then
-  printf '%s\n' 'GLPI TLS proxies did not start.' >&2
-  exit 1
+    printf '%s\n' 'GLPI TLS proxies did not start.' >&2
+    exit 1
 fi
 
 https_port_mapping="$(compose port tls-proxy 8443)"
 https_port="${https_port_mapping##*:}"
 if [[ -z "$https_port" || ! "$https_port" =~ ^[0-9]+$ ]]; then
-  printf '%s\n' 'Could not determine the Docker-assigned tls-proxy HTTPS host port.' >&2
-  exit 1
+    printf '%s\n' 'Could not determine the Docker-assigned tls-proxy HTTPS host port.' >&2
+    exit 1
 fi
 env_put GLPI_TEST_HTTPS_PORT "$https_port"
 cleanup_https_port_mapping="$(compose port cleanup-proxy 8444)"
 cleanup_https_port="${cleanup_https_port_mapping##*:}"
 if [[ -z "$cleanup_https_port" || ! "$cleanup_https_port" =~ ^[0-9]+$ ]]; then
-  printf '%s\n' 'Could not determine the Docker-assigned cleanup-proxy HTTPS host port.' >&2
-  exit 1
+    printf '%s\n' 'Could not determine the Docker-assigned cleanup-proxy HTTPS host port.' >&2
+    exit 1
 fi
 env_put GLPI_TEST_CLEANUP_HTTPS_PORT "$cleanup_https_port"
 # shellcheck disable=SC1090
@@ -255,12 +255,12 @@ source "$runtime_env"
 # dedicated `killsession.log` before the cleanup test runs.
 cleanup_proxy_deadline=$((SECONDS + 60))
 until curl --cacert "${tls_dir}/ca.crt" --fail --silent --show-error --output /dev/null \
-  "https://127.0.0.1:${GLPI_TEST_CLEANUP_HTTPS_PORT}/status.php"; do
-  if ((SECONDS > cleanup_proxy_deadline)); then
-    printf '%s\n' 'cleanup-proxy HTTPS readiness timed out.' >&2
-    exit 1
-  fi
-  sleep 2
+    "https://127.0.0.1:${GLPI_TEST_CLEANUP_HTTPS_PORT}/status.php"; do
+    if ((SECONDS > cleanup_proxy_deadline)); then
+        printf '%s\n' 'cleanup-proxy HTTPS readiness timed out.' >&2
+        exit 1
+    fi
+    sleep 2
 done
 
 # GLPI_TEST_ENDPOINT depends on the real (not preselected) HTTPS port, so it
@@ -277,11 +277,12 @@ killsession_response="${runtime_dir}/kill-session.txt"
 init_session_deadline=$((SECONDS + 60))
 init_session_ok=0
 while ((SECONDS <= init_session_deadline)); do
-  if http_status="$(curl --cacert "${tls_dir}/ca.crt" --silent --show-error --output "$init_response" --write-out '%{http_code}' \
-    -H "Authorization: user_token ${GLPI_TEST_USER_TOKEN}" \
-    -H "App-Token: ${GLPI_TEST_APP_TOKEN}" \
-    "https://127.0.0.1:${GLPI_TEST_HTTPS_PORT}/apirest.php/initSession" 2>/dev/null)" && [[ "$http_status" == '200' ]]; then
-    session_token="$(python3 - "$init_response" <<'PY'
+    if http_status="$(curl --cacert "${tls_dir}/ca.crt" --silent --show-error --output "$init_response" --write-out '%{http_code}' \
+        -H "Authorization: user_token ${GLPI_TEST_USER_TOKEN}" \
+        -H "App-Token: ${GLPI_TEST_APP_TOKEN}" \
+        "https://127.0.0.1:${GLPI_TEST_HTTPS_PORT}/apirest.php/initSession" 2>/dev/null)" && [[ "$http_status" == '200' ]]; then
+        session_token="$(
+            python3 - "$init_response" <<'PY'
 import json
 import sys
 value = json.load(open(sys.argv[1], encoding="utf-8")).get("session_token")
@@ -289,14 +290,14 @@ if not isinstance(value, str) or not value:
     raise SystemExit(1)
 print(value)
 PY
-)" || session_token=''
-    if [[ -n "$session_token" ]]; then
-      mask_secret "$session_token"
-      kill_status="$(curl --cacert "${tls_dir}/ca.crt" --silent --show-error --output "$killsession_response" --write-out '%{http_code}' \
-        -H "Session-Token: ${session_token}" \
-        -H "App-Token: ${GLPI_TEST_APP_TOKEN}" \
-        "https://127.0.0.1:${GLPI_TEST_HTTPS_PORT}/apirest.php/killSession" 2>/dev/null)" || kill_status=''
-      if [[ "$kill_status" == '200' ]] && python3 - "$killsession_response" >/dev/null 2>&1 <<'PY'
+        )" || session_token=''
+        if [[ -n "$session_token" ]]; then
+            mask_secret "$session_token"
+            kill_status="$(curl --cacert "${tls_dir}/ca.crt" --silent --show-error --output "$killsession_response" --write-out '%{http_code}' \
+                -H "Session-Token: ${session_token}" \
+                -H "App-Token: ${GLPI_TEST_APP_TOKEN}" \
+                "https://127.0.0.1:${GLPI_TEST_HTTPS_PORT}/apirest.php/killSession" 2>/dev/null)" || kill_status=''
+            if [[ "$kill_status" == '200' ]] && python3 - "$killsession_response" >/dev/null 2>&1 <<'PY'
 import json
 import sys
 
@@ -304,19 +305,19 @@ with open(sys.argv[1], encoding="utf-8") as response:
     if json.load(response) is not True:
         raise SystemExit(1)
 PY
-      then
-        init_session_ok=1
-        break
-      fi
+            then
+                init_session_ok=1
+                break
+            fi
+        fi
     fi
-  fi
-  sleep 2
+    sleep 2
 done
 rm -f "$init_response" "$killsession_response"
 
 if [[ "$init_session_ok" != '1' ]]; then
-  printf '%s\n' 'initSession and killSession did not both succeed with the generated credentials.' >&2
-  exit 1
+    printf '%s\n' 'initSession and killSession did not both succeed with the generated credentials.' >&2
+    exit 1
 fi
 
 printf 'export GLPI_TEST_RUNTIME_ENV=%q\n' "$runtime_env"

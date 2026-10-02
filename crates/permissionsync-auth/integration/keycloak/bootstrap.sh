@@ -9,7 +9,7 @@
 #
 # The environment is disposable in every respect: an ephemeral CA and server
 # certificate, an in-memory Keycloak store, container-engine-assigned host
-# ports, and client secrets generated per run and exposed only through a
+# ports, and client secrets generated per run and persisted only in a
 # private runtime-env file.
 set -euo pipefail
 
@@ -52,17 +52,17 @@ chmod 644 "$proxy_conf"
 # escaping model of the real-GLPI bootstrap in
 # crates/permissionsync-adapter-glpi/integration/glpi/bootstrap.sh.
 env_put() {
-  local name="$1" value="$2" escaped
-  case "$value" in
-  *$'\r'* | *$'\n'* | *'`'*)
-    printf '%s\n' 'runtime.env write refused: a generated value contained a disallowed character (CR, LF, or backtick).' >&2
-    exit 1
-    ;;
-  esac
-  escaped="${value//\\/\\\\}"
-  escaped="${escaped//\"/\\\"}"
-  escaped="${escaped//\$/\\\$}"
-  printf '%s="%s"\n' "$name" "$escaped" >> "$runtime_env"
+    local name="$1" value="$2" escaped
+    case "$value" in
+    *$'\r'* | *$'\n'* | *'`'*)
+        printf '%s\n' 'runtime.env write refused: a generated value contained a disallowed character (CR, LF, or backtick).' >&2
+        exit 1
+        ;;
+    esac
+    escaped="${value//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    escaped="${escaped//\$/\\\$}"
+    printf '%s="%s"\n' "$name" "$escaped" >>"$runtime_env"
 }
 
 # GitHub `::add-mask::` workflow commands only make sense, and are only safe,
@@ -71,9 +71,9 @@ env_put() {
 # would otherwise try to execute `::add-mask::<secret>` as a command and could
 # echo the secret in the resulting error.
 mask_secret() {
-  if [[ "${GITHUB_ACTIONS:-}" == 'true' ]]; then
-    printf '::add-mask::%s\n' "$1"
-  fi
+    if [[ "${GITHUB_ACTIONS:-}" == 'true' ]]; then
+        printf '::add-mask::%s\n' "$1"
+    fi
 }
 
 # If bootstrap fails after the runtime directory (and possibly containers)
@@ -81,16 +81,16 @@ mask_secret() {
 # commands, never runtime.env contents or credentials, and never delete
 # anything here: diagnostics.sh/teardown.sh own that.
 report_recovery_on_failure() {
-  local status=$?
-  if ((status != 0)); then
-    {
-      printf '%s\n' 'Bootstrap failed after creating a disposable runtime directory.'
-      printf 'Runtime env locator: %s\n' "$runtime_env"
-      printf 'Diagnostics: KEYCLOAK_TEST_RUNTIME_ENV=%q ./diagnostics.sh\n' "$runtime_env"
-      printf 'Teardown:   KEYCLOAK_TEST_RUNTIME_ENV=%q ./teardown.sh\n' "$runtime_env"
-    } >&2
-  fi
-  exit "$status"
+    local status=$?
+    if ((status != 0)); then
+        {
+            printf '%s\n' 'Bootstrap failed after creating a disposable runtime directory.'
+            printf 'Runtime env locator: %s\n' "$runtime_env"
+            printf 'Diagnostics: KEYCLOAK_TEST_RUNTIME_ENV=%q ./diagnostics.sh\n' "$runtime_env"
+            printf 'Teardown:   KEYCLOAK_TEST_RUNTIME_ENV=%q ./teardown.sh\n' "$runtime_env"
+        } >&2
+    fi
+    exit "$status"
 }
 trap report_recovery_on_failure EXIT
 
@@ -109,11 +109,11 @@ env_put KEYCLOAK_TEST_RUNTIME_ENV "$runtime_env"
 # The compose file's pinned image tag is the single declaration of the
 # supported release, so Renovate updating it there needs no second edit here.
 keycloak_release="$(sed -n \
-  's|^[[:space:]]*image:[[:space:]]*quay\.io/keycloak/keycloak:\([^@[:space:]]*\)@.*|\1|p' \
-  "${script_dir}/docker-compose.yml")"
+    's|^[[:space:]]*image:[[:space:]]*quay\.io/keycloak/keycloak:\([^@[:space:]]*\)@.*|\1|p' \
+    "${script_dir}/docker-compose.yml")"
 if [[ -z "$keycloak_release" ]]; then
-  printf '%s\n' 'Could not read the pinned Keycloak release from docker-compose.yml.' >&2
-  exit 1
+    printf '%s\n' 'Could not read the pinned Keycloak release from docker-compose.yml.' >&2
+    exit 1
 fi
 env_put KEYCLOAK_TEST_RELEASE "$keycloak_release"
 
@@ -122,22 +122,22 @@ env_put KEYCLOAK_TEST_RELEASE "$keycloak_release"
 # provision.stderr/compose.stderr even if bootstrap fails below. This is a
 # filesystem path locator only; it is never a secret value.
 if [[ -n "${GITHUB_ENV:-}" ]]; then
-  printf 'KEYCLOAK_TEST_RUNTIME_ENV=%s\n' "$runtime_env" >> "$GITHUB_ENV"
+    printf 'KEYCLOAK_TEST_RUNTIME_ENV=%s\n' "$runtime_env" >>"$GITHUB_ENV"
 fi
 
 compose() {
-  docker compose --env-file "$runtime_env" -p "$project_name" "$@"
+    docker compose --env-file "$runtime_env" -p "$project_name" "$@"
 }
 
 discover_published_port() {
-  local service="$1" container_port="$2" mapping port
-  mapping="$(compose port "$service" "$container_port")"
-  port="${mapping##*:}"
-  if [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]]; then
-    printf 'Could not determine the assigned host port for %s:%s.\n' "$service" "$container_port" >&2
-    exit 1
-  fi
-  printf '%s\n' "$port"
+    local service="$1" container_port="$2" mapping port
+    mapping="$(compose port "$service" "$container_port")"
+    port="${mapping##*:}"
+    if [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]]; then
+        printf 'Could not determine the assigned host port for %s:%s.\n' "$service" "$container_port" >&2
+        exit 1
+    fi
+    printf '%s\n' "$port"
 }
 
 # Disposable local trust: one ephemeral CA signs one server certificate whose
@@ -150,20 +150,20 @@ discover_published_port() {
 # usage a strict verifier requires, so every client in this environment keeps
 # full certificate and hostname validation enabled.
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
-  -keyout "${tls_dir}/ca.key" -out "${tls_dir}/ca.crt" \
-  -subj "/CN=permissionsync-keycloak-real-integration-ca" \
-  -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' \
-  -addext 'keyUsage=critical,keyCertSign,cRLSign' >/dev/null 2>&1
+    -keyout "${tls_dir}/ca.key" -out "${tls_dir}/ca.crt" \
+    -subj "/CN=permissionsync-keycloak-real-integration-ca" \
+    -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' \
+    -addext 'keyUsage=critical,keyCertSign,cRLSign' >/dev/null 2>&1
 openssl req -newkey rsa:2048 -nodes \
-  -keyout "${tls_dir}/server.key" -out "${tls_dir}/server.csr" \
-  -subj "/CN=keycloak" >/dev/null 2>&1
+    -keyout "${tls_dir}/server.key" -out "${tls_dir}/server.csr" \
+    -subj "/CN=keycloak" >/dev/null 2>&1
 openssl x509 -req -in "${tls_dir}/server.csr" -CA "${tls_dir}/ca.crt" -CAkey "${tls_dir}/ca.key" \
-  -CAcreateserial -days 2 -out "${tls_dir}/server.crt" \
-  -extfile <(printf '%s\n' \
-    'basicConstraints=critical,CA:FALSE' \
-    'keyUsage=critical,digitalSignature,keyEncipherment' \
-    'extendedKeyUsage=serverAuth' \
-    'subjectAltName=IP:127.0.0.1,DNS:keycloak,DNS:localhost') >/dev/null 2>&1
+    -CAcreateserial -days 2 -out "${tls_dir}/server.crt" \
+    -extfile <(printf '%s\n' \
+        'basicConstraints=critical,CA:FALSE' \
+        'keyUsage=critical,digitalSignature,keyEncipherment' \
+        'extendedKeyUsage=serverAuth' \
+        'subjectAltName=IP:127.0.0.1,DNS:keycloak,DNS:localhost') >/dev/null 2>&1
 # Keycloak reads these as its own unprivileged container user. The private key
 # is an ephemeral test key that exists only inside this runtime directory and
 # is destroyed by teardown.sh.
@@ -171,8 +171,8 @@ chmod 644 "${tls_dir}/ca.crt" "${tls_dir}/server.crt" "${tls_dir}/server.key"
 chmod 600 "${tls_dir}/ca.key" "${tls_dir}/server.csr"
 
 if ! compose up -d keycloak >"$compose_stdout" 2>"$compose_stderr"; then
-  printf '%s\n' 'Keycloak did not start; captured output was redacted.' >&2
-  exit 1
+    printf '%s\n' 'Keycloak did not start; captured output was redacted.' >&2
+    exit 1
 fi
 
 https_port="$(discover_published_port keycloak 8443)"
@@ -185,21 +185,57 @@ env_put KEYCLOAK_TEST_BASE_URL "$base_url"
 # answer realm metadata", not merely "container running".
 deadline=$((SECONDS + 240))
 until curl --cacert "${tls_dir}/ca.crt" --fail --silent --output /dev/null \
-  "${base_url}/realms/master/.well-known/openid-configuration" 2>/dev/null; do
-  if ((SECONDS > deadline)); then
-    printf '%s\n' 'Keycloak HTTPS metadata readiness timed out.' >&2
-    exit 1
-  fi
-  sleep 2
+    "${base_url}/realms/master/.well-known/openid-configuration" 2>/dev/null; do
+    if ((SECONDS > deadline)); then
+        printf '%s\n' 'Keycloak HTTPS metadata readiness timed out.' >&2
+        exit 1
+    fi
+    sleep 2
 done
 
+# Client secrets are generated here, next to the administrator password
+# above, and handed to provision.py through its environment, so provisioning
+# neither creates nor prints a credential.
+caller_client_secret="$(openssl rand -hex 24)"
+minimal_client_secret="$(openssl rand -hex 24)"
+disallowed_algorithm_client_secret="$(openssl rand -hex 24)"
+shortlived_client_secret="$(openssl rand -hex 24)"
+wrong_audience_client_secret="$(openssl rand -hex 24)"
+foreign_client_secret="$(openssl rand -hex 24)"
+rotation_client_secret="$(openssl rand -hex 24)"
+for secret in \
+    "$caller_client_secret" \
+    "$minimal_client_secret" \
+    "$disallowed_algorithm_client_secret" \
+    "$shortlived_client_secret" \
+    "$wrong_audience_client_secret" \
+    "$foreign_client_secret" \
+    "$rotation_client_secret"; do
+    mask_secret "$secret"
+done
+env_put KEYCLOAK_TEST_CALLER_CLIENT_SECRET "$caller_client_secret"
+env_put KEYCLOAK_TEST_MINIMAL_CLIENT_SECRET "$minimal_client_secret"
+env_put KEYCLOAK_TEST_DISALLOWED_ALGORITHM_CLIENT_SECRET \
+    "$disallowed_algorithm_client_secret"
+env_put KEYCLOAK_TEST_SHORTLIVED_CLIENT_SECRET "$shortlived_client_secret"
+env_put KEYCLOAK_TEST_WRONG_AUDIENCE_CLIENT_SECRET "$wrong_audience_client_secret"
+env_put KEYCLOAK_TEST_FOREIGN_CLIENT_SECRET "$foreign_client_secret"
+env_put KEYCLOAK_TEST_ROTATION_CLIENT_SECRET "$rotation_client_secret"
+
 if ! KEYCLOAK_BASE_URL="$base_url" \
-  KEYCLOAK_CA_PEM="${tls_dir}/ca.crt" \
-  KEYCLOAK_ADMIN_USERNAME="$admin_username" \
-  KEYCLOAK_ADMIN_PASSWORD="$admin_password" \
-  python3 "${script_dir}/provision.py" >"$provision_stdout" 2>"$provision_stderr"; then
-  printf '%s\n' 'Keycloak provisioning failed; captured output was redacted.' >&2
-  exit 1
+    KEYCLOAK_CA_PEM="${tls_dir}/ca.crt" \
+    KEYCLOAK_ADMIN_USERNAME="$admin_username" \
+    KEYCLOAK_ADMIN_PASSWORD="$admin_password" \
+    KEYCLOAK_CLIENT_SECRET_CALLER="$caller_client_secret" \
+    KEYCLOAK_CLIENT_SECRET_MINIMAL="$minimal_client_secret" \
+    KEYCLOAK_CLIENT_SECRET_DISALLOWED_ALGORITHM="$disallowed_algorithm_client_secret" \
+    KEYCLOAK_CLIENT_SECRET_SHORTLIVED="$shortlived_client_secret" \
+    KEYCLOAK_CLIENT_SECRET_WRONG_AUDIENCE="$wrong_audience_client_secret" \
+    KEYCLOAK_CLIENT_SECRET_FOREIGN="$foreign_client_secret" \
+    KEYCLOAK_CLIENT_SECRET_ROTATION="$rotation_client_secret" \
+    python3 "${script_dir}/provision.py" >"$provision_stdout" 2>"$provision_stderr"; then
+    printf '%s\n' 'Keycloak provisioning failed; captured output was redacted.' >&2
+    exit 1
 fi
 
 python3 - "$provision_stdout" "$runtime_env" <<'PY'
@@ -223,20 +259,13 @@ expected = {
     "LOOKALIKE_PREFIX_SCOPE",
     "LOOKALIKE_SUFFIX_SCOPE",
     "CALLER_CLIENT_ID",
-    "CALLER_CLIENT_SECRET",
     "MINIMAL_CLIENT_ID",
-    "MINIMAL_CLIENT_SECRET",
     "DISALLOWED_ALGORITHM_CLIENT_ID",
-    "DISALLOWED_ALGORITHM_CLIENT_SECRET",
     "SHORTLIVED_CLIENT_ID",
-    "SHORTLIVED_CLIENT_SECRET",
     "WRONG_AUDIENCE_CLIENT_ID",
-    "WRONG_AUDIENCE_CLIENT_SECRET",
     "FOREIGN_CLIENT_ID",
-    "FOREIGN_CLIENT_SECRET",
     "ROTATION_REALM",
     "ROTATION_CLIENT_ID",
-    "ROTATION_CLIENT_SECRET",
 }
 values = {}
 with open(output_path, encoding="utf-8") as output:
@@ -264,16 +293,6 @@ PY
 
 # shellcheck disable=SC1090
 source "$runtime_env"
-for secret in \
-  "$KEYCLOAK_TEST_CALLER_CLIENT_SECRET" \
-  "$KEYCLOAK_TEST_MINIMAL_CLIENT_SECRET" \
-  "$KEYCLOAK_TEST_DISALLOWED_ALGORITHM_CLIENT_SECRET" \
-  "$KEYCLOAK_TEST_SHORTLIVED_CLIENT_SECRET" \
-  "$KEYCLOAK_TEST_WRONG_AUDIENCE_CLIENT_SECRET" \
-  "$KEYCLOAK_TEST_FOREIGN_CLIENT_SECRET" \
-  "$KEYCLOAK_TEST_ROTATION_CLIENT_SECRET"; do
-  mask_secret "$secret"
-done
 
 realm_base="${base_url}/realms/${KEYCLOAK_TEST_REALM}"
 env_put KEYCLOAK_TEST_ISSUER "$realm_base"
@@ -281,14 +300,14 @@ env_put KEYCLOAK_TEST_DISCOVERY_URI "${realm_base}/.well-known/openid-configurat
 env_put KEYCLOAK_TEST_JWKS_URI "${realm_base}/protocol/openid-connect/certs"
 env_put KEYCLOAK_TEST_TOKEN_ENDPOINT "${realm_base}/protocol/openid-connect/token"
 env_put KEYCLOAK_TEST_FOREIGN_TOKEN_ENDPOINT \
-  "${base_url}/realms/${KEYCLOAK_TEST_FOREIGN_REALM}/protocol/openid-connect/token"
+    "${base_url}/realms/${KEYCLOAK_TEST_FOREIGN_REALM}/protocol/openid-connect/token"
 
 rotation_realm_base="${base_url}/realms/${KEYCLOAK_TEST_ROTATION_REALM}"
 env_put KEYCLOAK_TEST_ROTATION_ISSUER "$rotation_realm_base"
 env_put KEYCLOAK_TEST_ROTATION_DISCOVERY_URI \
-  "${rotation_realm_base}/.well-known/openid-configuration"
+    "${rotation_realm_base}/.well-known/openid-configuration"
 env_put KEYCLOAK_TEST_ROTATION_TOKEN_ENDPOINT \
-  "${rotation_realm_base}/protocol/openid-connect/token"
+    "${rotation_realm_base}/protocol/openid-connect/token"
 
 # The production image reaches Keycloak over the compose network rather than
 # through the host's published port, so the smoke test needs the in-network
@@ -296,41 +315,41 @@ env_put KEYCLOAK_TEST_ROTATION_TOKEN_ENDPOINT \
 # above, which is exactly what ADR-0002 allows: a trusted JWKS source may be
 # reached at a different host name than the issuer it belongs to.
 env_put KEYCLOAK_TEST_INTERNAL_JWKS_URI \
-  "https://keycloak:8443/realms/${KEYCLOAK_TEST_REALM}/protocol/openid-connect/certs"
+    "https://keycloak:8443/realms/${KEYCLOAK_TEST_REALM}/protocol/openid-connect/certs"
 env_put KEYCLOAK_TEST_COMPOSE_NETWORK "${project_name}_default"
 
 if ! compose up -d outage-proxy >>"$compose_stdout" 2>>"$compose_stderr"; then
-  printf '%s\n' 'The disposable outage proxy did not start; captured output was redacted.' >&2
-  exit 1
+    printf '%s\n' 'The disposable outage proxy did not start; captured output was redacted.' >&2
+    exit 1
 fi
 
 outage_port="$(discover_published_port outage-proxy 8444)"
 env_put KEYCLOAK_TEST_OUTAGE_JWKS_URI \
-  "https://127.0.0.1:${outage_port}/realms/${KEYCLOAK_TEST_REALM}/protocol/openid-connect/certs"
+    "https://127.0.0.1:${outage_port}/realms/${KEYCLOAK_TEST_REALM}/protocol/openid-connect/certs"
 
 # The forwarder has no container healthcheck, so prove the published listener
 # really reaches Keycloak's JWKS endpoint through the generated CA before the
 # suite depends on it.
 outage_deadline=$((SECONDS + 60))
 until curl --cacert "${tls_dir}/ca.crt" --fail --silent --output /dev/null \
-  "https://127.0.0.1:${outage_port}/realms/${KEYCLOAK_TEST_REALM}/protocol/openid-connect/certs" 2>/dev/null; do
-  if ((SECONDS > outage_deadline)); then
-    printf '%s\n' 'Disposable outage-proxy HTTPS readiness timed out.' >&2
-    exit 1
-  fi
-  sleep 2
+    "https://127.0.0.1:${outage_port}/realms/${KEYCLOAK_TEST_REALM}/protocol/openid-connect/certs" 2>/dev/null; do
+    if ((SECONDS > outage_deadline)); then
+        printf '%s\n' 'Disposable outage-proxy HTTPS readiness timed out.' >&2
+        exit 1
+    fi
+    sleep 2
 done
 
 # Prove the provisioned realm really issues the token contract the suite
 # depends on before declaring the environment ready. Only the presence of the
 # token is checked here; no token, claim set, or secret is printed.
 if ! curl --cacert "${tls_dir}/ca.crt" --fail --silent --show-error --output /dev/null \
-  --data "@-" "${realm_base}/protocol/openid-connect/token" <<REQUEST
+    --data "@-" "${realm_base}/protocol/openid-connect/token" <<REQUEST
 grant_type=client_credentials&client_id=${KEYCLOAK_TEST_CALLER_CLIENT_ID}&client_secret=${KEYCLOAK_TEST_CALLER_CLIENT_SECRET}
 REQUEST
 then
-  printf '%s\n' 'The provisioned technical caller could not obtain a Client Credentials token.' >&2
-  exit 1
+    printf '%s\n' 'The provisioned technical caller could not obtain a Client Credentials token.' >&2
+    exit 1
 fi
 
 printf 'export KEYCLOAK_TEST_RUNTIME_ENV=%q\n' "$runtime_env"
