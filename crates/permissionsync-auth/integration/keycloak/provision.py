@@ -101,7 +101,15 @@ class AdminApi:
         self.token = self._administrator_token(username, password)
 
     def _open(self, request: urllib.request.Request) -> tuple[int, bytes]:
+        # Every URL here is built from KEYCLOAK_BASE_URL, which the reviewed
+        # bootstrap sets to the disposable local HTTPS Keycloak endpoint
+        # (https://127.0.0.1 plus the container-assigned port). No scheme or
+        # host is caller-controlled, so the rule's generic concern about a
+        # dynamic value selecting file:// or another scheme does not apply, and
+        # the certificate and hostname verification configured above stays
+        # mandatory.
         try:
+            # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             with urllib.request.urlopen(
                 request, context=self.context, timeout=30
             ) as response:

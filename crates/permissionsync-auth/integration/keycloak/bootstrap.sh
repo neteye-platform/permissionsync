@@ -96,6 +96,7 @@ trap report_recovery_on_failure EXIT
 
 admin_username='permissionsync-contract-admin'
 admin_password="$(openssl rand -hex 24)"
+mask_secret "$admin_password"
 env_put KEYCLOAK_TEST_ADMIN_USERNAME "$admin_username"
 env_put KEYCLOAK_TEST_ADMIN_PASSWORD "$admin_password"
 env_put KEYCLOAK_TEST_TLS_DIR "$tls_dir"
@@ -115,7 +116,6 @@ if [[ -z "$keycloak_release" ]]; then
   exit 1
 fi
 env_put KEYCLOAK_TEST_RELEASE "$keycloak_release"
-mask_secret "$admin_password"
 
 # Export the runtime-env locator to $GITHUB_ENV as soon as the runtime
 # directory and its diagnostic files exist, so a later CI step can find
