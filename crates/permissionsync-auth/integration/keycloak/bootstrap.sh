@@ -234,6 +234,9 @@ expected = {
     "WRONG_AUDIENCE_CLIENT_SECRET",
     "FOREIGN_CLIENT_ID",
     "FOREIGN_CLIENT_SECRET",
+    "ROTATION_REALM",
+    "ROTATION_CLIENT_ID",
+    "ROTATION_CLIENT_SECRET",
 }
 values = {}
 with open(output_path, encoding="utf-8") as output:
@@ -267,7 +270,8 @@ for secret in \
   "$KEYCLOAK_TEST_DISALLOWED_ALGORITHM_CLIENT_SECRET" \
   "$KEYCLOAK_TEST_SHORTLIVED_CLIENT_SECRET" \
   "$KEYCLOAK_TEST_WRONG_AUDIENCE_CLIENT_SECRET" \
-  "$KEYCLOAK_TEST_FOREIGN_CLIENT_SECRET"; do
+  "$KEYCLOAK_TEST_FOREIGN_CLIENT_SECRET" \
+  "$KEYCLOAK_TEST_ROTATION_CLIENT_SECRET"; do
   mask_secret "$secret"
 done
 
@@ -278,6 +282,13 @@ env_put KEYCLOAK_TEST_JWKS_URI "${realm_base}/protocol/openid-connect/certs"
 env_put KEYCLOAK_TEST_TOKEN_ENDPOINT "${realm_base}/protocol/openid-connect/token"
 env_put KEYCLOAK_TEST_FOREIGN_TOKEN_ENDPOINT \
   "${base_url}/realms/${KEYCLOAK_TEST_FOREIGN_REALM}/protocol/openid-connect/token"
+
+rotation_realm_base="${base_url}/realms/${KEYCLOAK_TEST_ROTATION_REALM}"
+env_put KEYCLOAK_TEST_ROTATION_ISSUER "$rotation_realm_base"
+env_put KEYCLOAK_TEST_ROTATION_DISCOVERY_URI \
+  "${rotation_realm_base}/.well-known/openid-configuration"
+env_put KEYCLOAK_TEST_ROTATION_TOKEN_ENDPOINT \
+  "${rotation_realm_base}/protocol/openid-connect/token"
 
 # The production image reaches Keycloak over the compose network rather than
 # through the host's published port, so the smoke test needs the in-network

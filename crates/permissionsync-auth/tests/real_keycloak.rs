@@ -40,13 +40,14 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Request, StatusCode,
-    header::{ACCEPT, CONTENT_TYPE},
+    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
 };
 use hyper_tls::HttpsConnector;
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioTimer},
 };
+use josekit::{jws::JwsHeader, jwt::JwtContext};
 use permissionsync_auth::{
     AuthenticationError, AuthenticationRequest, JwtAlgorithm, TargetSelection,
     TechnicalCallerAuthenticator, TechnicalCallerAuthenticatorConfig, TrustedVerificationSource,
@@ -85,6 +86,21 @@ const CLOCK_SKEW: Duration = Duration::from_secs(30);
 /// has elapsed, so the expiry assertion never races the boundary it is testing.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(2);
 
+/// How far above the realm's highest existing key-provider priority the
+/// rotation test places its new provider. Keycloak selects an algorithm's
+/// active key from the highest-priority active provider, so a strictly higher
+/// priority is what makes the new key the realm's signing key, the way a real
+/// rotation does. Derived from the realm rather than fixed, so rotating twice
+/// in one disposable environment still rotates.
+const ROTATED_KEY_PRIORITY_STEP: i64 = 100;
+
+/// Bounded window in which Keycloak must report the rotated key as active.
+/// Polled on the administrative key listing, which is authoritative, rather
+/// than waited out blindly.
+const ROTATION_VISIBLE_WITHIN: Duration = Duration::from_secs(30);
+
+const ROTATION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 struct NeverCancelled;
 
 impl CancellationSignal for NeverCancelled {
@@ -99,6 +115,9 @@ fn context(cancellation: &NeverCancelled) -> SynchronizationContext<'_> {
 
 struct RealKeycloakEnvironment {
     release: String,
+    base_url: String,
+    admin_username: String,
+    admin_password: String,
     issuer: String,
     discovery_uri: String,
     jwks_uri: String,
@@ -128,6 +147,14 @@ struct RealKeycloakEnvironment {
     case_different_scope: String,
     lookalike_prefix_scope: String,
     lookalike_suffix_scope: String,
+    /// A realm used by nothing but the signing-key rotation test, so rotating
+    /// its active key cannot disturb the realm the other cases share.
+    rotation_realm: String,
+    rotation_issuer: String,
+    rotation_discovery_uri: String,
+    rotation_token_endpoint: String,
+    rotation_client_id: String,
+    rotation_client_secret: String,
 }
 
 /// Loads the disposable environment the bootstrap emitted. This deliberately
@@ -147,6 +174,9 @@ fn real_environment() -> RealKeycloakEnvironment {
 
     RealKeycloakEnvironment {
         release: required("KEYCLOAK_TEST_RELEASE"),
+        base_url: required("KEYCLOAK_TEST_BASE_URL"),
+        admin_username: required("KEYCLOAK_TEST_ADMIN_USERNAME"),
+        admin_password: required("KEYCLOAK_TEST_ADMIN_PASSWORD"),
         issuer: required("KEYCLOAK_TEST_ISSUER"),
         discovery_uri: required("KEYCLOAK_TEST_DISCOVERY_URI"),
         jwks_uri: required("KEYCLOAK_TEST_JWKS_URI"),
@@ -178,6 +208,12 @@ fn real_environment() -> RealKeycloakEnvironment {
         case_different_scope: required("KEYCLOAK_TEST_CASE_DIFFERENT_SCOPE"),
         lookalike_prefix_scope: required("KEYCLOAK_TEST_LOOKALIKE_PREFIX_SCOPE"),
         lookalike_suffix_scope: required("KEYCLOAK_TEST_LOOKALIKE_SUFFIX_SCOPE"),
+        rotation_realm: required("KEYCLOAK_TEST_ROTATION_REALM"),
+        rotation_issuer: required("KEYCLOAK_TEST_ROTATION_ISSUER"),
+        rotation_discovery_uri: required("KEYCLOAK_TEST_ROTATION_DISCOVERY_URI"),
+        rotation_token_endpoint: required("KEYCLOAK_TEST_ROTATION_TOKEN_ENDPOINT"),
+        rotation_client_id: required("KEYCLOAK_TEST_ROTATION_CLIENT_ID"),
+        rotation_client_secret: required("KEYCLOAK_TEST_ROTATION_CLIENT_SECRET"),
     }
 }
 
@@ -187,12 +223,13 @@ fn real_environment() -> RealKeycloakEnvironment {
 /// authenticator's own TLS construction forbids disabling either.
 fn build_authenticator(
     environment: &RealKeycloakEnvironment,
+    issuer: &str,
     source: TrustedVerificationSource,
     algorithms: Vec<JwtAlgorithm>,
     freshness: Duration,
 ) -> TechnicalCallerAuthenticator {
     let config = TechnicalCallerAuthenticatorConfig::new(
-        environment.issuer.clone(),
+        issuer.to_owned(),
         environment.audience.clone(),
         source,
         algorithms,
@@ -210,6 +247,7 @@ fn build_authenticator(
 fn baseline_authenticator(environment: &RealKeycloakEnvironment) -> TechnicalCallerAuthenticator {
     build_authenticator(
         environment,
+        &environment.issuer,
         TrustedVerificationSource::OidcDiscovery {
             uri: environment.discovery_uri.clone(),
         },
@@ -375,6 +413,208 @@ fn pinned_keycloak_release() -> String {
         .expect("the compose file pins the Keycloak image by tag and digest")
 }
 
+/// The `kid` a compact token's JOSE header names.
+///
+/// Reads the header with the same library the production verifier uses. A
+/// `kid` is public key metadata, not a credential, and no part of the token is
+/// returned or printed.
+fn token_key_id(compact: &str) -> String {
+    let header = JwtContext::new()
+        .decode_header(compact)
+        .expect("a Keycloak-issued token carries a decodable JOSE header");
+    header
+        .as_any()
+        .downcast_ref::<JwsHeader>()
+        .and_then(JwsHeader::key_id)
+        .expect("a Keycloak-issued access token names its signing key")
+        .to_owned()
+}
+
+/// Obtains a Keycloak administrator token over the same verified HTTPS
+/// endpoint and trust material as the rest of this suite.
+///
+/// The disposable administrator password travels in the request body, so it
+/// never reaches a process argument vector, and the token is never printed.
+async fn administrator_token(environment: &RealKeycloakEnvironment) -> String {
+    let form = format!(
+        "grant_type=password&client_id=admin-cli&username={}&password={}",
+        form_encode(&environment.admin_username),
+        form_encode(&environment.admin_password)
+    );
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "{}/realms/master/protocol/openid-connect/token",
+            environment.base_url
+        ))
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(ACCEPT, "application/json")
+        .body(Full::new(Bytes::from(form)))
+        .expect("the administrator token request is well formed");
+    let response = https_client(environment)
+        .request(request)
+        .await
+        .expect("the disposable Keycloak token endpoint answered over HTTPS");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the disposable administrator could not obtain a token"
+    );
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("the administrator token response was readable")
+        .to_bytes();
+    serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .as_ref()
+        .and_then(|document| document.get("access_token"))
+        .and_then(serde_json::Value::as_str)
+        .expect("the administrator token response carries an access token")
+        .to_owned()
+}
+
+/// Issues one Keycloak Admin REST request. Only the two calls the rotation
+/// test needs are exercised; this is deliberately not a general-purpose
+/// administration client.
+async fn administrative_request(
+    environment: &RealKeycloakEnvironment,
+    administrator_token: &str,
+    method: &str,
+    path: &str,
+    json_body: Option<String>,
+) -> (StatusCode, Bytes) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(format!("{}/admin/realms{path}", environment.base_url))
+        .header(AUTHORIZATION, format!("Bearer {administrator_token}"))
+        .header(ACCEPT, "application/json");
+    if json_body.is_some() {
+        builder = builder.header(CONTENT_TYPE, "application/json");
+    }
+    let request = builder
+        .body(Full::new(Bytes::from(json_body.unwrap_or_default())))
+        .expect("the administrative request is well formed");
+    let response = https_client(environment)
+        .request(request)
+        .await
+        .expect("the disposable Keycloak admin API answered over HTTPS");
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("the administrative response was readable")
+        .to_bytes();
+    (status, body)
+}
+
+/// The `kid` Keycloak currently reports as the rotation realm's active RS256
+/// signing key. This is the realm's own authoritative answer, so the test never
+/// has to infer which key rotation selected.
+async fn active_signing_key(
+    environment: &RealKeycloakEnvironment,
+    administrator_token: &str,
+) -> String {
+    let (status, body) = administrative_request(
+        environment,
+        administrator_token,
+        "GET",
+        &format!("/{}/keys", environment.rotation_realm),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the rotation realm's key listing must be readable"
+    );
+    serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .as_ref()
+        .and_then(|document| document.get("active"))
+        .and_then(|active| active.get("RS256"))
+        .and_then(serde_json::Value::as_str)
+        .expect("the rotation realm reports an active RS256 signing key")
+        .to_owned()
+}
+
+/// The priority that will outrank every key provider the rotation realm
+/// currently has, read from the realm itself.
+async fn next_signing_priority(
+    environment: &RealKeycloakEnvironment,
+    administrator_token: &str,
+) -> i64 {
+    let (status, body) = administrative_request(
+        environment,
+        administrator_token,
+        "GET",
+        &format!(
+            "/{}/components?type=org.keycloak.keys.KeyProvider",
+            environment.rotation_realm
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the rotation realm's key providers must be readable"
+    );
+    let components: serde_json::Value =
+        serde_json::from_slice(&body).expect("the key-provider listing is JSON");
+    let highest = components
+        .as_array()
+        .expect("the key-provider listing is an array")
+        .iter()
+        .filter_map(|component| {
+            component
+                .get("config")
+                .and_then(|config| config.get("priority"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(serde_json::Value::as_str)
+                .and_then(|priority| priority.parse::<i64>().ok())
+        })
+        .max()
+        .unwrap_or(0);
+    highest + ROTATED_KEY_PRIORITY_STEP
+}
+
+/// Rotates the rotation realm's signing key the way Keycloak supports it: by
+/// adding a generated RS256 key provider that outranks the realm's existing
+/// ones, which makes its key the active signing key. The previous provider
+/// stays enabled, so Keycloak keeps publishing the old public key for
+/// verification exactly as it does in production.
+async fn rotate_signing_key(environment: &RealKeycloakEnvironment, administrator_token: &str) {
+    let priority = next_signing_priority(environment, administrator_token).await;
+    let component = serde_json::json!({
+        "providerId": "rsa-generated",
+        "providerType": "org.keycloak.keys.KeyProvider",
+        "config": {
+            "priority": [priority.to_string()],
+            "enabled": ["true"],
+            "active": ["true"],
+            "algorithm": ["RS256"],
+            "keySize": ["2048"],
+        },
+    });
+    let (status, _) = administrative_request(
+        environment,
+        administrator_token,
+        "POST",
+        &format!("/{}/components", environment.rotation_realm),
+        Some(component.to_string()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "Keycloak did not accept the new signing key provider"
+    );
+}
+
 /// Runs one `docker compose` subcommand against this run's disposable project.
 ///
 /// The compose file is addressed explicitly so the command does not depend on
@@ -506,6 +746,7 @@ async fn direct_jwks_source_verifies_a_real_token() {
     let environment = real_environment();
     let subject = build_authenticator(
         &environment,
+        &environment.issuer,
         TrustedVerificationSource::DirectJwks {
             uri: environment.jwks_uri.clone(),
         },
@@ -728,6 +969,7 @@ async fn a_real_token_signed_with_a_disallowed_algorithm_is_rejected() {
     // rejection above was the allowlist rather than a broken fixture.
     let permissive = build_authenticator(
         &environment,
+        &environment.issuer,
         TrustedVerificationSource::OidcDiscovery {
             uri: environment.discovery_uri.clone(),
         },
@@ -738,6 +980,128 @@ async fn a_real_token_signed_with_a_disallowed_algorithm_is_rejected() {
         selected_target(&permissive, &token.compact).await,
         None,
         "the RS512 fixture is a valid token under an allowlist that permits it"
+    );
+}
+
+/// A real Keycloak signing-key rotation must not cause an authentication
+/// outage.
+///
+/// Keycloak rotates by making a higher-priority key provider's key the realm's
+/// active signing key while still publishing the previous public key, so every
+/// replica holding a still-fresh JWKS suddenly sees tokens signed by a `kid` it
+/// has never seen. If PermissionSync waited for its cache to age out before
+/// refreshing, every caller would be rejected until it did. This proves it
+/// refreshes on the unknown key instead, and that tokens issued before the
+/// rotation keep working.
+///
+/// The rotation happens in a realm dedicated to this test, so it is safe while
+/// the test runner executes the rest of this suite concurrently, and it needs
+/// no second Keycloak container.
+#[tokio::test]
+#[ignore = "requires a disposable real Keycloak environment; see integration/keycloak/bootstrap.sh"]
+async fn a_real_signing_key_rotation_causes_no_authentication_outage() {
+    let environment = real_environment();
+    let cancellation = NeverCancelled;
+
+    // Discovery, so the refresh below covers the whole real path: discovery
+    // document, then the rotated JWKS it points at.
+    let subject = build_authenticator(
+        &environment,
+        &environment.rotation_issuer,
+        TrustedVerificationSource::OidcDiscovery {
+            uri: environment.rotation_discovery_uri.clone(),
+        },
+        vec![JwtAlgorithm::RS256],
+        LONG_FRESHNESS,
+    );
+
+    let administrator = administrator_token(&environment).await;
+    let key_before = active_signing_key(&environment, &administrator).await;
+
+    // Warm the verifier from the realm's original key and prove a token signed
+    // by it authenticates, so the state the rotation invalidates is real.
+    assert_eq!(
+        subject
+            .ensure_trusted_verifier_state(&context(&cancellation))
+            .await,
+        TrustedVerifierState::Usable,
+        "the rotation realm must establish usable trusted state before rotating"
+    );
+    let token_before = issue_token(
+        &environment,
+        &environment.rotation_token_endpoint,
+        &environment.rotation_client_id,
+        &environment.rotation_client_secret,
+        Some(&environment.target_scope),
+    )
+    .await;
+    assert!(
+        token_key_id(&token_before.compact) == key_before,
+        "the pre-rotation token must be signed by the realm's original key"
+    );
+    assert_eq!(
+        selected_target(&subject, &token_before.compact)
+            .await
+            .as_deref(),
+        Some(SELECTED_LOGICAL_TARGET),
+        "a token signed by the original key must authenticate before rotation"
+    );
+
+    rotate_signing_key(&environment, &administrator).await;
+
+    // Keycloak's own key listing is the authority on which key is active, so
+    // this waits for that state rather than assuming the POST took effect.
+    let deadline = Instant::now() + ROTATION_VISIBLE_WITHIN;
+    let mut key_after = active_signing_key(&environment, &administrator).await;
+    while key_after == key_before {
+        assert!(
+            Instant::now() < deadline,
+            "Keycloak did not report a rotated active RS256 signing key in time"
+        );
+        tokio::time::sleep(ROTATION_POLL_INTERVAL).await;
+        key_after = active_signing_key(&environment, &administrator).await;
+    }
+    assert!(
+        key_after != key_before,
+        "the realm must have selected a different active signing key"
+    );
+
+    let token_after = issue_token(
+        &environment,
+        &environment.rotation_token_endpoint,
+        &environment.rotation_client_id,
+        &environment.rotation_client_secret,
+        Some(&environment.target_scope),
+    )
+    .await;
+    assert!(
+        token_key_id(&token_after.compact) == key_after,
+        "a token issued after rotation must be signed by the new active key"
+    );
+
+    // The central assertion. This authenticator's cached JWKS is still well
+    // inside LONG_FRESHNESS and contains only the pre-rotation key, and
+    // nothing here asked it to refresh. Accepting this token therefore proves
+    // the production path noticed the unknown key and performed its own
+    // bounded trusted-source refresh.
+    assert_eq!(
+        selected_target(&subject, &token_after.compact)
+            .await
+            .as_deref(),
+        Some(SELECTED_LOGICAL_TARGET),
+        "the already-warmed authenticator must accept the rotated token immediately, \
+         without waiting for cache freshness to expire"
+    );
+
+    // Keycloak keeps publishing the previous public key after a rotation, so a
+    // token minted just before it must keep working. This is the other half of
+    // a no-downtime transition, and it is not a key-removal scenario.
+    assert_eq!(
+        selected_target(&subject, &token_before.compact)
+            .await
+            .as_deref(),
+        Some(SELECTED_LOGICAL_TARGET),
+        "a still-valid token signed by the retained previous key must keep authenticating"
     );
 }
 
@@ -755,12 +1119,14 @@ async fn cached_trusted_state_survives_a_real_metadata_source_outage() {
     };
     let fresh = build_authenticator(
         &environment,
+        &environment.issuer,
         outage_source(),
         vec![JwtAlgorithm::RS256],
         LONG_FRESHNESS,
     );
     let stale_if_error = build_authenticator(
         &environment,
+        &environment.issuer,
         outage_source(),
         vec![JwtAlgorithm::RS256],
         SHORT_FRESHNESS,
@@ -811,6 +1177,7 @@ async fn cached_trusted_state_survives_a_real_metadata_source_outage() {
     // no retained trusted state cannot establish validity at all.
     let without_cached_state = build_authenticator(
         &environment,
+        &environment.issuer,
         outage_source(),
         vec![JwtAlgorithm::RS256],
         LONG_FRESHNESS,

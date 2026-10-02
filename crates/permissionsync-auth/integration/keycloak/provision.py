@@ -36,6 +36,11 @@ import urllib.request
 REALM = "permissionsync-contract"
 FOREIGN_REALM = "permissionsync-contract-foreign"
 
+# A realm used by nothing but the signing-key rotation test. Rotation changes a
+# realm's active signing key, so it must not touch the realm the other contract
+# cases share while the test runner executes them concurrently.
+ROTATION_REALM = "permissionsync-contract-rotation"
+
 # The audience PermissionSync is configured to require. A standard Keycloak
 # Audience protocol mapper puts it into every access token below.
 AUDIENCE = "permissionsync"
@@ -225,7 +230,7 @@ def main() -> None:
     # which host name a particular client used to reach Keycloak. The container
     # smoke test therefore reaches the same realm over the compose network
     # while still receiving the issuer the suite configures.
-    for realm in (REALM, FOREIGN_REALM):
+    for realm in (REALM, FOREIGN_REALM, ROTATION_REALM):
         api.require(
             "POST",
             "",
@@ -316,6 +321,32 @@ def main() -> None:
     foreign = service_account_client("permissionsync-foreign-caller", AUDIENCE, {})
     create_client(api, FOREIGN_REALM, foreign)
 
+    # The rotation realm gets only what that one test needs: the target scope,
+    # so the authenticated result can still be asserted, and one caller.
+    api.require(
+        "POST",
+        f"/{ROTATION_REALM}/client-scopes",
+        {
+            "name": TARGET_SCOPE,
+            "protocol": "openid-connect",
+            "attributes": {
+                "include.in.token.scope": "true",
+                "display.on.consent.screen": "false",
+            },
+        },
+    )
+    rotation = service_account_client("permissionsync-rotation-caller", AUDIENCE, {})
+    rotation_uuid = create_client(api, ROTATION_REALM, rotation)
+    rotation_scope_id = next(
+        scope["id"]
+        for scope in api.get(f"/{ROTATION_REALM}/client-scopes")
+        if scope["name"] == TARGET_SCOPE
+    )
+    api.require(
+        "PUT",
+        f"/{ROTATION_REALM}/clients/{rotation_uuid}/optional-client-scopes/{rotation_scope_id}",
+    )
+
     records = {
         "REALM": REALM,
         "FOREIGN_REALM": FOREIGN_REALM,
@@ -343,6 +374,9 @@ def main() -> None:
         "WRONG_AUDIENCE_CLIENT_SECRET": wrong_audience["secret"],
         "FOREIGN_CLIENT_ID": foreign["clientId"],
         "FOREIGN_CLIENT_SECRET": foreign["secret"],
+        "ROTATION_REALM": ROTATION_REALM,
+        "ROTATION_CLIENT_ID": rotation["clientId"],
+        "ROTATION_CLIENT_SECRET": rotation["secret"],
     }
     for name, value in records.items():
         if any(character in value for character in "=\r\n`"):

@@ -95,60 +95,30 @@ so a saturated synchronization workload cannot keep them from being answered.
 They expose no secrets, URLs, targets, credentials, trust material, JWT details,
 or internal errors, and there is no general status or configuration endpoint.
 
-`inbound_admission_limit` bounds two things: how many synchronization requests
-may be admitted at once, and — through a value derived from it — how many further
-synchronization requests may be parked waiting for admission. Together those two
-values are the complete bound on synchronization requests that are admitted or
-waiting anywhere in the process, and only admitted requests buffer a body.
+`inbound_admission_limit` bounds both how many synchronization requests may be
+admitted at once and how many more may be parked waiting, and only admitted
+requests buffer a body. A parked request is woken as soon as a permit frees. A
+request arriving when both bounds are full is refused at the transport boundary
+and receives no PermissionSync response, so saturation adds no `429`, `503`, or
+other caller-facing status; such refusals are counted by
+`permissionsync_inbound_admission_refused_total`.
 
-A parked request is woken as soon as a permit frees, so it can still succeed
-inside its own overall deadline, and a waiter whose own deadline really does
-expire returns the ordinary server-side deadline outcome.
+Two further bounds are fixed product values rather than deployment knobs: a
+one-mebibyte inbound body limit, and a thirty-second window in which a client
+must deliver one complete request head.
 
-A request that arrives when both bounds are already full is different: it is
-never parked, never authenticated, never has its body collected, and receives no
-PermissionSync response at all. It was neither cancelled nor expired and was
-never processed, so inventing any outcome for it would change the precedence the
-synchronization contract fixes. Instead the connection is refused and terminated
-at the transport boundary. Saturation therefore adds no `429`, `503`, or other
-caller-facing status, and it cannot accumulate waiting requests, buffered bodies,
-or permits beyond those two bounds however many connections are open. Such
-refusals are counted by `permissionsync_inbound_admission_refused_total`.
-
-The inbound synchronization body has a fixed one-mebibyte product limit. It is
-not configurable, and exceeding it is a body-validation outcome in the fixed
-processing order rather than an immediate transport rejection.
-
-Connections are additionally bounded by a fixed thirty-second window in which a
-client must deliver one complete request head. It applies to an incomplete first
-request head and to an idle keep-alive connection waiting for the next request,
-so neither can hold a task and a descriptor indefinitely. Like the body limit it
-is a fixed product value rather than a deployment knob, and it is unrelated to
-the configured overall request deadline, which starts only once a
-synchronization request reaches the transport handler.
-
-The _number_ of simultaneously accepted connections is not bounded inside the
-process. A bound taken when a connection is accepted could not keep the
-operational endpoints reachable, because a connection's route is unknown until
-its first request head has been read and HTTP/1 keep-alive lets one connection
-change route between requests, so no share can be reserved for a class of
-request that has not been identified yet. What limits the accepted population is
-the process descriptor limit together with the request-head window above.
-Descriptor exhaustion is handled rather than fatal: accepting is retried
-behind a short backoff, already-established work continues, and the process does
-not terminate. A deployment that must bound the population should enforce a
-connection limit in front of PermissionSync.
+The number of simultaneously accepted connections is not bounded inside the
+process; a deployment that must bound it should enforce a connection limit in
+front of PermissionSync. Descriptor exhaustion is retried behind a short backoff
+rather than being fatal.
 
 Concurrent synchronization requests are allowed, including requests for the same
-synchronized user on the same target. PermissionSync assigns them no ordering
-and serializes nothing by identity — `synchronization_capacity` bounds resource
-use, not exclusion — so a successful response means the Target Adapter
-authoritatively verified its desired state immediately before returning, not
-that the target still holds that state afterwards. A caller that needs a settled
-outcome for one user must sequence its own deliveries. The exact semantics are
-in [ADR-0003](docs/adr/0003-at-most-once-delivery-and-idempotent-reconciliation.md),
+user on the same target, and PermissionSync assigns them no ordering:
+`synchronization_capacity` bounds resource use, not exclusion. A caller that
+needs a settled outcome for one user must sequence its own deliveries. See
+[ADR-0003](docs/adr/0003-at-most-once-delivery-and-idempotent-reconciliation.md),
 [ADR-0007](docs/adr/0007-compile-time-rust-target-adapters.md), and
-[ADR-0009](docs/adr/0009-glpi-target-adapter.md).
+[ADR-0009](docs/adr/0009-glpi-target-adapter.md) for why.
 
 ### Observability
 
@@ -171,13 +141,10 @@ Provider or Target Adapter requests.
 
 ### Shutdown
 
-Listener-accept failures are classified before any of them is treated as fatal.
-A per-connection or network error is retried immediately, and local resource
-pressure such as descriptor exhaustion is retried behind a short fixed backoff
-that shutdown can interrupt; neither is evidence that the listener itself broke,
-so neither can terminate the process. Only repeated consecutive failures that do
-indicate an unusable listener are fatal: the process then enters the same
-shutdown sequence as below and exits reporting failure rather than success.
+A per-connection, network, or resource-pressure accept failure is retried and
+never terminates the process; only repeated consecutive failures that indicate
+an unusable listener are fatal, and the process then shuts down as below and
+exits reporting failure.
 
 On `SIGTERM` or `SIGINT` the process marks readiness false, stops accepting,
 admits no further synchronization request and releases pending admission waits,
@@ -199,15 +166,12 @@ Build it locally from the repository root:
 docker build --file Dockerfile --tag permissionsync:local .
 ```
 
-The build is a two-stage [Dockerfile](Dockerfile). The builder is the official
-Rust image, pinned by tag and digest; it installs the toolchain
-[rust-toolchain.toml](rust-toolchain.toml) selects, so that file stays the only
-place the compiler version is declared, and then runs
-`cargo build --release --locked --bin permissionsync`. The runtime stage is a
-distroless base carrying only the executable plus the C runtime, OpenSSL, and
-system trust store the binary links against. It has no shell, package manager,
-compiler, Cargo state, source tree, or test material, and no configuration or
-trust material of any kind.
+The [Dockerfile](Dockerfile) has two stages. The builder is the official Rust
+image, pinned by tag and digest, and it installs the toolchain
+[rust-toolchain.toml](rust-toolchain.toml) selects. The runtime stage is a
+distroless base holding the executable plus the C runtime, OpenSSL, and system
+trust store it links against — no shell, package manager, compiler, Cargo
+state, source tree, test material, configuration, or trust material.
 
 Run it with the configuration mounted from outside the image:
 
@@ -231,11 +195,10 @@ docker run --rm \
 | Health check  | None in the image: Kubernetes is the supported platform and owns the probes below                    |
 | Platform      | `linux/amd64`, the only platform published and the only one validated in CI                          |
 
-The image carries the standard `org.opencontainers.image.title`,
-`description`, `source`, `url`, `documentation`, `licenses`, and `vendor`
-labels. The `version`, `revision`, and `created` labels are added by the
-publishing workflow from the release event, so a local build never claims a
-release identity it does not have.
+The image carries the standard `org.opencontainers.image.*` title,
+description, source, url, documentation, licenses, and vendor labels. Version,
+revision, and creation labels are added by the publishing workflow, so a local
+build claims no release identity.
 
 Releases are published to `ghcr.io/neteye-platform/permissionsync` from stable
 `vX.Y.Z` tags only. Each release publishes the version tag and also moves the
@@ -253,14 +216,11 @@ correctness, so a deployment that needs reproducibility or offline recovery
 MUST reference the immutable digest, which the publishing workflow prints for
 every release. Do not pin `latest`.
 
-After installation or upgrade, normal restart and recovery must not depend on
-public registry connectivity. That is deployment infrastructure, not
-PermissionSync application state: the deployment platform is responsible for
-retaining, mirroring, or caching the selected digest in deployment-local
-infrastructure or on offline installation media. This repository publishes an
-immutable image and nothing more — it implements no registry, mirror, or image
-cache, and GHCR availability is never part of PermissionSync's runtime
-correctness.
+Normal restart and recovery must not depend on public registry connectivity.
+Keeping the selected digest available — mirrored, cached, or on offline
+installation media — is the deployment platform's responsibility; this
+repository publishes an immutable image and implements no registry or mirror,
+so GHCR availability is never part of PermissionSync's runtime correctness.
 
 ## Kubernetes
 
@@ -333,28 +293,18 @@ releases are broken: PermissionSync's contract is the OIDC and JWT behaviour
 recorded in [ADR-0002](docs/adr/0002-receiver-side-jwt-verification.md), and
 any Keycloak that satisfies it works.
 
-The suite proves, against a real Keycloak instance over real HTTPS, that both
-supported trusted-source modes work — OIDC discovery, where the discovered
-issuer must equal the configured issuer exactly and its `jwks_uri` becomes
-trusted only through that chain, and a directly configured `jwks_uri`. It also
-proves the token contract: real Client Credentials tokens carry `client_id` and
-the configured audience, zero/one/many `permissionsync:<target>` scope tokens
-behave as the scope convention requires, and real tokens with the wrong
-audience, a different realm, an expired lifetime, or an algorithm outside the
-configured allowlist are all refused. One test additionally stops the
-configured metadata source and proves that still-usable cached verification
-material keeps verifying while an authenticator with no retained state fails
-closed.
+Against a real Keycloak over real HTTPS, the suite covers both supported
+trusted-source modes (OIDC discovery and a directly configured `jwks_uri`), the
+Client Credentials token and `permissionsync:<target>` scope contract, the
+refusal of tokens with a wrong audience, a foreign realm, an expired lifetime or
+a disallowed algorithm, behaviour while the metadata source is unreachable, and
+a real signing-key rotation. Each case is named and explained in
+[real_keycloak.rs](crates/permissionsync-auth/tests/real_keycloak.rs).
 
-The Keycloak endpoint is HTTPS with certificate and hostname validation fully
-enabled; the disposable CA is supplied through PermissionSync's existing
-`additional_trust_anchors_pem` configuration. Nothing in the suite disables
-verification, accepts plaintext, or bypasses a host name. Every credential is
-generated per run inside the disposable environment and is destroyed with it.
-
-Adversarial parser, cryptographic, and detailed cache-timing cases remain the
-job of the hermetic auth tests; this suite covers the wire and deployment
-contract.
+Certificate and hostname validation stay fully enabled; the disposable CA is
+supplied through `additional_trust_anchors_pem`, and every credential is
+generated per run and destroyed with the environment. Adversarial parser,
+cryptographic, and cache-timing cases belong to the hermetic auth tests.
 
 Run it locally. The disposable environments drive `docker` and
 `docker compose`, so they need Docker Engine with the Compose v2 plugin:
@@ -377,34 +327,22 @@ crates/permissionsync-auth/integration/keycloak/teardown.sh
 | Real Keycloak suite         | The supported-Keycloak authentication and metadata wire contract                                              | [Keycloak workflow](.github/workflows/keycloak-authentication-tests.yaml) |
 | OCI and deployment contract | The built production image, its hardening, its signal handling, and the Kubernetes example                    | [OCI workflow](.github/workflows/oci-image-tests.yaml)                    |
 
-The OCI workflow builds the production image, proves it statically
-(non-root numeric user, exec entrypoint, expected executable, no shell, no
-source, build, Cargo, configuration, or credential material, no preset
-configuration path), proves it fails fast without `PERMISSIONSYNC_CONFIG_FILE`,
-proves that with valid configuration and an unreachable metadata source it
-serves `/healthz` while `/readyz` stays `503`, and proves `SIGTERM` reaches the
-executable directly and terminates it cleanly inside a bounded window. It then
-runs the same image against the disposable HTTPS Keycloak with one mounted YAML
-document, waits for `/readyz` to become `200`, obtains a real Keycloak token,
-completes a targetless `POST /api/sync-user` as `204` without GLPI or a
-Provider, and terminates the container with `SIGTERM`.
-
-The Kubernetes example is validated separately, by the organization's
-[kubeconform hook](https://github.com/neteye-platform/kubeconform-precommit)
-configured in [.pre-commit-config.yaml](.pre-commit-config.yaml). It runs in
-strict mode against the targeted Kubernetes version, both in `prek run
---all-files` locally and in the shared pull-request checks, so the tool stays
-pinned in one place.
-
-Both container scripts live in [integration/oci/](integration/oci/) and take a
-built image reference, so they can be run locally. Like the GLPI and Keycloak
-layers they drive `docker` and `docker compose`, so they need Docker Engine
-with the Compose v2 plugin:
+The OCI workflow checks the built image itself — hardening, metadata, absence
+of build and configuration material, startup without configuration, readiness
+while the metadata source is unreachable, and graceful `SIGTERM` — and then runs
+that same image against the disposable HTTPS Keycloak. Both checks live in
+[integration/oci/](integration/oci/) and take a built image reference, so they
+run locally too, against Docker Engine with the Compose v2 plugin:
 
 ```sh
 docker build --file Dockerfile --tag permissionsync:local .
 integration/oci/image-contract.sh permissionsync:local
 ```
+
+The Kubernetes example is validated by the organization's
+[kubeconform hook](https://github.com/neteye-platform/kubeconform-precommit)
+configured in [.pre-commit-config.yaml](.pre-commit-config.yaml), which runs in
+`prek run --all-files` and in the shared pull-request checks.
 
 ## Development
 

@@ -38,7 +38,8 @@ for secret in \
   "${KEYCLOAK_TEST_DISALLOWED_ALGORITHM_CLIENT_SECRET:-}" \
   "${KEYCLOAK_TEST_SHORTLIVED_CLIENT_SECRET:-}" \
   "${KEYCLOAK_TEST_WRONG_AUDIENCE_CLIENT_SECRET:-}" \
-  "${KEYCLOAK_TEST_FOREIGN_CLIENT_SECRET:-}"; do
+  "${KEYCLOAK_TEST_FOREIGN_CLIENT_SECRET:-}" \
+  "${KEYCLOAK_TEST_ROTATION_CLIENT_SECRET:-}"; do
   # Every generated value is hexadecimal, so one per line is unambiguous. A
   # value that somehow contained a newline is skipped rather than written as
   # two partial patterns that would redact nothing useful.
