@@ -74,6 +74,17 @@ repos:
     hooks:
       - id: hadolint-docker
 
+  - repo: https://github.com/neteye-platform/kubeconform-precommit
+    rev: 4c42d96db6f5a09d64faaa18513781ea690725e9 # frozen: v0.2.0
+    hooks:
+      - id: kubeconform
+        files: ^deploy/kubernetes/
+        args:
+          - -strict
+          - -summary
+          - -kubernetes-version
+          - "1.37.1"
+
   - repo: https://github.com/DavidAnson/markdownlint-cli2
     rev: 916ad0aaa108c64d294101002066f530ea170b10 # frozen: v0.23.3
     hooks:

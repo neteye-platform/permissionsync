@@ -1,0 +1,200 @@
+# Publishes the production PermissionSync OCI image for one released semantic
+# version.
+#
+# This runs only for a semantic version tag pushed to this repository, never
+# for a pull request, so untrusted pull-request code can never reach a step
+# that holds a registry credential. Pull-request validation builds the same
+# Dockerfile in the OCI Image Tests workflow with `contents: read` only.
+#
+# `packages: write` is granted to the publishing job alone, and only GitHub's
+# own scoped token is used; this repository adds no long-lived registry
+# credential.
+name: Release Image
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+# One release at a time per tag. A second invocation for the same ref queues
+# behind the first instead of racing it through the preflight and publish path,
+# and never cancels a release that is already publishing. This complements the
+# registry check below rather than replacing it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # A released version is immutable, and the publishing job would overwrite an
+  # existing tag, so refuse before it runs when that version already exists.
+  #
+  # This check is fail-closed. It asks the registry directly, because only an
+  # explicit HTTP status can separate the three outcomes that matter:
+  # the manifest exists, the registry authoritatively reports it absent, or the
+  # registry state could not be determined at all. A command that merely exits
+  # non-zero cannot: an unreachable registry, a DNS or TLS failure, a declined
+  # credential, and a rate limit all look identical to a missing manifest.
+  # Only an authoritative `404` allows the release to proceed.
+  unpublished-version:
+    name: Verify The Released Version Is Unpublished
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Refuse to overwrite an existing released version
+        env:
+          IMAGE_REPOSITORY: ${{ github.repository_owner }}/permissionsync
+          # The immutable release version only. `latest` is deliberately not
+          # consulted: it is expected to exist after the first stable release
+          # and to move on every later one, so its presence says nothing about
+          # whether this version was already published.
+          RELEASE_VERSION: ${{ github.ref_name }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          version="${RELEASE_VERSION#v}"
+          reference="${IMAGE_REPOSITORY}:${version}"
+
+          fail_closed() {
+            printf 'Release preflight could not determine registry state: %s\n' "$1" >&2
+            printf 'Publishing nothing rather than assuming %s is unpublished.\n' \
+              "$reference" >&2
+            exit 1
+          }
+
+          # Credentials travel on curl's standard input through `--config`, so
+          # neither the GitHub token nor the issued registry token ever reaches
+          # a process argument vector, a log line, or the step summary.
+          token_body="$(mktemp)"
+          trap 'rm -f -- "$token_body"' EXIT
+          chmod 600 "$token_body"
+
+          token_status="$(curl --silent --show-error --output "$token_body" \
+            --write-out '%{http_code}' --config - <<REQUEST || true
+          user = "${GITHUB_REPOSITORY_OWNER}:${GITHUB_TOKEN}"
+          url = "https://ghcr.io/token?service=ghcr.io&scope=repository:${IMAGE_REPOSITORY}:pull"
+          REQUEST
+          )"
+          if [[ "$token_status" != '200' ]]; then
+            fail_closed "the registry declined to issue a pull token (HTTP ${token_status})"
+          fi
+          registry_token="$(python3 -c '
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as response:
+              token = json.load(response).get("token")
+          if not isinstance(token, str) or not token:
+              raise SystemExit(1)
+          print(token)
+          ' "$token_body")" || fail_closed 'the registry issued no usable pull token'
+          rm -f -- "$token_body"
+
+          manifest_status="$(curl --silent --show-error --output /dev/null \
+            --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.oci.image.index.v1+json' \
+            --header 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            --header 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+            --header 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            --config - <<REQUEST || true
+          header = "Authorization: Bearer ${registry_token}"
+          url = "https://ghcr.io/v2/${IMAGE_REPOSITORY}/manifests/${version}"
+          REQUEST
+          )"
+
+          case "$manifest_status" in
+          200)
+            printf '%s is already published; a released version is immutable.\n' \
+              "$reference" >&2
+            exit 1
+            ;;
+          404)
+            printf '%s is not published; the release may proceed.\n' "$reference"
+            ;;
+          401 | 403)
+            fail_closed "the registry refused the authenticated manifest request (HTTP ${manifest_status})"
+            ;;
+          *)
+            fail_closed "unexpected registry response (HTTP ${manifest_status})"
+            ;;
+          esac
+
+  # The organization's reusable image workflow is the convention for building
+  # and publishing to GHCR: it pins every action by commit SHA, authenticates
+  # with the scoped GITHUB_TOKEN, derives the version tag and the standard OCI
+  # source, revision, version, and creation labels from the release event, and
+  # attaches provenance and an SBOM.
+  #
+  # It leaves docker/metadata-action's default `latest=auto` flavor in place.
+  # The tag filter above accepts stable `vX.Y.Z` tags only, so every release
+  # this workflow performs publishes the immutable `X.Y.Z` tag and also moves
+  # the conventional mutable `latest` tag. That is deliberate: `latest` is a
+  # convenience and discovery reference, while the version tag and the content
+  # digest are the immutable deployment references.
+  #
+  # It builds for the runner's platform only, so the published image supports
+  # linux/amd64, which is also the only platform this repository validates. A
+  # job that calls a reusable workflow cannot declare its own
+  # `timeout-minutes`; the called workflow owns its job configuration.
+  publish-oci-image:
+    name: Publish OCI Image
+    needs: unpublished-version
+    permissions:
+      contents: read
+      packages: write
+    uses: neteye-platform/repo-commons/.github/workflows/build-docker-image.yaml@e8e2d702d7a80fc53886bd28a7ddcbb05906180a # main
+    with:
+      working-directory: .
+      dockerfile-path: ./Dockerfile
+      image-name: permissionsync
+      push: true
+
+  published-digest:
+    name: Report The Published Image Digest
+    needs: publish-oci-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Deployments should pin this digest. ADR-0006 requires that normal
+      # restart and recovery never depend on public registry connectivity,
+      # which deployment infrastructure provides by retaining or mirroring the
+      # selected digest locally. `latest` cannot serve that purpose.
+      - name: Report the published immutable digest
+        env:
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/permissionsync
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          reference="${IMAGE_REPOSITORY}:${RELEASE_TAG#v}"
+          digest="$(docker buildx imagetools inspect "$reference" \
+            --format '{{.Manifest.Digest}}')"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            # A content digest is by definition the SHA-256 of the manifest's
+            # own bytes, so recomputing it from the raw manifest is an exact
+            # equivalent rather than an approximation.
+            digest="sha256:$(docker buildx imagetools inspect "$reference" --raw |
+              sha256sum | cut -d ' ' -f 1)"
+          fi
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf 'could not determine the published digest of %s\n' "$reference" >&2
+            exit 1
+          fi
+          printf 'published %s@%s\n' "$reference" "$digest"
+          printf '### Published PermissionSync image\n\n    %s@%s\n' \
+            "$reference" "$digest" >> "$GITHUB_STEP_SUMMARY"

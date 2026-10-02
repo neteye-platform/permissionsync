@@ -1,0 +1,144 @@
+# Example reference Kubernetes deployment contract for PermissionSync.
+#
+# This is an EXAMPLE, not PermissionSync's configuration API and not a
+# mandatory production architecture. ADR-0006 makes Kubernetes the only
+# explicitly supported deployment platform while keeping manifests and Helm
+# charts deployment-owned optional artifacts, and PermissionSync itself depends
+# on no Kubernetes API, object, discovery, or configuration semantics. This file
+# exists so the properties the supported platform must provide are auditable and
+# can be validated in CI; copy it, replace every REPLACE_WITH_* placeholder, and
+# own the result in your own deployment repository.
+#
+# Everything the service needs is one external YAML document, mounted read-only,
+# whose path is given by PERMISSIONSYNC_CONFIG_FILE. See
+# docs/permissionsync.example.yaml for that document's schema, and keep the real
+# one outside the image.
+#
+# Replicas, resource requests and limits, scheduling, Service, Ingress, TLS
+# termination in front of the listener, and how the configuration volume is
+# delivered are deployment concerns, not product semantics.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: permissionsync
+  labels:
+    app.kubernetes.io/name: permissionsync
+spec:
+  # Any healthy replica can serve any request: the service is stateless, with
+  # no shared persistence, distributed lock, or delivery queue.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: permissionsync
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: permissionsync
+    spec:
+      # Must cover the whole bounded shutdown horizon, not only the configured
+      # request grace: after `shutdown.grace_milliseconds` expires the process
+      # still spends a fixed bounded window letting cancelled requests return,
+      # and then a bounded final trace flush, before it exits. 30s leaves ample
+      # headroom over the example document's 20000 ms grace.
+      terminationGracePeriodSeconds: 30
+      # PermissionSync calls no Kubernetes API, so it needs no API credential.
+      automountServiceAccountToken: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      securityContext:
+        runAsNonRoot: true
+        # The image's own dedicated unprivileged account.
+        runAsUser: 65532
+        runAsGroup: 65532
+        # Lets the mounted configuration file be group-readable by that
+        # account without making it readable by anyone else.
+        fsGroup: 65532
+        # Required by ADR-0006.
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: permissionsync
+          # Pin the selected release by immutable digest. Deployment
+          # infrastructure is responsible for keeping that digest available
+          # from deployment-local infrastructure or offline installation media,
+          # so normal restart and recovery never need public registry
+          # connectivity.
+          image: ghcr.io/neteye-platform/permissionsync:REPLACE_WITH_VERSION@sha256:REPLACE_WITH_IMAGE_DIGEST
+          imagePullPolicy: IfNotPresent
+          # The complete application configuration contract: exactly one
+          # external file path. There are no per-value environment variables,
+          # command-line flags, environment interpolation, configuration
+          # directories, or runtime reload.
+          env:
+            - name: PERMISSIONSYNC_CONFIG_FILE
+              value: /etc/permissionsync/permissionsync.yaml
+          ports:
+            # Must match `listener.port` in the mounted configuration.
+            - name: http
+              containerPort: 8443
+              protocol: TCP
+          # `/healthz` is true while the process and HTTP runtime function;
+          # `/readyz` is true only while the service can currently verify
+          # technical callers safely. Readiness deliberately does not depend on
+          # Keycloak connectivity while usable cached verification material
+          # exists, nor on the Provider, a target, or a telemetry backend.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            successThreshold: 1
+            failureThreshold: 3
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            # The service writes nothing to the filesystem, so no writable
+            # path is required anywhere.
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          # Deployment sizing, not product semantics. Replace with values
+          # measured for your own workload.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: configuration
+              mountPath: /etc/permissionsync
+              readOnly: true
+      volumes:
+        # Any volume source that presents the single configuration document at
+        # the mounted path is acceptable. ADR-0006 does NOT require Kubernetes
+        # Secrets, and PermissionSync neither requires nor understands any
+        # secret backend: a Secret, a ConfigMap, a projected volume, a CSI
+        # secrets-store volume, or an operator-managed volume are all equally
+        # valid. A Secret is shown here only because the document normally
+        # carries credentials and private trust material.
+        - name: configuration
+          secret:
+            secretName: REPLACE_WITH_CONFIGURATION_SECRET_NAME
+            # Readable by the container's group only. Written in decimal
+            # because a leading-zero YAML integer is ambiguous: 288 is 0440.
+            defaultMode: 288
+            items:
+              - key: permissionsync.yaml
+                path: permissionsync.yaml

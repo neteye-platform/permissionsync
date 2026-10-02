@@ -1,0 +1,55 @@
+# Disposable supported-Keycloak environment for the ignored real contract
+# suite. Every value it needs is supplied by bootstrap.sh through a generated
+# --env-file; nothing here is shared, persistent, or developer-specific.
+services:
+  keycloak:
+    # The one supported Keycloak release this repository exercises, pinned by
+    # exact release tag and immutable digest. Renovate proposes both together;
+    # an upgrade PR must run this contract suite before merge.
+    image: quay.io/keycloak/keycloak:26.8.0@sha256:b0f60d489d51c5d113390bdf5461d4c06e6051be026c05549f2e1e10ec352bcc
+    command: ["start-dev"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_TEST_ADMIN_USERNAME:?admin username required}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_TEST_ADMIN_PASSWORD:?admin password required}
+      # In-memory store only: the realm, clients, and client scopes this suite
+      # provisions never outlive the container.
+      KC_DB: dev-mem
+      # PermissionSync requires HTTPS for every trusted issuer, discovery, and
+      # JWKS source, so Keycloak terminates TLS itself with the disposable
+      # certificate bootstrap.sh generates. Plain HTTP is never enabled.
+      KC_HTTP_ENABLED: "false"
+      KC_HTTPS_CERTIFICATE_FILE: /tls/server.crt
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /tls/server.key
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      # `Z` keeps the mount usable on SELinux hosts. The source is the
+      # ephemeral TLS directory bootstrap.sh generated for this run only, so
+      # relabelling it affects nothing outside the disposable environment.
+      - ${KEYCLOAK_TEST_TLS_DIR:?tls material directory required}:/tls:ro,Z
+    ports:
+      # Container-engine-assigned ephemeral host port (no pre-discovery and no
+      # race for a preselected port): the real host port is discovered
+      # afterwards with `docker compose port`.
+      - "127.0.0.1::8443"
+
+  # Layer-4 TCP forwarder in front of the same Keycloak listener, published on
+  # its own ephemeral host port. The metadata-outage test configures
+  # PermissionSync's trusted JWKS source through this port and then stops only
+  # this service, so one test can make the configured source unreachable
+  # without disturbing Keycloak for any other test in the suite. TLS is not
+  # re-terminated here: the client's session goes straight to Keycloak, so
+  # certificate and hostname verification stay exactly as they are on the
+  # direct port.
+  outage-proxy:
+    image: docker.io/library/nginx:1.31.6@sha256:908dc23e643a1447dbfb2e189ed268bfde6a51a5bf9a34d3dd3440a24f58ccf7
+    depends_on:
+      keycloak:
+        condition: service_started
+    volumes:
+      # bootstrap.sh copies the reviewed nginx-stream.conf next to this run's
+      # other disposable state and mounts that copy, so the SELinux relabel
+      # never touches a file in the working tree.
+      - ${KEYCLOAK_TEST_PROXY_CONF:?proxy configuration required}:/etc/nginx/nginx.conf:ro,Z
+    ports:
+      # Container-engine-assigned ephemeral host port; discovered afterwards.
+      - "127.0.0.1::8444"

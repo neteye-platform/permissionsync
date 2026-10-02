@@ -1,0 +1,56 @@
+name: OCI Image Tests
+
+on:
+  pull_request:
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+
+jobs:
+  oci-image-tests:
+    name: OCI Image Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      IMAGE_REFERENCE: permissionsync:pull-request
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The Kubernetes example is validated by the organization's kubeconform
+      # hook in .pre-commit-config.yaml, which the shared pull-request checks
+      # already run, so the tool stays pinned in one place.
+      - name: Build the production image
+        run: |
+          set -euo pipefail
+          docker build --file Dockerfile --tag "$IMAGE_REFERENCE" .
+
+      - name: Prove the production image contract
+        run: ./integration/oci/image-contract.sh "$IMAGE_REFERENCE"
+
+      - name: Bootstrap disposable Keycloak environment
+        working-directory: crates/permissionsync-auth/integration/keycloak
+        run: ./bootstrap.sh
+
+      - name: Run the production-image deployment contract against real Keycloak
+        run: |
+          set -euo pipefail
+          set -a
+          # shellcheck disable=SC1090
+          source "$KEYCLOAK_TEST_RUNTIME_ENV"
+          set +a
+          ./integration/oci/keycloak-smoke.sh "$IMAGE_REFERENCE"
+
+      - name: Collect Keycloak container logs on failure
+        if: failure()
+        working-directory: crates/permissionsync-auth/integration/keycloak
+        run: ./diagnostics.sh
+
+      - name: Tear down the disposable environment
+        if: always()
+        working-directory: crates/permissionsync-auth/integration/keycloak
+        run: ./teardown.sh

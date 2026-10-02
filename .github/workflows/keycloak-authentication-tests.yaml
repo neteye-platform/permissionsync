@@ -1,0 +1,49 @@
+name: Keycloak Authentication Tests
+
+on:
+  pull_request:
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+
+jobs:
+  keycloak-authentication-tests:
+    name: Keycloak Authentication Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Bootstrap disposable Keycloak environment
+        working-directory: crates/permissionsync-auth/integration/keycloak
+        run: ./bootstrap.sh
+
+      - name: Run the real Keycloak contract suite
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          set -euo pipefail
+          set -a
+          # shellcheck disable=SC1090
+          source "$KEYCLOAK_TEST_RUNTIME_ENV"
+          set +a
+          cargo test -p permissionsync-auth --test real_keycloak --locked \
+            -- --ignored
+
+      - name: Collect Keycloak container logs on failure
+        if: failure()
+        working-directory: crates/permissionsync-auth/integration/keycloak
+        run: ./diagnostics.sh
+
+      - name: Tear down the disposable environment
+        if: always()
+        working-directory: crates/permissionsync-auth/integration/keycloak
+        run: ./teardown.sh

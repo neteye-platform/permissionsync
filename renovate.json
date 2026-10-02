@@ -1,4 +1,18 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["github>neteye-platform/repo-commons"]
+  "extends": ["github>neteye-platform/repo-commons"],
+  "customManagers": [
+    {
+      "description": "kubeconform's targeted Kubernetes version, which no built-in manager reads out of a pre-commit hook argument",
+      "customType": "regex",
+      "managerFilePatterns": [".pre-commit-config.yaml"],
+      "matchStrings": [
+        "- -kubernetes-version\\s*\\n\\s*- \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "kubernetes/kubernetes",
+      "versioningTemplate": "semver",
+      "extractVersionTemplate": "^v(?<version>\\d+\\.\\d+\\.\\d+)$"
+    }
+  ]
 }
