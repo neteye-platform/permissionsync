@@ -22,15 +22,27 @@ if ! source "$runtime_env" >/dev/null 2>&1; then
     exit 0
 fi
 
-secrets=()
+# The values to redact are handed to the redaction filter through a private
+# file inside the already-private runtime directory, never through its process
+# argument vector, which any local user can read from /proc. The file is
+# removed when this script exits, and teardown removes the whole runtime
+# directory regardless.
+secrets_file="$(mktemp "${GLPI_TEST_RUNTIME_DIR:-${TMPDIR:-/tmp}}/redaction.XXXXXX")"
+chmod 600 "$secrets_file"
+trap 'rm -f -- "$secrets_file"' EXIT
+
 for secret in \
     "${GLPI_TEST_DB_ROOT_PASSWORD:-}" \
     "${GLPI_TEST_DB_PASSWORD:-}" \
     "${GLPI_TEST_APP_TOKEN:-}" \
     "${GLPI_TEST_USER_TOKEN:-}" \
     "${GLPI_TEST_TOPOLOGY_USER_TOKEN:-}"; do
-    if [[ -n "$secret" ]]; then
-        secrets+=("$secret")
+    # Every generated value is a single-line hexadecimal or token string, so
+    # one per line is unambiguous. A value that somehow contained a newline is
+    # skipped rather than written as two partial patterns that would redact
+    # nothing useful.
+    if [[ -n "$secret" && "$secret" != *$'\n'* ]]; then
+        printf '%s\n' "$secret" >>"$secrets_file"
     fi
 done
 
@@ -38,12 +50,13 @@ redact() {
     python3 -c '
 import sys
 
-secrets = [secret for secret in sys.argv[1:] if secret]
+with open(sys.argv[1], encoding="utf-8") as patterns:
+    secrets = [secret for secret in patterns.read().splitlines() if secret]
 for line in sys.stdin:
     for secret in secrets:
         line = line.replace(secret, "[REDACTED]")
     sys.stdout.write(line)
-' "${secrets[@]}"
+' "$secrets_file"
 }
 
 if [[ -n "${PERMISSIONSYNC_GLPI_PROJECT_NAME:-}" ]]; then

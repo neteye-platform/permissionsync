@@ -2,12 +2,15 @@
 # Best-effort diagnostics for a failed real-Keycloak contract run.
 #
 # This script never fails the calling CI job: diagnostics are secondary to the
-# primary test failure already recorded by the earlier step. It must NEVER
-# print provision.stdout or the runtime env file's raw contents, because both
-# contain generated client secrets and the bootstrap administrator password.
-# Other diagnostic streams are redacted defensively: Keycloak and compose
-# output is not expected to contain credentials, but that is not sufficient
-# reason to print it unredacted.
+# primary test failure already recorded by the earlier step. The runtime env
+# file holds every generated credential of the run, the bootstrap
+# administrator password included, so its raw contents must NEVER be printed.
+# provision.stdout is credential-free by construction (bootstrap.sh generates
+# the client secrets and publishes them only through the runtime env file),
+# but it is a provisioning record list rather than diagnostic material, so it
+# stays out of this output too. Other diagnostic streams are redacted
+# defensively: Keycloak and compose output is not expected to contain
+# credentials, but that is not sufficient reason to print it unredacted.
 set -uo pipefail
 
 runtime_env="${KEYCLOAK_TEST_RUNTIME_ENV:-}"
