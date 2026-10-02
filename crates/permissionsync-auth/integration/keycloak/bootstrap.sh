@@ -193,10 +193,51 @@ until curl --cacert "${tls_dir}/ca.crt" --fail --silent --output /dev/null \
   sleep 2
 done
 
+# Every client secret of this run is generated here, next to the
+# administrator password above, and handed to provision.py through the
+# environment. Provisioning therefore neither creates nor emits a credential:
+# its standard output is a non-sensitive record list, and each secret is
+# masked before first use and published only through the private runtime-env
+# file below.
+caller_client_secret="$(openssl rand -hex 24)"
+minimal_client_secret="$(openssl rand -hex 24)"
+disallowed_algorithm_client_secret="$(openssl rand -hex 24)"
+shortlived_client_secret="$(openssl rand -hex 24)"
+wrong_audience_client_secret="$(openssl rand -hex 24)"
+foreign_client_secret="$(openssl rand -hex 24)"
+rotation_client_secret="$(openssl rand -hex 24)"
+for secret in \
+  "$caller_client_secret" \
+  "$minimal_client_secret" \
+  "$disallowed_algorithm_client_secret" \
+  "$shortlived_client_secret" \
+  "$wrong_audience_client_secret" \
+  "$foreign_client_secret" \
+  "$rotation_client_secret"; do
+  mask_secret "$secret"
+done
+env_put KEYCLOAK_TEST_CALLER_CLIENT_SECRET "$caller_client_secret"
+env_put KEYCLOAK_TEST_MINIMAL_CLIENT_SECRET "$minimal_client_secret"
+env_put KEYCLOAK_TEST_DISALLOWED_ALGORITHM_CLIENT_SECRET \
+  "$disallowed_algorithm_client_secret"
+env_put KEYCLOAK_TEST_SHORTLIVED_CLIENT_SECRET "$shortlived_client_secret"
+env_put KEYCLOAK_TEST_WRONG_AUDIENCE_CLIENT_SECRET "$wrong_audience_client_secret"
+env_put KEYCLOAK_TEST_FOREIGN_CLIENT_SECRET "$foreign_client_secret"
+env_put KEYCLOAK_TEST_ROTATION_CLIENT_SECRET "$rotation_client_secret"
+
+# Variable assignments on the command prefix become provision.py's
+# environment, so no secret reaches an argument vector here either.
 if ! KEYCLOAK_BASE_URL="$base_url" \
   KEYCLOAK_CA_PEM="${tls_dir}/ca.crt" \
   KEYCLOAK_ADMIN_USERNAME="$admin_username" \
   KEYCLOAK_ADMIN_PASSWORD="$admin_password" \
+  KEYCLOAK_CLIENT_SECRET_CALLER="$caller_client_secret" \
+  KEYCLOAK_CLIENT_SECRET_MINIMAL="$minimal_client_secret" \
+  KEYCLOAK_CLIENT_SECRET_DISALLOWED_ALGORITHM="$disallowed_algorithm_client_secret" \
+  KEYCLOAK_CLIENT_SECRET_SHORTLIVED="$shortlived_client_secret" \
+  KEYCLOAK_CLIENT_SECRET_WRONG_AUDIENCE="$wrong_audience_client_secret" \
+  KEYCLOAK_CLIENT_SECRET_FOREIGN="$foreign_client_secret" \
+  KEYCLOAK_CLIENT_SECRET_ROTATION="$rotation_client_secret" \
   python3 "${script_dir}/provision.py" >"$provision_stdout" 2>"$provision_stderr"; then
   printf '%s\n' 'Keycloak provisioning failed; captured output was redacted.' >&2
   exit 1
@@ -223,20 +264,13 @@ expected = {
     "LOOKALIKE_PREFIX_SCOPE",
     "LOOKALIKE_SUFFIX_SCOPE",
     "CALLER_CLIENT_ID",
-    "CALLER_CLIENT_SECRET",
     "MINIMAL_CLIENT_ID",
-    "MINIMAL_CLIENT_SECRET",
     "DISALLOWED_ALGORITHM_CLIENT_ID",
-    "DISALLOWED_ALGORITHM_CLIENT_SECRET",
     "SHORTLIVED_CLIENT_ID",
-    "SHORTLIVED_CLIENT_SECRET",
     "WRONG_AUDIENCE_CLIENT_ID",
-    "WRONG_AUDIENCE_CLIENT_SECRET",
     "FOREIGN_CLIENT_ID",
-    "FOREIGN_CLIENT_SECRET",
     "ROTATION_REALM",
     "ROTATION_CLIENT_ID",
-    "ROTATION_CLIENT_SECRET",
 }
 values = {}
 with open(output_path, encoding="utf-8") as output:
@@ -264,16 +298,6 @@ PY
 
 # shellcheck disable=SC1090
 source "$runtime_env"
-for secret in \
-  "$KEYCLOAK_TEST_CALLER_CLIENT_SECRET" \
-  "$KEYCLOAK_TEST_MINIMAL_CLIENT_SECRET" \
-  "$KEYCLOAK_TEST_DISALLOWED_ALGORITHM_CLIENT_SECRET" \
-  "$KEYCLOAK_TEST_SHORTLIVED_CLIENT_SECRET" \
-  "$KEYCLOAK_TEST_WRONG_AUDIENCE_CLIENT_SECRET" \
-  "$KEYCLOAK_TEST_FOREIGN_CLIENT_SECRET" \
-  "$KEYCLOAK_TEST_ROTATION_CLIENT_SECRET"; do
-  mask_secret "$secret"
-done
 
 realm_base="${base_url}/realms/${KEYCLOAK_TEST_REALM}"
 env_put KEYCLOAK_TEST_ISSUER "$realm_base"

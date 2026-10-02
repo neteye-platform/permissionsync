@@ -15,16 +15,21 @@ command line:
     Path to the disposable CA certificate that signs Keycloak's certificate.
 ``KEYCLOAK_ADMIN_USERNAME`` / ``KEYCLOAK_ADMIN_PASSWORD``
     The container's bootstrap administrator.
+``KEYCLOAK_CLIENT_SECRET_<RECORD>``
+    The per-run client secret for each service-account client created below,
+    one variable per ``<RECORD>_CLIENT_ID`` record emitted at the end.
+    ``bootstrap.sh`` generates these, masks them in CI logs, and publishes
+    them through its private runtime-env file.
 
 Output is a list of ``NAME=value`` records on standard output, which
-``bootstrap.sh`` turns into the suite's runtime environment. Client secrets are
-generated here and are the only sensitive records; no access token, admin
-token, or signing key is ever printed.
+``bootstrap.sh`` turns into the suite's runtime environment. None of those
+records is sensitive: no client secret, access token, admin token, or signing
+key is ever printed, so the provisioning output can be captured and diagnosed
+without handling credentials.
 """
 
 import json
 import os
-import secrets
 import ssl
 import sys
 import urllib.error
@@ -172,7 +177,24 @@ class AdminApi:
         return json.loads(self.require("GET", path) or b"null")
 
 
-def service_account_client(client_id: str, audience: str, attributes: dict) -> dict:
+def client_secret(record: str) -> str:
+    """Read the secret ``bootstrap.sh`` generated for one client.
+
+    The bootstrap owns every client secret in this environment: it generates
+    them, masks them, and writes them to its private runtime-env file. Taking
+    them as input keeps this script free of credential generation and keeps
+    every credential out of its standard output.
+    """
+    variable = f"KEYCLOAK_CLIENT_SECRET_{record}"
+    value = os.environ.get(variable, "")
+    if not value:
+        raise SystemExit(f"{variable} must be set to a generated client secret")
+    return value
+
+
+def service_account_client(
+    client_id: str, audience: str, attributes: dict, secret: str
+) -> dict:
     """Build a confidential Client Credentials client definition.
 
     The audience mapper is Keycloak's standard ``oidc-audience-mapper``; no
@@ -189,7 +211,7 @@ def service_account_client(client_id: str, audience: str, attributes: dict) -> d
         "implicitFlowEnabled": False,
         "directAccessGrantsEnabled": False,
         "clientAuthenticatorType": "client-secret",
-        "secret": secrets.token_hex(24),
+        "secret": secret,
         "attributes": attributes,
         "protocolMappers": [
             {
@@ -279,7 +301,9 @@ def main() -> None:
         scope["name"]: scope["id"] for scope in api.get(f"/{REALM}/client-scopes")
     }
 
-    caller = service_account_client("permissionsync-caller", AUDIENCE, {})
+    caller = service_account_client(
+        "permissionsync-caller", AUDIENCE, {}, client_secret("CALLER")
+    )
     caller_uuid = create_client(api, REALM, caller)
     # Assigned as optional scopes so each contract case selects exactly the
     # scope string it needs through the token request itself.
@@ -289,7 +313,9 @@ def main() -> None:
             f"/{REALM}/clients/{caller_uuid}/optional-client-scopes/{scope_ids[scope]}",
         )
 
-    minimal = service_account_client("permissionsync-minimal", AUDIENCE, {})
+    minimal = service_account_client(
+        "permissionsync-minimal", AUDIENCE, {}, client_secret("MINIMAL")
+    )
     minimal_uuid = create_client(api, REALM, minimal)
     assigned = api.get(f"/{REALM}/clients/{minimal_uuid}/default-client-scopes")
     for scope in assigned:
@@ -303,6 +329,7 @@ def main() -> None:
         "permissionsync-disallowed-algorithm",
         AUDIENCE,
         {"access.token.signed.response.alg": DISALLOWED_ALGORITHM},
+        client_secret("DISALLOWED_ALGORITHM"),
     )
     create_client(api, REALM, disallowed)
 
@@ -310,15 +337,21 @@ def main() -> None:
         "permissionsync-shortlived",
         AUDIENCE,
         {"access.token.lifespan": str(SHORTLIVED_LIFESPAN_SECONDS)},
+        client_secret("SHORTLIVED"),
     )
     create_client(api, REALM, shortlived)
 
     wrong_audience = service_account_client(
-        "permissionsync-wrong-audience", WRONG_AUDIENCE, {}
+        "permissionsync-wrong-audience",
+        WRONG_AUDIENCE,
+        {},
+        client_secret("WRONG_AUDIENCE"),
     )
     create_client(api, REALM, wrong_audience)
 
-    foreign = service_account_client("permissionsync-foreign-caller", AUDIENCE, {})
+    foreign = service_account_client(
+        "permissionsync-foreign-caller", AUDIENCE, {}, client_secret("FOREIGN")
+    )
     create_client(api, FOREIGN_REALM, foreign)
 
     # The rotation realm gets only what that one test needs: the target scope,
@@ -335,7 +368,9 @@ def main() -> None:
             },
         },
     )
-    rotation = service_account_client("permissionsync-rotation-caller", AUDIENCE, {})
+    rotation = service_account_client(
+        "permissionsync-rotation-caller", AUDIENCE, {}, client_secret("ROTATION")
+    )
     rotation_uuid = create_client(api, ROTATION_REALM, rotation)
     rotation_scope_id = next(
         scope["id"]
@@ -363,20 +398,13 @@ def main() -> None:
         "LOOKALIKE_PREFIX_SCOPE": LOOKALIKE_PREFIX_SCOPE,
         "LOOKALIKE_SUFFIX_SCOPE": LOOKALIKE_SUFFIX_SCOPE,
         "CALLER_CLIENT_ID": caller["clientId"],
-        "CALLER_CLIENT_SECRET": caller["secret"],
         "MINIMAL_CLIENT_ID": minimal["clientId"],
-        "MINIMAL_CLIENT_SECRET": minimal["secret"],
         "DISALLOWED_ALGORITHM_CLIENT_ID": disallowed["clientId"],
-        "DISALLOWED_ALGORITHM_CLIENT_SECRET": disallowed["secret"],
         "SHORTLIVED_CLIENT_ID": shortlived["clientId"],
-        "SHORTLIVED_CLIENT_SECRET": shortlived["secret"],
         "WRONG_AUDIENCE_CLIENT_ID": wrong_audience["clientId"],
-        "WRONG_AUDIENCE_CLIENT_SECRET": wrong_audience["secret"],
         "FOREIGN_CLIENT_ID": foreign["clientId"],
-        "FOREIGN_CLIENT_SECRET": foreign["secret"],
         "ROTATION_REALM": ROTATION_REALM,
         "ROTATION_CLIENT_ID": rotation["clientId"],
-        "ROTATION_CLIENT_SECRET": rotation["secret"],
     }
     for name, value in records.items():
         if any(character in value for character in "=\r\n`"):
