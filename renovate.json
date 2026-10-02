@@ -5,7 +5,7 @@
     {
       "description": "kubeconform's targeted Kubernetes version, which no built-in manager reads out of a pre-commit hook argument",
       "customType": "regex",
-      "managerFilePatterns": ["/^\\.pre-commit-config\\.yaml$/"],
+      "managerFilePatterns": [".pre-commit-config.yaml"],
       "matchStrings": [
         "- -kubernetes-version\\s*\\n\\s*- \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
       ],

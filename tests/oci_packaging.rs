@@ -7,7 +7,7 @@
 //! while `integration/oci/` owns the properties that can only be proved by
 //! actually building and running the image.
 
-use std::{fs, path::PathBuf, time::Duration};
+use std::{collections::BTreeSet, fs, path::PathBuf, time::Duration};
 
 use yaml_serde::Value;
 
@@ -572,13 +572,16 @@ fn the_trivy_policy_narrows_ksv0125_instead_of_suppressing_it() {
 
     let configuration: Value =
         yaml_serde::from_str(&read("trivy.yaml")).expect("trivy.yaml parses as YAML");
+    let declared: BTreeSet<&str> = configuration
+        .as_mapping()
+        .expect("trivy.yaml is a mapping")
+        .iter()
+        .filter_map(|(key, _)| key.as_str())
+        .collect();
     assert_eq!(
-        configuration
-            .as_mapping()
-            .expect("trivy.yaml is a mapping")
-            .len(),
-        1,
-        "trivy.yaml must configure nothing beyond the Rego data path"
+        declared,
+        BTreeSet::from(["rego", "ksv0125"]),
+        "trivy.yaml must declare nothing beyond the Rego data path and the KSV0125 data"
     );
 
     let data_paths: Vec<&str> = field(&configuration, &["rego", "data"])
@@ -590,21 +593,29 @@ fn the_trivy_policy_narrows_ksv0125_instead_of_suppressing_it() {
     assert_eq!(
         data_paths.len(),
         1,
-        "exactly one repository-owned data path is loaded, found {data_paths:?}"
+        "exactly one repository-owned Rego data path is loaded"
     );
 
-    // The trusted-registry data has to live under the path trivy.yaml really
-    // loads, not merely at a filename this test happens to know.
-    let data_directory = repository_path(data_paths[0]);
-    assert!(
-        data_directory.is_dir(),
-        "{} must be the repository's Trivy data directory",
-        data_directory.display()
-    );
-    let trusted: Vec<String> = fs::read_dir(&data_directory)
-        .expect("the Trivy data directory is readable")
-        .filter_map(Result::ok)
-        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+    // The trusted-registry data has to live at the path trivy.yaml really
+    // loads, not merely where this test expects it. Trivy loads either a file
+    // or a directory, so accept both rather than fixing the layout here.
+    let data_path = repository_path(data_paths[0]);
+    let data_files: Vec<PathBuf> = if data_path.is_dir() {
+        fs::read_dir(&data_path)
+            .expect("the Trivy data directory is readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect()
+    } else {
+        assert!(
+            data_path.is_file(),
+            "the configured Rego data path must exist in the repository"
+        );
+        vec![data_path]
+    };
+    let trusted: Vec<String> = data_files
+        .iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
         .filter_map(|text| yaml_serde::from_str::<Value>(&text).ok())
         .filter_map(|document| {
             document

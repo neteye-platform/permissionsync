@@ -2,8 +2,24 @@
 # directory by the shared scan workflow.
 #
 # This narrows one built-in check's data and disables nothing. `rego.data` is
-# the configuration-file form of `--config-data`, so every file under .trivy
-# is loaded as Rego data for the built-in checks.
+# the configuration-file form of `--config-data`, and it accepts a file, so
+# this file supplies its own Rego data and no extra path is needed.
 rego:
   data:
-    - .trivy
+    - trivy.yaml
+
+# Trusted registries for built-in check KSV0125, "Restrict container images to
+# trusted registries".
+#
+# The check stays enabled for every workload in this repository and keeps
+# reporting any other registry. Only its generic default registry list is
+# replaced, because this repository publishes its own production image to GHCR
+# through its own release workflow.
+#
+# KSV0125 evaluates the registry host, so trusting ghcr.io trusts that host.
+# The narrower repository-specific guarantee is enforced separately by
+# tests/oci_packaging.rs, which requires the example deployment to reference
+# exactly ghcr.io/neteye-platform/permissionsync pinned by immutable digest.
+ksv0125:
+  trusted_registries:
+    - ghcr.io
