@@ -16,16 +16,13 @@ command line:
 ``KEYCLOAK_ADMIN_USERNAME`` / ``KEYCLOAK_ADMIN_PASSWORD``
     The container's bootstrap administrator.
 ``KEYCLOAK_CLIENT_SECRET_<RECORD>``
-    The per-run client secret for each service-account client created below,
-    one variable per ``<RECORD>_CLIENT_ID`` record emitted at the end.
-    ``bootstrap.sh`` generates these, masks them in CI logs, and publishes
-    them through its private runtime-env file.
+    The secret ``bootstrap.sh`` generated for each service-account client,
+    one variable per ``<RECORD>_CLIENT_ID`` record emitted below.
 
 Output is a list of ``NAME=value`` records on standard output, which
-``bootstrap.sh`` turns into the suite's runtime environment. None of those
-records is sensitive: no client secret, access token, admin token, or signing
-key is ever printed, so the provisioning output can be captured and diagnosed
-without handling credentials.
+``bootstrap.sh`` turns into the suite's runtime environment. No record is
+sensitive: no client secret, access token, admin token, or signing key is ever
+printed.
 """
 
 import json
@@ -178,13 +175,7 @@ class AdminApi:
 
 
 def client_secret(record: str) -> str:
-    """Read the secret ``bootstrap.sh`` generated for one client.
-
-    The bootstrap owns every client secret in this environment: it generates
-    them, masks them, and writes them to its private runtime-env file. Taking
-    them as input keeps this script free of credential generation and keeps
-    every credential out of its standard output.
-    """
+    """Read the secret ``bootstrap.sh`` generated for one client."""
     variable = f"KEYCLOAK_CLIENT_SECRET_{record}"
     value = os.environ.get(variable, "")
     if not value:

@@ -193,12 +193,9 @@ until curl --cacert "${tls_dir}/ca.crt" --fail --silent --output /dev/null \
   sleep 2
 done
 
-# Every client secret of this run is generated here, next to the
-# administrator password above, and handed to provision.py through the
-# environment. Provisioning therefore neither creates nor emits a credential:
-# its standard output is a non-sensitive record list, and each secret is
-# masked before first use and published only through the private runtime-env
-# file below.
+# Client secrets are generated here, next to the administrator password
+# above, and handed to provision.py through its environment, so provisioning
+# neither creates nor prints a credential.
 caller_client_secret="$(openssl rand -hex 24)"
 minimal_client_secret="$(openssl rand -hex 24)"
 disallowed_algorithm_client_secret="$(openssl rand -hex 24)"
@@ -225,8 +222,6 @@ env_put KEYCLOAK_TEST_WRONG_AUDIENCE_CLIENT_SECRET "$wrong_audience_client_secre
 env_put KEYCLOAK_TEST_FOREIGN_CLIENT_SECRET "$foreign_client_secret"
 env_put KEYCLOAK_TEST_ROTATION_CLIENT_SECRET "$rotation_client_secret"
 
-# Variable assignments on the command prefix become provision.py's
-# environment, so no secret reaches an argument vector here either.
 if ! KEYCLOAK_BASE_URL="$base_url" \
   KEYCLOAK_CA_PEM="${tls_dir}/ca.crt" \
   KEYCLOAK_ADMIN_USERNAME="$admin_username" \
