@@ -622,19 +622,22 @@ fn the_trivy_policy_narrows_ksv0125_instead_of_suppressing_it() {
         .flatten()
         .collect();
 
+    // Both assertions below deliberately carry fixed messages: the values come
+    // from repository configuration and printing them buys nothing.
     assert!(
-        trusted.contains(&"ghcr.io".to_owned()),
-        "the loaded data must trust ghcr.io, found {trusted:?}"
+        trusted.iter().any(|registry| registry == "ghcr.io"),
+        "KSV0125 must trust ghcr.io"
     );
-    for registry in &trusted {
-        assert!(
-            !registry.contains('*')
+    assert!(
+        trusted.iter().all(|registry| {
+            !registry.is_empty()
+                && !registry.contains('*')
                 && !registry.contains('/')
                 && !registry.contains("://")
-                && !registry.is_empty(),
-            "{registry:?} must be a plain registry host, with no wildcard, scheme, or path"
-        );
-    }
+        }),
+        "KSV0125 trusted registries must be non-empty plain registry hosts, with no wildcard, \
+         scheme, or path"
+    );
 }
 
 /// `latest` is expected to exist from the first stable release onward and to
