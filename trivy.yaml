@@ -1,0 +1,9 @@
+# Repository-owned Trivy configuration, loaded automatically from the working
+# directory by the shared scan workflow.
+#
+# This narrows one built-in check's data and disables nothing. `rego.data` is
+# the configuration-file form of `--config-data`, so every file under .trivy
+# is loaded as Rego data for the built-in checks.
+rego:
+  data:
+    - .trivy

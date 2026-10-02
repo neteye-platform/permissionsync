@@ -558,6 +558,85 @@ fn the_release_documentation_describes_latest_as_mutable() {
     }
 }
 
+/// The scanner policy for the deployment contract is configuration, not
+/// suppression: KSV0125 stays enabled for every workload in this repository
+/// and only its generic trusted-registry data is replaced. This asserts the
+/// checked-in policy stays that narrow; it deliberately does not reimplement
+/// Trivy's own rule, which `integration` scanning in CI evaluates for real.
+#[test]
+fn the_trivy_policy_narrows_ksv0125_instead_of_suppressing_it() {
+    assert!(
+        !repository_path(".trivyignore").exists(),
+        ".trivyignore must not exist: KSV0125 is configured, never suppressed"
+    );
+
+    let configuration: Value =
+        yaml_serde::from_str(&read("trivy.yaml")).expect("trivy.yaml parses as YAML");
+    assert_eq!(
+        configuration
+            .as_mapping()
+            .expect("trivy.yaml is a mapping")
+            .len(),
+        1,
+        "trivy.yaml must configure nothing beyond the Rego data path"
+    );
+
+    let data_paths: Vec<&str> = field(&configuration, &["rego", "data"])
+        .as_sequence()
+        .expect("rego.data is a sequence")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        data_paths.len(),
+        1,
+        "exactly one repository-owned data path is loaded, found {data_paths:?}"
+    );
+
+    // The trusted-registry data has to live under the path trivy.yaml really
+    // loads, not merely at a filename this test happens to know.
+    let data_directory = repository_path(data_paths[0]);
+    assert!(
+        data_directory.is_dir(),
+        "{} must be the repository's Trivy data directory",
+        data_directory.display()
+    );
+    let trusted: Vec<String> = fs::read_dir(&data_directory)
+        .expect("the Trivy data directory is readable")
+        .filter_map(Result::ok)
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .filter_map(|text| yaml_serde::from_str::<Value>(&text).ok())
+        .filter_map(|document| {
+            document
+                .get("ksv0125")
+                .and_then(|check| check.get("trusted_registries"))
+                .and_then(Value::as_sequence)
+                .map(|registries| {
+                    registries
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<String>>()
+                })
+        })
+        .flatten()
+        .collect();
+
+    assert!(
+        trusted.contains(&"ghcr.io".to_owned()),
+        "the loaded data must trust ghcr.io, found {trusted:?}"
+    );
+    for registry in &trusted {
+        assert!(
+            !registry.contains('*')
+                && !registry.contains('/')
+                && !registry.contains("://")
+                && !registry.is_empty(),
+            "{registry:?} must be a plain registry host, with no wildcard, scheme, or path"
+        );
+    }
+}
+
 /// `latest` is expected to exist from the first stable release onward and to
 /// move on every later one, so its presence must never block a release.
 #[test]
