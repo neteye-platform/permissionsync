@@ -34,7 +34,7 @@ async-trait = "=0.1.92"
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
 http = { version = "=1.5.0", default-features = false, features = ["std"] }
 http-body-util = { version = "=0.1.5", default-features = false }
-hyper = { version = "=1.11.1", default-features = false, features = ["client", "http1", "server"] }
+hyper = { version = "=1.12.0", default-features = false, features = ["client", "http1", "server"] }
 hyper-tls = { version = "=0.6.0", default-features = false }
 hyper-util = { version = "=0.1.21", default-features = false, features = ["client-legacy", "http1", "server", "service", "tokio"] }
 libc = { version = "=0.2.190", default-features = false }
