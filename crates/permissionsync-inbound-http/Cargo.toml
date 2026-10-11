@@ -12,7 +12,7 @@ permissionsync-auth = { path = "../permissionsync-auth", version = "=0.1.0" }
 permissionsync-core = { path = "../permissionsync-core", version = "=0.1.0" }
 permissionsync-orchestration = { path = "../permissionsync-orchestration", version = "=0.1.0" }
 serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }
-serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
+serde_json = { version = "=1.0.152", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 josekit = { version = "=0.10.3", default-features = false }

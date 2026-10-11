@@ -41,10 +41,10 @@ libc = { version = "=0.2.190", default-features = false }
 metrics = { version = "=0.24.6", default-features = false }
 metrics-exporter-prometheus = { version = "=0.18.3", default-features = false }
 native-tls = { version = "=0.2.18", default-features = false }
-opentelemetry = { version = "=0.33.0", default-features = false, features = ["trace"] }
-opentelemetry-http = { version = "=0.33.0", default-features = false, features = ["hyper"] }
-opentelemetry-otlp = { version = "=0.33.0", default-features = false, features = ["http-proto", "trace"] }
-opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = ["experimental_trace_batch_span_processor_with_async_runtime", "rt-tokio", "trace"] }
+opentelemetry = { version = "=0.33.1", default-features = false, features = ["trace"] }
+opentelemetry-http = { version = "=0.33.1", default-features = false, features = ["hyper"] }
+opentelemetry-otlp = { version = "=0.33.1", default-features = false, features = ["http-proto", "trace"] }
+opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = ["experimental_trace_batch_span_processor_with_async_runtime", "rt-tokio", "trace"] }
 permissionsync-adapter-glpi = { path = "crates/permissionsync-adapter-glpi", version = "=0.1.0" }
 permissionsync-auth = { path = "crates/permissionsync-auth", version = "=0.1.0" }
 permissionsync-core = { path = "crates/permissionsync-core", version = "=0.1.0" }
@@ -64,7 +64,7 @@ bytes = { version = "=1.12.1", default-features = false }
 http-body = { version = "=1.1.0", default-features = false }
 josekit = { version = "=0.10.3", default-features = false }
 openssl = { version = "=0.10.81", default-features = false }
-serde_json = { version = "=1.0.151", default-features = false, features = ["std"] }
+serde_json = { version = "=1.0.152", default-features = false, features = ["std"] }
 tokio = { version = "=1.53.2", default-features = false, features = ["io-util", "test-util"] }
 tokio-native-tls = { version = "=0.3.1", default-features = false }
 tower = { version = "=0.5.3", default-features = false, features = ["util"] }
