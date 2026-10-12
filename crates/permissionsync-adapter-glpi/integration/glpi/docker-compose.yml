@@ -15,7 +15,7 @@ services:
       - /var/lib/mysql
 
   glpi:
-    image: glpi/glpi:11.0.11@sha256:8888c5d8aa46d4876add5980e78815ba2309bced6a5677a555bbf67315877817
+    image: glpi/glpi:11.0.11@sha256:45572164994cbd12bedd99bf6dd954b7962076dd3b529f0fdc4a84131f30a32a
     depends_on:
       db:
         condition: service_healthy
