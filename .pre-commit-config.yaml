@@ -65,7 +65,7 @@ repos:
       - id: uv-lock
 
   - repo: https://github.com/ansible/ansible-lint
-    rev: e7f397ad6dfa20d274afa17cd7bbedd84ed136f5 # frozen: v26.9.0
+    rev: fac2489f3e4ccffa83a40b839770abbf4ab52327 # frozen: v26.10.0
     hooks:
       - id: ansible-lint
 
@@ -91,7 +91,7 @@ repos:
       - id: markdownlint-cli2
 
   - repo: https://github.com/renovatebot/pre-commit-hooks
-    rev: 5dd87129e32b92a511c8543c941058f65fa34bbb # frozen: 44.151.2
+    rev: 4fda87d7a88af8155a135f9bd6ffa10c1c0a3fa4 # frozen: 44.155.2
     hooks:
       - id: renovate-config-validator
         args: [--strict]
