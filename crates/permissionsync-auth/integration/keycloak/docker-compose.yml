@@ -41,7 +41,7 @@ services:
   # certificate and hostname verification stay exactly as they are on the
   # direct port.
   outage-proxy:
-    image: docker.io/library/nginx:1.31.6@sha256:60f0d4e986561e08804f75c211dcaf7fc5455699eada29f42cbe8a0a7253dd86
+    image: docker.io/library/nginx:1.31.7@sha256:bc4cad49969aaf95eb4eecec5572846f86e59f1e8332aba36ed64b91aff8b724
     depends_on:
       keycloak:
         condition: service_started
