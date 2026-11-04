@@ -13,6 +13,7 @@
 pub(crate) mod admission;
 pub(crate) mod capacity;
 pub(crate) mod configuration;
+pub(crate) mod environment;
 pub(crate) mod failure;
 pub(crate) mod lifecycle;
 pub(crate) mod observability;
@@ -49,6 +50,7 @@ use crate::runtime::{
     admission::InboundAdmission,
     capacity::SemaphoreCapacity,
     configuration::{ComponentOutcome, ExecutableConfiguration},
+    environment::{Environment, report_unknown_variables},
     failure::RuntimeFailure,
     lifecycle::{Lifecycle, RequestCancellation},
     transport::{RefusingService, RuntimeState, record_component_availability, router},
@@ -100,19 +102,23 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Runs the executable runtime to completion.
 ///
-/// Startup order follows ADR 0011: resolve and read the single configuration
-/// file, validate global and static values, construct the authenticator,
-/// project semantic configuration and compose, construct admission and
-/// capacity, initialize required observability, wire orchestration and inbound
-/// handling, build the transport, bind the listener, begin serving, and only
-/// then allow bounded verifier warm-up.
+/// Startup order follows ADR 0011: capture the environment once, report the
+/// unknown `PERMISSIONSYNC_*` names, resolve and read the single configuration
+/// file, merge the environment overrides, validate global and static values,
+/// construct the authenticator, project semantic configuration and compose,
+/// construct admission and capacity, initialize required observability, wire
+/// orchestration and inbound handling, build the transport, bind the listener,
+/// begin serving, and only then allow bounded verifier warm-up.
 ///
 /// Reading and validating configuration happens before the asynchronous runtime
 /// exists, so a global defect aborts before any listener, task, or telemetry
 /// channel is created.
 pub(crate) fn run() -> Result<(), RuntimeFailure> {
-    let path = configuration::configuration_path()?;
-    let configuration = configuration::load(Path::new(&path))?;
+    let environment = Environment::from_process();
+    report_unknown_variables(&environment, io::stderr());
+    let path = configuration::configuration_path(&environment)?;
+    let configuration = configuration::load(Path::new(&path), &environment)?;
+    drop(environment);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

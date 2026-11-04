@@ -3,8 +3,9 @@
 # The runtime stage deliberately carries no configuration: ADR-0011 requires
 # exactly one external UTF-8 YAML document whose path comes only from
 # PERMISSIONSYNC_CONFIG_FILE, so the image sets neither that variable nor a
-# default document. Secrets, private trust material, deployment URLs, and
-# target configuration stay outside the artifact (ADR-0006).
+# default document. Other PERMISSIONSYNC_* variables override single values
+# and supply every secret; the image sets none of them. Secrets, private trust material, deployment URLs, and target
+# configuration stay outside the artifact (ADR-0006).
 #
 # Both base images are pinned by readable tag and immutable digest so Renovate
 # can propose both together. The builder tag is only a rustup bootstrap: the

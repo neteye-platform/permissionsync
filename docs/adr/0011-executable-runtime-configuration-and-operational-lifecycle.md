@@ -24,11 +24,12 @@ contracts.
 ### Configuration delivery
 
 The executable loads exactly one UTF-8 YAML configuration document. Its path is
-supplied by the required `PERMISSIONSYNC_CONFIG_FILE` environment variable.
-There are no layered file, environment-value, command-line, or remote
-configuration overrides, and no implicit environment substitution inside the
-document. The file is loaded once during startup; runtime reload is not
-supported.
+supplied by the required `PERMISSIONSYNC_CONFIG_FILE` environment variable. The
+file is the required base document: `PERMISSIONSYNC_*` environment variables
+replace single values of it and supply every secret, as described below. There
+are no layered file, command-line, or remote configuration overrides, and no
+implicit environment substitution inside the document. The file and the
+environment are read once during startup; runtime reload is not supported.
 
 YAML is selected because it lets operators comment deployment configuration
 next to the values they manage while remaining one strict external document.
@@ -40,10 +41,62 @@ not a parsing crate: the implementation chooses a maintained, Serde-compatible
 parser with strict typed deserialization under the repository's exact-versioning
 and dependency policy.
 
-Secrets, credentials, and private trust material are supplied through this
-external runtime file and are never built into the binary or image. The
-executable neither requires nor understands Kubernetes Secrets, secret
-operators, or another secret backend.
+Private trust material is supplied through this external runtime file.
+Secrets and credentials come only from the environment. Neither is ever built
+into the binary or image. The executable neither requires nor understands
+Kubernetes Secrets, secret operators, or another secret backend.
+
+### Environment overrides and secrets
+
+One environment variable replaces exactly one scalar value of the file. Every
+scalar value can come from the environment. Lists stay in the file only:
+`targets`, `authentication.algorithms`, and every
+`additional_trust_anchors_pem`. The environment cannot replace an absent,
+empty, or malformed file.
+
+A variable name is `PERMISSIONSYNC_` followed by the path of the key in the
+file, in uppercase, with `__` between two levels, for example
+`PERMISSIONSYNC_REQUEST__OVERALL_DEADLINE_MILLISECONDS`. A single `_` already
+occurs inside keys, so it cannot separate levels. Variable names are public
+interface, like the file keys.
+
+The secrets are `glpi.app_token`, `glpi.user_token`, and the OTLP exporter
+headers `observability.tracing.headers`. A future secret value is also
+environment-only. The file has no secret field: when it contains a secret key,
+whatever its value, startup stops with a fixed, value-free failure category.
+The exporter headers are a map, so one variable
+`PERMISSIONSYNC_OBSERVABILITY__TRACING__HEADERS__<NAME>` supplies one header,
+and each credential can come from its own secret reference. `<NAME>` is one or
+more groups of uppercase ASCII letters and digits separated by a single `_`;
+the header name is `<NAME>` in lowercase with every `_` replaced by `-`. A
+header name that contains `_` therefore cannot be supplied.
+
+The runtime parses the file into one YAML tree. A YAML tag anywhere in the file
+makes the document structure invalid: no configuration value uses a tag, and a
+tagged key would hide from the secret check and from the merge while typed
+decoding still accepts it. Then the runtime checks the file for secret keys,
+decodes each recognized environment value with the declared type of its key,
+and inserts it into the tree, creating missing mappings. The merge never
+repairs the file: when a node on the path exists and is not a mapping, the
+value is not inserted. The strict decoding and validation of this record then
+run on the merged tree, so environment values follow exactly the file rules,
+including the split between global and component-local failures. A variable
+creates its missing section, which then needs its other required keys.
+
+An unknown `PERMISSIONSYNC_*` variable does not stop startup, because
+deployment tooling can set variables that an older or newer release does not
+know. For each such variable, startup writes one warning line with the name
+only to standard error, before it reads the file, so the name is visible also
+when startup then stops. PermissionSync never logs, prints, or puts in an error
+the value of an environment variable.
+
+One static table in the code lists every variable, with its key path, type,
+default, and secret flag. The merge and the secret check use it. The
+[environment variable reference](../environment-variables.md) contains a table
+generated from it, and a test checks that the two are equal. Another test
+checks that every scalar field of the delivery model has an entry. The runtime
+reads the process environment in one place; every other function receives the
+captured variables, so tests never change the process environment.
 
 The deserialized executable configuration is a delivery or wire model, not a
 replacement for the existing semantic `RuntimeConfiguration`. It contains the
@@ -215,8 +268,10 @@ availability.
 
 Startup proceeds in this order:
 
-1. Resolve and read the single configuration file.
-2. Parse it and validate required global and static values.
+1. Capture the environment, report unknown `PERMISSIONSYNC_*` names, and
+   resolve and read the single configuration file.
+2. Parse it, merge the environment overrides and secrets, and validate required
+   global and static values.
 3. Construct the technical-caller authenticator.
 4. Project semantic configuration and compose the Provider and targets.
 5. Construct the inbound admission limit and semaphore-backed capacity.
@@ -284,7 +339,7 @@ requested, so no redirect or remote response can expand the configured trust
 boundary. Configured headers and credentials are sent only to the configured
 endpoint origin, meaning its scheme, host, and effective port, and there is no
 endpoint discovery, redirect allowlist, or same-origin redirect exception.
-Exporter headers and credentials are runtime configuration and never appear in
+Exporter headers come only from the environment and never appear in
 logs, metrics, errors, or `Debug` output. Invalid local tracing
 configuration while export is explicitly enabled fails startup as global
 configuration; an unreachable backend afterwards does not.
@@ -314,9 +369,34 @@ ADR-0006, OCI image construction details, or CI/CD pipelines.
 
 ## Alternatives considered
 
-- **Layered file, environment, and command-line overrides:** rejected because
-  precedence and partial overrides make sensitive configuration harder to
-  reason about. One external YAML document provides one inspectable input.
+- **Layered files and command-line overrides:** rejected because precedence
+  and partial overrides make sensitive configuration harder to reason about.
+  One external YAML document provides one inspectable base.
+
+- **No environment overrides, with secrets in the file:** rejected because the
+  whole file must then be handled as a secret, and a single deployment value
+  cannot change without a new file. Most deployment platforms and secret
+  managers supply secrets as environment variables.
+
+- **Secrets from the file or the environment:** rejected because two sources
+  need a precedence rule, and a secret can still reach a shared or committed
+  file. One source is easier to audit.
+
+- **Secret file references, such as an `app_token_file` key, or environment
+  substitution inside the document:** rejected because they add a second file
+  mechanism or hidden indirection inside the one document.
+
+- **Lists or all exporter headers from one variable:** rejected because they
+  need a second value syntax, and one header could not come from its own secret
+  reference.
+
+- **Startup failure for an unknown variable:** rejected because it would break
+  a rollout or rollback in which the tooling sets a variable that the other
+  release does not know. The warning keeps the mistake visible.
+
+- **Unknown-variable warnings in the structured log:** rejected because logging
+  is set up only after the file is read, so a startup that stops earlier would
+  lose them, and the `error` level filters them.
 
 - **A JSON configuration document:** rejected for the executable configuration
   because YAML keeps one strict external document while letting operators
@@ -345,12 +425,16 @@ ADR-0006, OCI image construction details, or CI/CD pipelines.
 
 ## Consequences
 
-PermissionSync has one runtime delivery model: a single external YAML file that
-keeps deployment values, secrets, and private trust outside the image and that
-operators can document with comments beside the values they manage. Invalid
-local global
-configuration fails deterministically, while transient authentication metadata
-or downstream outages do not create startup crash loops.
+PermissionSync has one runtime delivery model: a single external YAML file, with
+single values and every secret from the environment, that keeps deployment
+values, secrets, and private trust outside the image and that operators can
+document with comments beside the values they manage. The file carries no
+credential, so it can be handled as ordinary configuration. Operators have two
+inputs to inspect, the file and the `PERMISSIONSYNC_*` variables, and must
+protect the environment as they protect any secret delivery. Each new scalar
+configuration key gets a schema entry, and with it a public variable name.
+Invalid local global configuration fails deterministically, while transient
+authentication metadata or downstream outages do not create startup crash loops.
 
 A fixed body limit, bounded inbound admission, one absolute deadline, and
 bounded local concurrency protect the process from unbounded request work.
@@ -371,4 +455,5 @@ probes without coupling application semantics to Kubernetes APIs.
 - [ADR-0008](0008-generic-rest-permission-provider-wire-and-transport-contract.md)
 - [ADR-0009](0009-glpi-target-adapter.md)
 - [ADR-0010](0010-runtime-target-configuration-and-composition-root.md)
+- [Environment variables](../environment-variables.md)
 - [ADR index](README.md)

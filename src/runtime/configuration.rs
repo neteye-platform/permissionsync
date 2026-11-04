@@ -1,4 +1,5 @@
-//! Executable configuration delivery: one strict external YAML document.
+//! Executable configuration delivery: one strict external YAML document,
+//! with environment-variable overrides of its scalar values (ADR 0011).
 //!
 //! This module owns the delivery/wire model only. It is deliberately separate
 //! from the semantic [`RuntimeConfiguration`] it projects into: listener,
@@ -7,16 +8,21 @@
 //!
 //! # Global versus component-local decoding
 //!
-//! The document is decoded in two steps so strict decoding cannot promote a
+//! The document is decoded in steps so strict decoding cannot promote a
 //! component-local defect into a global startup failure.
 //!
-//! 1. The whole document is decoded into [`DocumentDelivery`], which names
+//! 1. The file is parsed into one YAML tree. A YAML tag anywhere in the file
+//!    makes the document structure invalid, and a secret key in the file
+//!    stops startup. Then [`environment::merge`] inserts every recognized
+//!    environment value into the tree, so every later rule applies equally to
+//!    file values and environment values.
+//! 2. The whole merged document is decoded into [`DocumentDelivery`], which names
 //!    exactly the required top-level sections, rejects unknown top-level
 //!    fields, and keeps `provider` and `glpi` as still-undecoded YAML values.
-//! 2. Each global section is then decoded and validated on its own, so a
+//! 3. Each global section is then decoded and validated on its own, so a
 //!    schema mistake reports which section was unusable without reporting any
 //!    value from it.
-//! 3. The `provider` and `glpi` values are decoded and validated separately.
+//! 4. The `provider` and `glpi` values are decoded and validated separately.
 //!    Either failing leaves only that component unavailable.
 //!
 //! # Durations
@@ -49,12 +55,10 @@ use yaml_serde::Value;
 
 use crate::runtime::{
     admission,
+    environment::{self, CONFIGURATION_PATH_VARIABLE, Environment},
     failure::RuntimeFailure,
     observability::{LogLevel, ObservabilityConfiguration, TracingConfiguration},
 };
-
-/// The environment variable that supplies the single configuration file path.
-pub(crate) const CONFIGURATION_PATH_VARIABLE: &str = "PERMISSIONSYNC_CONFIG_FILE";
 
 /// The finite product safety ceiling on configured selected-target
 /// synchronization capacity required by ADR 0011.
@@ -100,26 +104,46 @@ pub(crate) struct ExecutableConfiguration {
 /// Resolves the single configuration path from the required environment
 /// variable.
 ///
-/// Path resolution is separated from loading so every loading and validation
-/// rule stays testable from a temporary file without mutating process
-/// environment state.
-pub(crate) fn configuration_path() -> Result<OsString, RuntimeFailure> {
-    match std::env::var_os(CONFIGURATION_PATH_VARIABLE) {
-        Some(path) if !path.is_empty() => Ok(path),
+/// The environment is injected, so every loading and validation rule stays
+/// testable without mutating process environment state.
+pub(crate) fn configuration_path(environment: &Environment) -> Result<OsString, RuntimeFailure> {
+    match environment.get(CONFIGURATION_PATH_VARIABLE) {
+        Some(path) if !path.is_empty() => Ok(path.to_owned()),
         Some(_) | None => Err(RuntimeFailure::ConfigurationPathMissing),
     }
 }
 
-/// Loads, decodes, and validates the single configuration document.
-pub(crate) fn load(path: &Path) -> Result<ExecutableConfiguration, RuntimeFailure> {
+/// Loads the single configuration document, merges the environment into it,
+/// and decodes and validates the result.
+pub(crate) fn load(
+    path: &Path,
+    environment: &Environment,
+) -> Result<ExecutableConfiguration, RuntimeFailure> {
     let bytes = std::fs::read(path).map_err(|_| RuntimeFailure::ConfigurationUnreadable)?;
     let text = String::from_utf8(bytes).map_err(|_| RuntimeFailure::ConfigurationNotUtf8)?;
-    decode(&text)
+    decode(&text, environment)
 }
 
-/// Decodes and validates one already-read UTF-8 configuration document.
-pub(crate) fn decode(text: &str) -> Result<ExecutableConfiguration, RuntimeFailure> {
-    let document = single_document(text)?;
+/// Decodes one already-read UTF-8 configuration document, merges the
+/// environment into it, and validates the result.
+pub(crate) fn decode(
+    text: &str,
+    environment: &Environment,
+) -> Result<ExecutableConfiguration, RuntimeFailure> {
+    let mut value = single_document(text)?;
+    // No configuration value uses a tag. A tagged key would hide from the
+    // secret check and the merge while typed decoding still accepts it.
+    if environment::contains_tag(&value) {
+        return Err(RuntimeFailure::InvalidDocumentStructure);
+    }
+    // Secrets come only from the environment. The check runs on the file
+    // alone, before the merge inserts environment secrets.
+    if environment::contains_secret(&value) {
+        return Err(RuntimeFailure::SecretInConfigurationFile);
+    }
+    environment::merge(&mut value, environment);
+    let document: DocumentDelivery =
+        yaml_serde::from_value(value).map_err(|_| RuntimeFailure::InvalidDocumentStructure)?;
 
     let listener = listener(&document.listener)?;
     let request = request(&document.request)?;
@@ -156,13 +180,13 @@ pub(crate) fn decode(text: &str) -> Result<ExecutableConfiguration, RuntimeFailu
     })
 }
 
-/// Parses exactly one YAML document.
+/// Parses exactly one YAML document into an untyped tree.
 ///
 /// The first document is parsed before the stream is asked for a second one, so
 /// a malformed single document is reported as malformed rather than as a
 /// multi-document stream. A stream that really does carry a second document is
 /// a global failure rather than a silently used first document.
-fn single_document(text: &str) -> Result<DocumentDelivery, RuntimeFailure> {
+fn single_document(text: &str) -> Result<Value, RuntimeFailure> {
     let mut documents = yaml_serde::Deserializer::from_str(text);
     let first = documents.next().ok_or(RuntimeFailure::ConfigurationEmpty)?;
     let value = Value::deserialize(first).map_err(|_| RuntimeFailure::InvalidDocumentStructure)?;
@@ -172,8 +196,7 @@ fn single_document(text: &str) -> Result<DocumentDelivery, RuntimeFailure> {
     if documents.next().is_some() {
         return Err(RuntimeFailure::ConfigurationMultipleDocuments);
     }
-
-    yaml_serde::from_value(value).map_err(|_| RuntimeFailure::InvalidDocumentStructure)
+    Ok(value)
 }
 
 /// The strict top-level document shape.
@@ -630,7 +653,86 @@ fn positive_duration(milliseconds: u64) -> Option<Duration> {
 }
 
 /// PEM trust material is supplied inline in the configuration document. There
-/// is no file-reference or include mechanism.
+/// is no file-reference or include mechanism, and no environment override of a
+/// list.
 fn trust_anchors(pem: Vec<String>) -> Vec<Vec<u8>> {
     pem.into_iter().map(String::into_bytes).collect()
+}
+
+/// Every delivery section with its file key path and its field names.
+///
+/// The field names come from the derived `Deserialize` implementations, so a
+/// new field in a delivery struct appears here without a manual list. The
+/// schema completeness test compares these fields with the environment
+/// variable schema. `targets[]` names the fields of one list element.
+#[cfg(test)]
+pub(crate) fn delivery_sections() -> Vec<(&'static str, &'static [&'static str])> {
+    use field_probe::fields_of;
+
+    vec![
+        ("", fields_of::<DocumentDelivery>()),
+        ("listener", fields_of::<ListenerDelivery>()),
+        ("request", fields_of::<RequestDelivery>()),
+        ("shutdown", fields_of::<ShutdownDelivery>()),
+        ("authentication", fields_of::<AuthenticationDelivery>()),
+        ("authentication.source", fields_of::<SourceDelivery>()),
+        ("authentication.cache", fields_of::<CacheDelivery>()),
+        ("observability", fields_of::<ObservabilityDelivery>()),
+        ("observability.tracing", fields_of::<TracingDelivery>()),
+        ("provider", fields_of::<ProviderDelivery>()),
+        ("provider.generic_rest", fields_of::<GenericRestDelivery>()),
+        ("glpi", fields_of::<GlpiDelivery>()),
+        (
+            "glpi.authentication_source",
+            fields_of::<GlpiAuthenticationSourceDelivery>(),
+        ),
+        ("targets[]", fields_of::<TargetDelivery>()),
+    ]
+}
+
+/// Reads the field names of a derived `Deserialize` struct.
+///
+/// Serde passes the complete field list to `deserialize_struct`, so this
+/// deserializer records that list and then stops.
+#[cfg(test)]
+mod field_probe {
+    use std::cell::Cell;
+
+    use serde::{
+        Deserialize,
+        de::{self, Deserializer, Visitor, value::Error},
+    };
+
+    struct Probe<'a>(&'a Cell<&'static [&'static str]>);
+
+    impl<'de> Deserializer<'de> for Probe<'_> {
+        type Error = Error;
+
+        fn deserialize_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Error> {
+            Err(de::Error::custom("only a struct can be probed"))
+        }
+
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, Error> {
+            self.0.set(fields);
+            Err(de::Error::custom("probed"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map enum identifier ignored_any
+        }
+    }
+
+    pub(super) fn fields_of<T: for<'de> Deserialize<'de>>() -> &'static [&'static str] {
+        let fields = Cell::new(&[][..]);
+        let _ = T::deserialize(Probe(&fields));
+        assert!(!fields.get().is_empty(), "the probed type must be a struct");
+        fields.get()
+    }
 }

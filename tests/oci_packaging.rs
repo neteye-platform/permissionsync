@@ -374,7 +374,8 @@ fn the_deployment_contract_example_is_hardened() {
 }
 
 /// The example must demonstrate exactly the application configuration
-/// contract: one externally mounted file named by one environment variable.
+/// contract: one externally mounted file named by one environment variable,
+/// and secrets that come only from the environment (ADR-0011).
 #[test]
 fn the_deployment_contract_example_mounts_exactly_one_external_configuration_file() {
     let example = kubernetes_example();
@@ -383,12 +384,15 @@ fn the_deployment_contract_example_mounts_exactly_one_external_configuration_fil
     let variables = field(container, &["env"])
         .as_sequence()
         .expect("the container declares environment variables");
+    let (literal, referenced): (Vec<&Value>, Vec<&Value>) = variables
+        .iter()
+        .partition(|variable| variable.get("value").is_some());
     assert_eq!(
-        variables.len(),
+        literal.len(),
         1,
-        "the configuration contract is exactly one environment variable"
+        "the configuration file path is the only literal environment value"
     );
-    let variable = &variables[0];
+    let variable = literal[0];
     assert_eq!(
         field(variable, &["name"]).as_str(),
         Some("PERMISSIONSYNC_CONFIG_FILE")
@@ -399,6 +403,29 @@ fn the_deployment_contract_example_mounts_exactly_one_external_configuration_fil
     assert!(
         configuration_path.ends_with(".yaml"),
         "PERMISSIONSYNC_CONFIG_FILE must name one YAML document"
+    );
+
+    // Secrets come only from the environment, and the example never writes a
+    // secret value into the manifest.
+    let mut secret_names: Vec<&str> = referenced
+        .iter()
+        .map(|variable| {
+            let reference = field(variable, &["valueFrom", "secretKeyRef"]);
+            assert!(field(reference, &["name"]).as_str().is_some());
+            assert!(field(reference, &["key"]).as_str().is_some());
+            field(variable, &["name"])
+                .as_str()
+                .expect("every variable has a name")
+        })
+        .collect();
+    secret_names.sort_unstable();
+    assert_eq!(
+        secret_names,
+        [
+            "PERMISSIONSYNC_GLPI__APP_TOKEN",
+            "PERMISSIONSYNC_GLPI__USER_TOKEN"
+        ],
+        "the GLPI secrets come from a Secret reference"
     );
 
     let mounts = field(container, &["volumeMounts"])

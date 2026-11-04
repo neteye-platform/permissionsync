@@ -378,8 +378,9 @@ pub(crate) fn build_tracer_provider(
                 .with_scheduled_delay(SPAN_EXPORT_INTERVAL)
                 // Every remaining batch value is set explicitly, because
                 // `BatchConfigBuilder::default()` seeds itself from ambient
-                // `OTEL_BSP_*` environment variables and ADR 0011 allows no
-                // environment-value configuration override. One export at a
+                // `OTEL_BSP_*` environment variables, and ADR 0011 allows no
+                // configuration source other than the YAML document and the
+                // `PERMISSIONSYNC_*` variables. One export at a
                 // time keeps telemetry from fanning out into concurrent
                 // outbound work, and the configured export timeout is the
                 // batch-level bound as well.
@@ -392,9 +393,9 @@ pub(crate) fn build_tracer_provider(
     Ok(SdkTracerProvider::builder()
         .with_span_processor(processor)
         // Every value the SDK would otherwise take from the ambient process
-        // environment is set here instead. ADR 0011 defines exactly one
-        // configuration source, the YAML document, and rejects environment-value
-        // overrides; `TracerProviderBuilder`'s own default configuration reads
+        // environment is set here instead. ADR 0011 defines the only
+        // configuration sources, the YAML document and the `PERMISSIONSYNC_*`
+        // variables; `TracerProviderBuilder`'s own default configuration reads
         // `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG`, and the
         // `OTEL_SPAN_*_COUNT_LIMIT` variables, and `Resource::builder()` runs
         // detectors for `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`.
