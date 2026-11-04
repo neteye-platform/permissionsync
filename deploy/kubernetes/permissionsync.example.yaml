@@ -9,10 +9,12 @@
 # can be validated in CI; copy it, replace every REPLACE_WITH_* placeholder, and
 # own the result in your own deployment repository.
 #
-# Everything the service needs is one external YAML document, mounted read-only,
-# whose path is given by PERMISSIONSYNC_CONFIG_FILE. See
-# docs/permissionsync.example.yaml for that document's schema, and keep the real
-# one outside the image.
+# The service needs one external YAML document, mounted read-only, whose path
+# is given by PERMISSIONSYNC_CONFIG_FILE, and its secrets as environment
+# variables. Secrets come only from the environment (ADR-0012), so the
+# document carries no secret. See docs/permissionsync.example.yaml for that
+# document's schema and docs/environment-variables.md for every variable, and
+# keep the real document outside the image.
 #
 # Replicas, resource requests and limits, scheduling, Service, Ingress, TLS
 # termination in front of the listener, and how the configuration volume is
@@ -66,13 +68,29 @@ spec:
           # connectivity.
           image: ghcr.io/neteye-platform/permissionsync:REPLACE_WITH_VERSION@sha256:REPLACE_WITH_IMAGE_DIGEST
           imagePullPolicy: IfNotPresent
-          # The complete application configuration contract: exactly one
-          # external file path. There are no per-value environment variables,
-          # command-line flags, environment interpolation, configuration
-          # directories, or runtime reload.
+          # The application configuration contract: exactly one external file
+          # path, plus the secrets. Any other PERMISSIONSYNC_* variable can
+          # replace one scalar value of the file. There are no command-line
+          # flags, environment interpolation, configuration directories, or
+          # runtime reload.
           env:
             - name: PERMISSIONSYNC_CONFIG_FILE
               value: /etc/permissionsync/permissionsync.yaml
+            # Secrets come only from the environment. A Kubernetes Secret is
+            # shown here, but PermissionSync neither requires nor understands
+            # any secret backend: anything that sets the variables works. Add
+            # one PERMISSIONSYNC_OBSERVABILITY__TRACING__HEADERS__<NAME>
+            # variable in the same way for each OTLP exporter header.
+            - name: PERMISSIONSYNC_GLPI__APP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_WITH_GLPI_SECRET_NAME
+                  key: app-token
+            - name: PERMISSIONSYNC_GLPI__USER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: REPLACE_WITH_GLPI_SECRET_NAME
+                  key: user-token
           ports:
             # Must match `listener.port` in the mounted configuration.
             - name: http
@@ -127,15 +145,13 @@ spec:
               readOnly: true
       volumes:
         # Any volume source that presents the single configuration document at
-        # the mounted path is acceptable. ADR-0006 does NOT require Kubernetes
-        # Secrets, and PermissionSync neither requires nor understands any
-        # secret backend: a Secret, a ConfigMap, a projected volume, a CSI
-        # secrets-store volume, or an operator-managed volume are all equally
-        # valid. A Secret is shown here only because the document normally
-        # carries credentials and private trust material.
+        # the mounted path is acceptable: a ConfigMap, a Secret, a projected
+        # volume, a CSI volume, or an operator-managed volume are all equally
+        # valid. A ConfigMap is shown here because the document carries no
+        # secret.
         - name: configuration
-          secret:
-            secretName: REPLACE_WITH_CONFIGURATION_SECRET_NAME
+          configMap:
+            name: REPLACE_WITH_CONFIGURATION_CONFIGMAP_NAME
             # Readable by the container's group only. Written in decimal
             # because a leading-zero YAML integer is ambiguous: 288 is 0440.
             defaultMode: 288

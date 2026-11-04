@@ -2,10 +2,9 @@
 //! failures, and component-local failures.
 //!
 //! Loading is exercised through a path in a temporary directory and through
-//! [`decode`] directly. The environment-variable lookup is reached through
-//! [`configuration_path`], which never needs process-environment mutation to be
-//! meaningful because path resolution is separated from every loading and
-//! validation rule.
+//! [`decode`] directly. The environment is always injected: no test reads or
+//! mutates the real process environment. The baseline environment supplies the
+//! GLPI secrets, because secrets come only from the environment.
 
 use std::{
     io::Write,
@@ -20,15 +19,52 @@ use crate::runtime::{
     admission::{InboundAdmission, max_inbound_admission_limit},
     capacity::SemaphoreCapacity,
     configuration::{
-        CONFIGURATION_PATH_VARIABLE, ComponentOutcome, ExecutableConfiguration,
-        MAX_SYNCHRONIZATION_CAPACITY, configuration_path, decode, load,
+        ComponentOutcome, ExecutableConfiguration, MAX_SYNCHRONIZATION_CAPACITY,
+        configuration_path, decode as decode_with, load as load_with,
     },
+    environment::{CONFIGURATION_PATH_VARIABLE, Environment},
     failure::RuntimeFailure,
 };
 
+/// The GLPI secrets of the baseline environment.
+pub(super) const GLPI_SECRETS: [(&str, &str); 2] = [
+    ("PERMISSIONSYNC_GLPI__APP_TOKEN", "sentinel-app-token"),
+    ("PERMISSIONSYNC_GLPI__USER_TOKEN", "sentinel-user-token"),
+];
+
+/// The baseline environment: the GLPI secrets and nothing else.
+pub(super) fn baseline_environment() -> Environment {
+    GLPI_SECRETS.into_iter().collect()
+}
+
+/// The baseline environment with `extra` variables added or replaced.
+pub(super) fn environment_with(extra: &[(&str, &str)]) -> Environment {
+    let mut variables: std::collections::BTreeMap<&str, &str> = GLPI_SECRETS.into_iter().collect();
+    variables.extend(extra.iter().copied());
+    variables.into_iter().collect()
+}
+
+/// The baseline environment without the named variables.
+fn environment_without(names: &[&str]) -> Environment {
+    GLPI_SECRETS
+        .into_iter()
+        .filter(|(name, _)| !names.contains(name))
+        .collect()
+}
+
+/// Decodes `text` with the baseline environment.
+fn decode(text: &str) -> Result<ExecutableConfiguration, RuntimeFailure> {
+    decode_with(text, &baseline_environment())
+}
+
+/// Loads `path` with the baseline environment.
+fn load(path: &std::path::Path) -> Result<ExecutableConfiguration, RuntimeFailure> {
+    load_with(path, &baseline_environment())
+}
+
 /// A complete, valid document. Tests mutate it through textual substitution so
 /// each case differs in exactly one place.
-const VALID: &str = r#"
+pub(super) const VALID: &str = r#"
 # PermissionSync runtime configuration. Comments carry no semantics.
 listener:
   address: "0.0.0.0"
@@ -64,8 +100,6 @@ provider:
 
 glpi:
   endpoint: "https://glpi.example.test/apirest.php"
-  app_token: "sentinel-app-token"
-  user_token: "sentinel-user-token"
   operation_timeout_milliseconds: 5000
 
 targets:
@@ -108,7 +142,11 @@ fn valid() -> ExecutableConfiguration {
 /// formattable: [`ExecutableConfiguration`] owns credentials and trust
 /// material and deliberately has no `Debug`.
 fn global_failure(document: &str) -> RuntimeFailure {
-    match decode(document) {
+    global_failure_with(document, &baseline_environment())
+}
+
+pub(super) fn global_failure_with(document: &str, environment: &Environment) -> RuntimeFailure {
+    match decode_with(document, environment) {
         Ok(_) => panic!("the document was expected to abort startup"),
         Err(failure) => failure,
     }
@@ -187,7 +225,11 @@ fn an_absent_provider_section_leaves_the_provider_unavailable_without_failing_st
 
 #[test]
 fn an_absent_glpi_section_leaves_configured_glpi_routes_recognized_but_unavailable() {
-    let configuration = decode(&document_without("glpi")).expect("still valid");
+    let configuration = decode_with(
+        &document_without("glpi"),
+        &Environment::from_iter(std::iter::empty::<(&str, &str)>()),
+    )
+    .expect("still valid");
 
     assert_eq!(configuration.glpi_outcome, ComponentOutcome::Absent);
     let application = ComposedApplication::compose(configuration.runtime).expect("composes");
@@ -195,6 +237,16 @@ fn an_absent_glpi_section_leaves_configured_glpi_routes_recognized_but_unavailab
         application.resolve_target(&LogicalTarget::try_from("glpi".to_owned()).unwrap()),
         TargetAvailability::Unavailable
     ));
+}
+
+/// An environment value creates its missing section, exactly as a file that
+/// names only that key would. GLPI secrets without the rest of a GLPI section
+/// are therefore an invalid GLPI section, not an absent one.
+#[test]
+fn glpi_secrets_without_a_glpi_section_leave_glpi_invalid() {
+    let configuration = decode(&document_without("glpi")).expect("still valid");
+
+    assert_eq!(configuration.glpi_outcome, ComponentOutcome::Invalid);
 }
 
 #[test]
@@ -220,11 +272,15 @@ fn an_enabled_tracing_section_is_validated_and_accepted() {
         "observability:\n  log_level: info",
         "observability:\n  log_level: info\n  tracing:\n    enabled: true\n    \
          endpoint: \"https://otlp.example.test/v1/traces\"\n    \
-         export_timeout_milliseconds: 5000\n    headers:\n      \
-         authorization: \"ApiKey sentinel-exporter-credential\"",
+         export_timeout_milliseconds: 5000",
     );
+    let environment = environment_with(&[(
+        "PERMISSIONSYNC_OBSERVABILITY__TRACING__HEADERS__AUTHORIZATION",
+        "ApiKey sentinel-exporter-credential",
+    )]);
 
-    let configuration = decode(&document).expect("a valid enabled tracing section");
+    let configuration =
+        decode_with(&document, &environment).expect("a valid enabled tracing section");
     assert!(configuration.observability.tracing.is_some());
 }
 
@@ -435,14 +491,27 @@ fn a_non_utf8_document_is_a_global_failure() {
 fn the_configuration_path_comes_only_from_the_required_variable() {
     assert_eq!(CONFIGURATION_PATH_VARIABLE, "PERMISSIONSYNC_CONFIG_FILE");
 
-    match configuration_path() {
-        // The variable is not set in the test process, which is the normal
-        // case and must be a fixed global failure rather than a default path.
-        Err(failure) => assert_eq!(failure, RuntimeFailure::ConfigurationPathMissing),
-        // If an ambient value exists, it must at least be non-empty; path
-        // resolution never invents one.
-        Ok(path) => assert!(!path.is_empty()),
-    }
+    let unset = baseline_environment();
+    assert_eq!(
+        configuration_path(&unset).err(),
+        Some(RuntimeFailure::ConfigurationPathMissing),
+        "an unset variable is a fixed global failure rather than a default path"
+    );
+
+    let empty = environment_with(&[(CONFIGURATION_PATH_VARIABLE, "")]);
+    assert_eq!(
+        configuration_path(&empty).err(),
+        Some(RuntimeFailure::ConfigurationPathMissing)
+    );
+
+    let set = environment_with(&[(
+        CONFIGURATION_PATH_VARIABLE,
+        "/etc/permissionsync/permissionsync.yaml",
+    )]);
+    assert_eq!(
+        configuration_path(&set).ok(),
+        Some("/etc/permissionsync/permissionsync.yaml".into())
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -799,9 +868,6 @@ fn invalid_enabled_tracing_configuration_is_a_global_failure() {
         // Endpoint with userinfo.
         "    endpoint: \"https://user:secret@otlp.example.test/v1/traces\"\n    export_timeout_milliseconds: 5000"
             .to_owned(),
-        // Reserved protocol header.
-        "    endpoint: \"https://otlp.example.test/v1/traces\"\n    export_timeout_milliseconds: 5000\n    headers:\n      content-type: \"application/json\""
-            .to_owned(),
         // Unknown tracing field.
         "    endpoint: \"https://otlp.example.test/v1/traces\"\n    export_timeout_milliseconds: 5000\n    insecure: true"
             .to_owned(),
@@ -809,6 +875,21 @@ fn invalid_enabled_tracing_configuration_is_a_global_failure() {
         assert_eq!(global_failure(&enabled(&extra)), RuntimeFailure::InvalidObservability, "invalid enabled tracing configuration must abort startup: {extra}"
         );
     }
+
+    // A reserved protocol header, supplied the only way a header can be.
+    let reserved = environment_with(&[(
+        "PERMISSIONSYNC_OBSERVABILITY__TRACING__HEADERS__CONTENT_TYPE",
+        "application/json",
+    )]);
+    assert_eq!(
+        global_failure_with(
+            &enabled(
+                "    endpoint: \"https://otlp.example.test/v1/traces\"\n    export_timeout_milliseconds: 5000"
+            ),
+            &reserved
+        ),
+        RuntimeFailure::InvalidObservability
+    );
 }
 
 #[test]
@@ -929,22 +1010,29 @@ fn a_provider_timeout_above_the_overall_deadline_leaves_the_provider_unavailable
 
 #[test]
 fn a_malformed_glpi_section_leaves_glpi_routes_recognized_but_unavailable() {
-    for glpi in [
+    const BASELINE: &str = "glpi:\n  endpoint: \"https://glpi.example.test/apirest.php\"\n  operation_timeout_milliseconds: 5000";
+    for (glpi, environment) in [
         // Unknown field inside the component section.
-        "glpi:\n  endpoint: \"https://glpi.example.test/apirest.php\"\n  app_token: \"sentinel-app-token\"\n  user_token: \"sentinel-user-token\"\n  operation_timeout_milliseconds: 5000\n  verify_tls: false",
+        (
+            "glpi:\n  endpoint: \"https://glpi.example.test/apirest.php\"\n  operation_timeout_milliseconds: 5000\n  verify_tls: false",
+            baseline_environment(),
+        ),
         // Missing required credential.
-        "glpi:\n  endpoint: \"https://glpi.example.test/apirest.php\"\n  user_token: \"sentinel-user-token\"\n  operation_timeout_milliseconds: 5000",
+        (
+            BASELINE,
+            environment_without(&["PERMISSIONSYNC_GLPI__APP_TOKEN"]),
+        ),
         // Incoherent authentication source: both fields are required together.
-        "glpi:\n  endpoint: \"https://glpi.example.test/apirest.php\"\n  app_token: \"sentinel-app-token\"\n  user_token: \"sentinel-user-token\"\n  operation_timeout_milliseconds: 5000\n  authentication_source:\n    authtype: 3",
+        (
+            "glpi:\n  endpoint: \"https://glpi.example.test/apirest.php\"\n  operation_timeout_milliseconds: 5000\n  authentication_source:\n    authtype: 3",
+            baseline_environment(),
+        ),
         // Wrong shape entirely.
-        "glpi: []",
+        ("glpi: []", baseline_environment()),
     ] {
-        let document = replaced(
-            "glpi:\n  endpoint: \"https://glpi.example.test/apirest.php\"\n  app_token: \"sentinel-app-token\"\n  user_token: \"sentinel-user-token\"\n  operation_timeout_milliseconds: 5000",
-            glpi,
-        );
-        let configuration =
-            decode(&document).expect("a malformed GLPI section must not abort startup");
+        let document = replaced(BASELINE, glpi);
+        let configuration = decode_with(&document, &environment)
+            .expect("a malformed GLPI section must not abort startup");
 
         assert_eq!(configuration.glpi_outcome, ComponentOutcome::Invalid);
         let application = ComposedApplication::compose(configuration.runtime).expect("composes");
@@ -957,22 +1045,29 @@ fn a_malformed_glpi_section_leaves_glpi_routes_recognized_but_unavailable() {
 
 #[test]
 fn invalid_glpi_values_leave_glpi_routes_recognized_but_unavailable() {
-    for (from, to) in [
+    let endpoint = "  endpoint: \"https://glpi.example.test/apirest.php\"";
+    for (document, environment) in [
         (
-            "  endpoint: \"https://glpi.example.test/apirest.php\"",
-            "  endpoint: \"http://glpi.example.test/apirest.php\"",
+            replaced(
+                endpoint,
+                "  endpoint: \"http://glpi.example.test/apirest.php\"",
+            ),
+            baseline_environment(),
         ),
         (
-            "  endpoint: \"https://glpi.example.test/apirest.php\"",
-            "  endpoint: \"https://glpi.example.test/api\"",
+            replaced(endpoint, "  endpoint: \"https://glpi.example.test/api\""),
+            baseline_environment(),
         ),
-        ("  app_token: \"sentinel-app-token\"", "  app_token: \"\""),
         (
-            "  user_token: \"sentinel-user-token\"",
-            "  user_token: \"\"",
+            VALID.to_owned(),
+            environment_with(&[("PERMISSIONSYNC_GLPI__APP_TOKEN", "")]),
+        ),
+        (
+            VALID.to_owned(),
+            environment_with(&[("PERMISSIONSYNC_GLPI__USER_TOKEN", "")]),
         ),
     ] {
-        let configuration = decode(&replaced(from, to)).expect("must not abort startup");
+        let configuration = decode_with(&document, &environment).expect("must not abort startup");
         let application = ComposedApplication::compose(configuration.runtime).expect("composes");
 
         assert!(
@@ -980,7 +1075,7 @@ fn invalid_glpi_values_leave_glpi_routes_recognized_but_unavailable() {
                 application.resolve_target(&LogicalTarget::try_from("glpi".to_owned()).unwrap()),
                 TargetAvailability::Unavailable
             ),
-            "{to} must leave GLPI routes unavailable"
+            "an invalid GLPI value must leave GLPI routes unavailable"
         );
     }
 }
@@ -988,8 +1083,8 @@ fn invalid_glpi_values_leave_glpi_routes_recognized_but_unavailable() {
 #[test]
 fn a_glpi_timeout_above_the_overall_deadline_leaves_glpi_unavailable() {
     let configuration = decode(&replaced(
-        "  app_token: \"sentinel-app-token\"\n  user_token: \"sentinel-user-token\"\n  operation_timeout_milliseconds: 5000",
-        "  app_token: \"sentinel-app-token\"\n  user_token: \"sentinel-user-token\"\n  operation_timeout_milliseconds: 10001",
+        "  endpoint: \"https://glpi.example.test/apirest.php\"\n  operation_timeout_milliseconds: 5000",
+        "  endpoint: \"https://glpi.example.test/apirest.php\"\n  operation_timeout_milliseconds: 10001",
     ))
     .expect("must not abort startup");
 

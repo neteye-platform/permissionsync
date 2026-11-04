@@ -62,4 +62,6 @@ PermissionSync uses these statuses:
     Target Configuration and Composition Root (Accepted)
 11. [0011](0011-executable-runtime-configuration-and-operational-lifecycle.md)
     Executable Runtime, Configuration Delivery, and Operational Lifecycle
-    (Accepted)
+    (Accepted; environment overrides and secret delivery replaced by 0012)
+12. [0012](0012-environment-overrides-and-environment-only-secrets.md)
+    Environment Overrides and Environment-Only Secrets (Accepted)

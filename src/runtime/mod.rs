@@ -13,6 +13,7 @@
 pub(crate) mod admission;
 pub(crate) mod capacity;
 pub(crate) mod configuration;
+pub(crate) mod environment;
 pub(crate) mod failure;
 pub(crate) mod lifecycle;
 pub(crate) mod observability;
@@ -49,8 +50,10 @@ use crate::runtime::{
     admission::InboundAdmission,
     capacity::SemaphoreCapacity,
     configuration::{ComponentOutcome, ExecutableConfiguration},
+    environment::{Environment, UnknownVariableReport, unknown_variables},
     failure::RuntimeFailure,
     lifecycle::{Lifecycle, RequestCancellation},
+    observability::LogLevel,
     transport::{RefusingService, RuntimeState, record_component_availability, router},
 };
 
@@ -100,8 +103,9 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Runs the executable runtime to completion.
 ///
-/// Startup order follows ADR 0011: resolve and read the single configuration
-/// file, validate global and static values, construct the authenticator,
+/// Startup order follows ADR 0011 and ADR 0012: capture the environment once,
+/// resolve and read the single configuration file, merge the environment
+/// overrides, validate global and static values, construct the authenticator,
 /// project semantic configuration and compose, construct admission and
 /// capacity, initialize required observability, wire orchestration and inbound
 /// handling, build the transport, bind the listener, begin serving, and only
@@ -111,18 +115,27 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// exists, so a global defect aborts before any listener, task, or telemetry
 /// channel is created.
 pub(crate) fn run() -> Result<(), RuntimeFailure> {
-    let path = configuration::configuration_path()?;
-    let configuration = configuration::load(Path::new(&path))?;
+    let environment = Environment::from_process();
+    // The unknown names come from the environment alone. If startup stops
+    // before logging is set up, dropping the report writes them to standard
+    // error, before `main` writes the fatal category.
+    let unknown = UnknownVariableReport::to_standard_error(unknown_variables(&environment));
+    let path = configuration::configuration_path(&environment)?;
+    let configuration = configuration::load(Path::new(&path), &environment)?;
+    drop(environment);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|_| RuntimeFailure::RuntimeUnavailable)?;
 
-    runtime.block_on(serve_configured(configuration))
+    runtime.block_on(serve_configured(configuration, unknown))
 }
 
-async fn serve_configured(configuration: ExecutableConfiguration) -> Result<(), RuntimeFailure> {
+async fn serve_configured(
+    configuration: ExecutableConfiguration,
+    unknown: UnknownVariableReport<std::io::Stderr>,
+) -> Result<(), RuntimeFailure> {
     let ExecutableConfiguration {
         listener: listen_address,
         overall_request_deadline,
@@ -160,6 +173,10 @@ async fn serve_configured(configuration: ExecutableConfiguration) -> Result<(), 
         SemaphoreCapacity::new(synchronization_capacity).ok_or(RuntimeFailure::InvalidRequest)?;
 
     let observability = observability::initialize(&observability_configuration)?;
+    // Configuration is loaded before logging exists, so the warnings wait
+    // until here instead of being lost. The `error` level filters warnings,
+    // so the report then also writes the names to standard error.
+    unknown.log(observability_configuration.log_level != LogLevel::Error);
     report_component_availability(&application, provider_outcome, glpi_outcome, &glpi_routes);
 
     let lifecycle = Arc::new(Lifecycle::new());

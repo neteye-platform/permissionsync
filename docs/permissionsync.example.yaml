@@ -1,16 +1,22 @@
 # Example PermissionSync runtime configuration.
 #
 # This file contains placeholders only. Replace every REPLACE_WITH_* value and
-# every example host before use, and keep the real file outside the image with
-# permissions appropriate for the credentials and private trust material it
-# carries.
+# every example host before use, and keep the real file outside the image.
 #
 # The executable loads exactly one UTF-8 YAML document, whose path comes only
-# from the PERMISSIONSYNC_CONFIG_FILE environment variable. There are no layered
-# files, no command-line overrides, no per-value environment overrides, no
-# environment substitution inside this document, no include or merge mechanism,
-# and no runtime reload. Comments like these carry no semantics and are not
-# retained.
+# from the PERMISSIONSYNC_CONFIG_FILE environment variable. This document is the
+# base. One PERMISSIONSYNC_* environment variable can replace exactly one scalar
+# value of it; lists stay in this document only. See
+# docs/environment-variables.md for every variable name, type, and default.
+# There are no layered files, no command-line overrides, no environment
+# substitution inside this document, no include or merge mechanism, and no
+# runtime reload. Comments like these carry no semantics and are not retained.
+#
+# Secrets come only from the environment. This document has no secret field,
+# and a secret field in it stops startup. The secrets are the GLPI tokens
+# (PERMISSIONSYNC_GLPI__APP_TOKEN and PERMISSIONSYNC_GLPI__USER_TOKEN) and the
+# OTLP exporter headers
+# (PERMISSIONSYNC_OBSERVABILITY__TRACING__HEADERS__<NAME>).
 #
 # Every duration is an integer number of whole milliseconds and is spelled with
 # a _milliseconds field suffix. There is no second duration syntax.
@@ -106,10 +112,13 @@ observability:
   #   # mandatory, there is no plaintext fallback, and no redirect is followed.
   #   endpoint: "https://otlp.example.test/v1/traces"
   #   export_timeout_milliseconds: 5000
-  #   # Optional static exporter credentials. They are sent only to the
-  #   # endpoint origin above and never appear in logs, metrics, or errors.
-  #   headers:
-  #     authorization: "REPLACE_WITH_OTLP_EXPORTER_CREDENTIAL"
+  #   # Optional static exporter headers, such as credentials, come only from
+  #   # the environment: PERMISSIONSYNC_OBSERVABILITY__TRACING__HEADERS__<NAME>
+  #   # supplies one header, and <NAME> in lowercase with "_" replaced by "-"
+  #   # is the header name. For example,
+  #   # PERMISSIONSYNC_OBSERVABILITY__TRACING__HEADERS__AUTHORIZATION supplies
+  #   # the authorization header. They are sent only to the endpoint origin
+  #   # above and never appear in logs, metrics, or errors.
   #   # additional_trust_anchors_pem:
   #   #   - |
   #   #     -----BEGIN CERTIFICATE-----
@@ -137,8 +146,9 @@ provider:
 # recognized but unavailable, and unrelated routes keep working.
 glpi:
   endpoint: "https://glpi.example.test/apirest.php"
-  app_token: "REPLACE_WITH_GLPI_APP_TOKEN"
-  user_token: "REPLACE_WITH_GLPI_SERVICE_ACCOUNT_USER_TOKEN"
+  # The GLPI API client token and the service account user token come only
+  # from the environment: PERMISSIONSYNC_GLPI__APP_TOKEN and
+  # PERMISSIONSYNC_GLPI__USER_TOKEN.
   # Must be positive and no greater than
   # request.overall_deadline_milliseconds.
   operation_timeout_milliseconds: 5000

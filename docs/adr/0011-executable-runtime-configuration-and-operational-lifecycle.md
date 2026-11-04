@@ -23,6 +23,13 @@ contracts.
 
 ### Configuration delivery
 
+> [ADR-0012](0012-environment-overrides-and-environment-only-secrets.md)
+> replaces two statements of this section: that there are no environment-value
+> overrides, and that secrets are supplied through the file. It also replaces
+> the environment part of the first rejected alternative below, and the part of
+> the first Consequences paragraph that says the single file is the one delivery
+> model and keeps secrets. The rest of this record stays in force.
+
 The executable loads exactly one UTF-8 YAML configuration document. Its path is
 supplied by the required `PERMISSIONSYNC_CONFIG_FILE` environment variable.
 There are no layered file, environment-value, command-line, or remote
