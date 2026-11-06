@@ -1,6 +1,6 @@
 services:
   db:
-    image: mariadb:13.0.2@sha256:0e4bb0f339feba125d1154fbacd36c16ec8518f52e44e1f82ecec7d6771caf39
+    image: mariadb:13.0.2@sha256:f4054da26e3a9dd6c8b5cc97363e544408b15c0fb369d7359c25dc04826eb6e1
     environment:
       MARIADB_ROOT_PASSWORD: ${GLPI_TEST_DB_ROOT_PASSWORD:?db root password required}
       MARIADB_DATABASE: glpi
@@ -15,7 +15,7 @@ services:
       - /var/lib/mysql
 
   glpi:
-    image: glpi/glpi:11.0.11@sha256:f5c5de01a5d24f966d7a4b2bce0c15fa151949a476ca5e31b303f4a2a344ea81
+    image: glpi/glpi:11.0.11@sha256:5faf2b2621ea4d54f51fceda5d454f280e70024f78b553ef8ffee246533a6ad1
     depends_on:
       db:
         condition: service_healthy
