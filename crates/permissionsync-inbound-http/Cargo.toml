@@ -8,9 +8,9 @@ repository.workspace = true
 version.workspace = true
 
 [dependencies]
-permissionsync-auth = { path = "../permissionsync-auth", version = "=0.1.0" }
-permissionsync-core = { path = "../permissionsync-core", version = "=0.1.0" }
-permissionsync-orchestration = { path = "../permissionsync-orchestration", version = "=0.1.0" }
+permissionsync-auth = { path = "../permissionsync-auth", version = "=0.2.0" }
+permissionsync-core = { path = "../permissionsync-core", version = "=0.2.0" }
+permissionsync-orchestration = { path = "../permissionsync-orchestration", version = "=0.2.0" }
 serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
 
@@ -18,7 +18,7 @@ serde_json = { version = "=1.0.154", default-features = false, features = ["std"
 josekit = { version = "=0.10.3", default-features = false }
 native-tls = { version = "=0.2.18", default-features = false }
 openssl = { version = "=0.10.82", default-features = false }
-permissionsync-routing = { path = "../permissionsync-routing", version = "=0.1.0" }
+permissionsync-routing = { path = "../permissionsync-routing", version = "=0.2.0" }
 tokio = { version = "=1.54.1", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-native-tls = { version = "=0.3.1", default-features = false }
 
