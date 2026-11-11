@@ -12,12 +12,15 @@ multiple-versions = "deny"
 wildcards = "deny"
 skip = [
   { crate = "core-foundation@0.9.4", reason = "transitive only: system-configuration 0.7.0 (via hickory-resolver) still requires 0.9 while native-tls 0.2.18 (via security-framework 3.7.0) requires 0.10; remove once system-configuration adopts core-foundation 0.10" },
-  { crate = "getrandom@0.3.4", reason = "transitive only: rand 0.9.5 (via metrics-util 0.20.4 and opentelemetry_sdk 0.33.0) still requires getrandom 0.3 while rand 0.10.3 (via hickory-net) and tempfile 3.27.0 use getrandom 0.4; remove once those crates adopt rand 0.10" },
+  { crate = "getrandom@0.3.4", reason = "transitive only: rand_core 0.9.5 (via rand 0.9.5, metrics-util 0.20.4, and opentelemetry_sdk 0.33.1) still requires getrandom 0.3 while rand 0.10.3 (via hickory-net), tempfile 3.27.0, and uuid 1.29.2 use getrandom 0.4; remove once those crates adopt rand 0.10" },
   { crate = "hashbrown@0.16.1", reason = "transitive only: metrics-util 0.20.4 (via metrics-exporter-prometheus 0.18.3) still requires hashbrown 0.16 while indexmap 2.14.2 uses hashbrown 0.17; remove once metrics-util adopts hashbrown 0.17" },
   { crate = "r-efi@5.3.0", reason = "transitive only: getrandom 0.3.4 still requires r-efi 5 while getrandom 0.4.3 uses r-efi 6; remove together with the getrandom 0.3 skip above" },
-  { crate = "rand@0.9.5", reason = "transitive only: metrics-util 0.20.4 (via metrics-exporter-prometheus 0.18.3) and opentelemetry_sdk 0.33.0 still require rand 0.9 while hickory-net 0.26.3 uses rand 0.10; remove once both adopt rand 0.10" },
+  { crate = "rand@0.9.5", reason = "transitive only: metrics-util 0.20.4 (via metrics-exporter-prometheus 0.18.3) and opentelemetry_sdk 0.33.1 still require rand 0.9 while hickory-net 0.26.3 uses rand 0.10; remove once both adopt rand 0.10" },
   { crate = "rand_core@0.9.5", reason = "transitive only: rand 0.9.5 requires rand_core 0.9 while rand 0.10.3 uses rand_core 0.10; remove together with the rand 0.9 skip above" },
-  { crate = "syn@2.0.119", reason = "transitive only: openssl-macros, jni-macros, and jni-sys-macros still require syn 2 while async-trait, displaydoc, futures-macro, and serde_derive use syn 3; remove once those proc-macro crates adopt syn 3" },
+  { crate = "syn@2.0.119", reason = "transitive only: openssl-macros, jni-macros, jni-sys-macros, prost-derive, zerocopy-derive, windows-implement, and windows-interface still require syn 2 while async-trait, displaydoc, futures-macro, serde_derive, and other proc-macro crates use syn 3; remove once those proc-macro crates adopt syn 3" },
+  { crate = "windows-link@0.2.1", reason = "transitive only: windows-sys 0.61.2, windows-registry 0.6.1 (via ipconfig 0.3.4 and hickory-resolver), and other Windows-target crates still require windows-link 0.2 while generator 0.8.12 (via loom, left-right, evmap, and metrics-exporter-prometheus 0.18.3) uses windows-core 0.100 with windows-link 0.100; remove once windows-sys and windows-registry adopt windows-link 0.100" },
+  { crate = "windows-result@0.4.1", reason = "transitive only: ipconfig 0.3.4 (via hickory-resolver) and windows-registry 0.6.1 still require windows-result 0.4 while generator 0.8.12 (via windows-core 0.100) uses windows-result 0.100; remove once ipconfig adopts windows-registry 0.100" },
+  { crate = "windows-strings@0.5.1", reason = "transitive only: windows-registry 0.6.1 (via ipconfig 0.3.4 and hickory-resolver) still requires windows-strings 0.5 while generator 0.8.12 (via windows-core 0.100) uses windows-strings 0.100; remove together with the windows-result 0.4 skip above" },
 ]
 
 [licenses]
