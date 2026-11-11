@@ -15,7 +15,7 @@ services:
       - /var/lib/mysql
 
   glpi:
-    image: glpi/glpi:11.0.11@sha256:5faf2b2621ea4d54f51fceda5d454f280e70024f78b553ef8ffee246533a6ad1
+    image: glpi/glpi:11.0.12@sha256:29525a4c236fc429ad10ffc423aa7be11514a47cafa98110f0d0afb4fe10cc69
     depends_on:
       db:
         condition: service_healthy
@@ -43,7 +43,7 @@ services:
       - "127.0.0.1::80"
 
   tls-proxy:
-    image: nginx:1.31.7@sha256:8632b3314d74c61f0e27f59055bab13f7793b988c94c090154d867bc29e0f39b
+    image: nginx:1.31.8@sha256:165ddde8751e75a1c907d24ef10d9f6deb08b57e0fe56caf67512486aff76d82
     depends_on:
       glpi:
         condition: service_healthy
@@ -55,7 +55,7 @@ services:
       - "127.0.0.1::8443"
 
   cleanup-proxy:
-    image: nginx:1.31.7@sha256:8632b3314d74c61f0e27f59055bab13f7793b988c94c090154d867bc29e0f39b
+    image: nginx:1.31.8@sha256:165ddde8751e75a1c907d24ef10d9f6deb08b57e0fe56caf67512486aff76d82
     depends_on:
       glpi:
         condition: service_healthy
