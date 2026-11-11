@@ -8,6 +8,7 @@
 
 mod admission;
 mod configuration;
+mod environment;
 mod http;
 mod lifecycle;
 mod observability;

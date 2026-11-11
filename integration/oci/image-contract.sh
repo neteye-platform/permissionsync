@@ -67,11 +67,13 @@ case "$command_value" in
 esac
 
 # The configuration contract is exactly one external file whose path comes only
-# from the environment. Baking the variable, or any configuration document,
-# into the image would make the artifact deployment-specific.
+# from the environment, plus environment overrides and secrets (ADR-0011).
+# Baking the path variable, any override or secret variable, or any
+# configuration document into the image would make the artifact
+# deployment-specific.
 if docker image inspect "$image" --format '{{range .Config.Env}}{{println .}}{{end}}' |
-    grep -q '^PERMISSIONSYNC_CONFIG_FILE='; then
-    fail 'the image presets PERMISSIONSYNC_CONFIG_FILE; configuration must be supplied externally'
+    grep -q '^PERMISSIONSYNC_'; then
+    fail 'the image presets a PERMISSIONSYNC_* variable; configuration must be supplied externally'
 fi
 
 printf '=== OCI labels ===\n'

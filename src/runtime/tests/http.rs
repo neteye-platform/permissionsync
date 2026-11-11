@@ -14,13 +14,18 @@ use axum::{
 use permissionsync_inbound_http::HttpOutcome;
 
 use crate::runtime::{
+    configuration::decode,
+    tests::configuration::{VALID, baseline_environment},
     tests::support::{
         GLPI, HttpsFixture, RefusingEndpoint, RuntimeFixture, RuntimeFixtureOptions,
         ScriptedResponse, SigningMaterial, authenticator, body_bytes, body_of_length,
         glpi_configuration, jwks_fixture, provider_configuration, target, unavailable_jwks_fixture,
         valid_body,
     },
-    transport::{HEALTH_ROUTE, INBOUND_BODY_LIMIT_BYTES, METRICS_ROUTE, SYNCHRONIZATION_ROUTE},
+    transport::{
+        HEALTH_ROUTE, INBOUND_BODY_LIMIT_BYTES, METRICS_ROUTE, READINESS_ROUTE,
+        SYNCHRONIZATION_ROUTE,
+    },
 };
 
 /// A GLPI endpoint that is configured and locally valid, which is all that is
@@ -199,6 +204,49 @@ async fn an_unknown_logical_target_is_a_bad_request() {
         scenario
             .fixture
             .synchronize(Some(&token), Body::from(valid_body()))
+            .await,
+        StatusCode::BAD_REQUEST
+    );
+
+    scenario.finish().await;
+}
+
+/// An empty `targets` list is a valid configuration: the service starts and is
+/// ready, targetless requests succeed, and every selected target is unknown.
+#[tokio::test]
+async fn zero_configured_targets_is_ready_and_every_selected_target_is_a_bad_request() {
+    let document = VALID.replace(
+        "targets:\n  - logical_target: \"glpi\"\n    adapter: \"glpi\"",
+        "targets: []",
+    );
+    let Ok(configuration) = decode(&document, &baseline_environment()) else {
+        panic!("an empty target list is a valid configuration");
+    };
+    assert!(configuration.runtime.targets.is_empty());
+
+    let scenario = Scenario::build(|options| {
+        options.glpi = configuration.runtime.glpi;
+        options.targets = configuration.runtime.targets;
+    })
+    .await;
+
+    assert_eq!(
+        scenario.fixture.get(READINESS_ROUTE).await.status(),
+        StatusCode::OK
+    );
+    let targetless = scenario.token(Some("service_account"));
+    assert_eq!(
+        scenario
+            .fixture
+            .synchronize(Some(&targetless), Body::from(valid_body()))
+            .await,
+        StatusCode::NO_CONTENT
+    );
+    let selected = scenario.token(Some("permissionsync:glpi"));
+    assert_eq!(
+        scenario
+            .fixture
+            .synchronize(Some(&selected), Body::from(valid_body()))
             .await,
         StatusCode::BAD_REQUEST
     );

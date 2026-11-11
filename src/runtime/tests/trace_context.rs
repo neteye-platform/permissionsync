@@ -687,10 +687,10 @@ async fn the_trace_configuration_is_exactly_pinned() {
 
 /// Ambient OpenTelemetry environment variables cannot change any of it.
 ///
-/// ADR 0011 defines one configuration source and rejects environment-value
-/// overrides, but the SDK's own defaults read `OTEL_SERVICE_NAME`,
-/// `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG`,
-/// and the `OTEL_SPAN_*_COUNT_LIMIT` variables.
+/// ADR 0011 defines the only configuration sources, the YAML document and the
+/// `PERMISSIONSYNC_*` variables, but the SDK's own defaults read
+/// `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_TRACES_SAMPLER`,
+/// `OTEL_TRACES_SAMPLER_ARG`, and the `OTEL_SPAN_*_COUNT_LIMIT` variables.
 ///
 /// The hostile environment is applied to a re-executed child process rather than
 /// to this one. Setting variables on a child requires no `unsafe`, which this

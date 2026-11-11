@@ -5,12 +5,13 @@ use std::{error::Error, fmt};
 /// A fatal runtime defect: a global startup defect, or a serving failure that
 /// terminates the process.
 ///
-/// Every variant is a fixed category with no payload. Configuration inputs can
-/// contain issuer and endpoint URIs, GLPI credentials, OTLP exporter
-/// authentication headers, and private trust material, and a serving failure can
-/// carry an operating-system error, so this type deliberately retains neither
-/// the offending value, its position in the document, nor an error source. It
-/// names only which part of the runtime refused to continue.
+/// Every variant is a fixed category with no payload. Configuration inputs,
+/// from the file or from the environment, can contain issuer and endpoint URIs,
+/// GLPI credentials, OTLP exporter authentication headers, and private trust
+/// material, and a serving failure can carry an operating-system error, so this
+/// type deliberately retains neither the offending value, its position in the
+/// document, nor an error source. It names only which part of the runtime
+/// refused to continue.
 ///
 /// Component-local Provider and GLPI defects are deliberately absent: they
 /// never abort startup and instead leave that component unavailable.
@@ -27,6 +28,9 @@ pub(crate) enum RuntimeFailure {
     ConfigurationEmpty,
     /// The configuration file contained more than one YAML document.
     ConfigurationMultipleDocuments,
+    /// The configuration file set a secret key. Secrets come only from the
+    /// environment.
+    SecretInConfigurationFile,
     /// The document was not one YAML mapping with exactly the required
     /// top-level runtime sections, or it carried an unknown top-level field.
     InvalidDocumentStructure,
@@ -72,6 +76,9 @@ impl fmt::Display for RuntimeFailure {
             Self::ConfigurationEmpty => "the configuration file contains no YAML document",
             Self::ConfigurationMultipleDocuments => {
                 "the configuration file contains more than one YAML document"
+            }
+            Self::SecretInConfigurationFile => {
+                "the configuration file contains a secret key; secrets come only from the environment"
             }
             Self::InvalidDocumentStructure => {
                 "the configuration document is not one mapping with exactly the required sections"
@@ -129,6 +136,7 @@ mod tests {
             RuntimeFailure::ConfigurationNotUtf8,
             RuntimeFailure::ConfigurationEmpty,
             RuntimeFailure::ConfigurationMultipleDocuments,
+            RuntimeFailure::SecretInConfigurationFile,
             RuntimeFailure::InvalidDocumentStructure,
             RuntimeFailure::InvalidListener,
             RuntimeFailure::InvalidRequest,

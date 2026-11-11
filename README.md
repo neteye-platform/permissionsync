@@ -23,21 +23,36 @@ both described below.
 ## Running the service
 
 The executable loads exactly one UTF-8 YAML configuration document. Its path
-comes only from the required `PERMISSIONSYNC_CONFIG_FILE` environment variable:
+comes only from the required `PERMISSIONSYNC_CONFIG_FILE` environment variable.
+The document is the base. One `PERMISSIONSYNC_*` environment variable can
+replace exactly one scalar value of it, and secrets come only from the
+environment:
 
 ```sh
-PERMISSIONSYNC_CONFIG_FILE=/etc/permissionsync/permissionsync.yaml permissionsync
+PERMISSIONSYNC_CONFIG_FILE=/etc/permissionsync/permissionsync.yaml \
+PERMISSIONSYNC_GLPI__APP_TOKEN="$(cat /run/secrets/glpi-app-token)" \
+PERMISSIONSYNC_GLPI__USER_TOKEN="$(cat /run/secrets/glpi-user-token)" \
+  permissionsync
 ```
 
-There are no layered configuration files, command-line overrides, per-value
-environment overrides, environment substitution inside the document, include or
-merge mechanisms, or runtime reload. Comments are allowed and carry no
-semantics. Unknown or misspelled fields are rejected rather than ignored.
+A variable name is `PERMISSIONSYNC_` followed by the path of the key in the
+file, in uppercase, with `__` between two levels: for example
+`PERMISSIONSYNC_REQUEST__OVERALL_DEADLINE_MILLISECONDS`. Lists stay in the file
+only. The secrets are the GLPI tokens and the OTLP exporter headers. A secret
+key in the file stops startup, and an unknown `PERMISSIONSYNC_*` variable gives
+a warning with its name only. The complete rules and the generated table of
+every variable, with its type, default, and secret flag, are in
+[docs/environment-variables.md](docs/environment-variables.md).
+
+There are no layered configuration files, command-line overrides, environment
+substitution inside the document, include or merge mechanisms, or runtime
+reload. Comments are allowed and carry no semantics. Unknown or misspelled
+fields are rejected rather than ignored.
 
 A documented example with placeholder values only is in
-[docs/permissionsync.example.yaml](docs/permissionsync.example.yaml). Secrets
-and private trust material are supplied inline through that external file and
-are never built into the binary or image.
+[docs/permissionsync.example.yaml](docs/permissionsync.example.yaml). Private
+trust material is supplied inline through that external file, secrets through
+the environment, and neither is ever built into the binary or image.
 
 ### Configuration outline
 
@@ -58,7 +73,8 @@ supported implementation (`generic_rest`), and `glpi` configures the one
 process-wide GLPI backend.
 
 Startup aborts for a global defect: an unreadable, non-UTF-8, empty,
-multi-document, or malformed file; an unknown top-level field; an invalid
+multi-document, or malformed file; a YAML tag or a secret key in the file; an
+unknown top-level field; an invalid
 listener, deadline, admission limit, or capacity; an admission limit or
 synchronization capacity whose bounded-concurrency primitives could not be
 constructed; a synchronization capacity above the product ceiling of 1024; a
@@ -180,15 +196,21 @@ docker run --rm \
   --read-only --cap-drop=ALL --security-opt=no-new-privileges \
   --publish 127.0.0.1:8443:8443 \
   --env PERMISSIONSYNC_CONFIG_FILE=/etc/permissionsync/permissionsync.yaml \
+  --env PERMISSIONSYNC_GLPI__APP_TOKEN \
+  --env PERMISSIONSYNC_GLPI__USER_TOKEN \
   --volume /etc/permissionsync/permissionsync.yaml:/etc/permissionsync/permissionsync.yaml:ro \
   permissionsync:local
 ```
+
+Each `--env NAME` without a value passes that variable from the calling shell,
+so the secret does not appear on the command line.
 
 | Property      | Behaviour                                                                                            |
 | ------------- | ---------------------------------------------------------------------------------------------------- |
 | Entrypoint    | `/usr/local/bin/permissionsync`, exec form, so it is PID 1 and receives `SIGTERM`/`SIGINT` directly  |
 | User          | `65532:65532`, a dedicated unprivileged account declared numerically                                 |
 | Configuration | Required externally through `PERMISSIONSYNC_CONFIG_FILE`; the image sets no environment value at all |
+| Secrets       | Only from `PERMISSIONSYNC_*` environment variables supplied at run time, never from the file         |
 | Listener      | Whatever `listener.address` and `listener.port` select; no port is baked in, so there is no `EXPOSE` |
 | Filesystem    | Nothing is written, so a read-only root filesystem needs no writable path, not even `/tmp`           |
 | Private CA    | Only through `additional_trust_anchors_pem` in the mounted configuration                             |
@@ -239,7 +261,8 @@ The supported deployment contract is:
 | Contract           | Requirement                                                                                 |
 | ------------------ | ------------------------------------------------------------------------------------------- |
 | Configuration      | Exactly one external YAML document, mounted read-only                                       |
-| Configuration path | `PERMISSIONSYNC_CONFIG_FILE` pointing at that mounted file, and no other environment value  |
+| Configuration path | `PERMISSIONSYNC_CONFIG_FILE` pointing at that mounted file                                  |
+| Secrets            | `PERMISSIONSYNC_*` environment variables, for example from a Secret through `secretKeyRef`  |
 | Liveness           | `GET /healthz` on the configured listener port                                              |
 | Readiness          | `GET /readyz` on the same port                                                              |
 | Seccomp            | `seccompProfile.type: RuntimeDefault`                                                       |
@@ -250,12 +273,13 @@ The supported deployment contract is:
 | Termination        | `SIGTERM`, with `terminationGracePeriodSeconds` covering the whole bounded shutdown horizon |
 | Image              | The published image pinned by immutable digest, kept available locally for restart          |
 
-Any volume source that presents the single document at the mounted path works.
-Kubernetes Secrets are **not** required, and PermissionSync neither requires nor
-understands a secret backend: a Secret, a ConfigMap, a projected volume, a CSI
-secrets-store volume, or an operator-managed volume are all equally valid. The
-example shows a Secret only because that document normally carries credentials
-and private trust material.
+Any volume source that presents the single document at the mounted path works:
+a ConfigMap, a Secret, a projected volume, a CSI volume, or an operator-managed
+volume are all equally valid. The example shows a ConfigMap because the
+document carries no secret. Secrets come only from the environment. Kubernetes
+Secrets are **not** required, and PermissionSync neither requires nor
+understands a secret backend: the example sets the GLPI token variables from a
+Secret through `secretKeyRef`, but anything that sets the variables works.
 
 `terminationGracePeriodSeconds` has to cover PermissionSync's whole bounded
 shutdown horizon, which is wider than the configured request grace. Once
