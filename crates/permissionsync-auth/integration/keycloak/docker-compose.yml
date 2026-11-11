@@ -6,7 +6,7 @@ services:
     # The one supported Keycloak release this repository exercises, pinned by
     # exact release tag and immutable digest. Renovate proposes both together;
     # an upgrade PR must run this contract suite before merge.
-    image: quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332
+    image: quay.io/keycloak/keycloak:26.8.2@sha256:723b1d6e254c0fc96d5cffec860c7e0744d6a3277822b865bb538cf891575e41
     command: ["start-dev"]
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_TEST_ADMIN_USERNAME:?admin username required}
@@ -41,7 +41,7 @@ services:
   # certificate and hostname verification stay exactly as they are on the
   # direct port.
   outage-proxy:
-    image: docker.io/library/nginx:1.31.7@sha256:8632b3314d74c61f0e27f59055bab13f7793b988c94c090154d867bc29e0f39b
+    image: docker.io/library/nginx:1.31.8@sha256:165ddde8751e75a1c907d24ef10d9f6deb08b57e0fe56caf67512486aff76d82
     depends_on:
       keycloak:
         condition: service_started
