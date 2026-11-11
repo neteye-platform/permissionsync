@@ -1282,7 +1282,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "permissionsync"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "permissionsync-adapter-glpi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "hickory-net",
@@ -1343,7 +1343,7 @@ dependencies = [
 
 [[package]]
 name = "permissionsync-auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -1362,14 +1362,14 @@ dependencies = [
 
 [[package]]
 name = "permissionsync-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "permissionsync-inbound-http"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "josekit",
  "native-tls",
@@ -1386,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "permissionsync-orchestration"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "permissionsync-core",
  "permissionsync-routing",
@@ -1394,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "permissionsync-provider-generic-rest"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "hickory-net",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "permissionsync-routing"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "permissionsync-core",
 ]
