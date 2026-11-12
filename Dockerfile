@@ -32,7 +32,7 @@ RUN cargo build --release --locked --bin permissionsync
 # The runtime base provides glibc, libgcc, OpenSSL 3, zlib, and the system
 # trust store that the native-tls/OpenSSL stack this binary links against
 # needs. It contains no shell, package manager, compiler, or Cargo state.
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:cc66d222f0a7ec996b78a99fe76a969bc80b539a5016ad866c14d1949bc6d0ab AS runtime
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2 AS runtime
 
 # Only statically true metadata. Version, revision, and creation metadata come
 # from the publishing workflow, so a local build claims no release identity.
