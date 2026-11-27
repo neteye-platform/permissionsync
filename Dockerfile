@@ -13,7 +13,7 @@
 # that file stays the single declaration of the toolchain and a base-image bump
 # cannot change it.
 
-FROM docker.io/library/rust:1.100.0-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS build
+FROM docker.io/library/rust:1.100.0-trixie@sha256:e84068000361bf3d4a5ba2b7647f62893528b1eb9f847d7a23b493f5ce8ea254 AS build
 
 WORKDIR /src
 
@@ -32,7 +32,7 @@ RUN cargo build --release --locked --bin permissionsync
 # The runtime base provides glibc, libgcc, OpenSSL 3, zlib, and the system
 # trust store that the native-tls/OpenSSL stack this binary links against
 # needs. It contains no shell, package manager, compiler, or Cargo state.
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2 AS runtime
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:29ee70762214fe8190cea04ef1c0a84a8365879e047ce8f911ae5a5ab2355fa2 AS runtime
 
 # Only statically true metadata. Version, revision, and creation metadata come
 # from the publishing workflow, so a local build claims no release identity.
