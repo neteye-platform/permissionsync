@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 15
     env:
       # renovate: datasource=crate depName=cargo-deny versioning=semver
-      CARGO_DENY_VERSION: "0.22.0"
+      CARGO_DENY_VERSION: "0.22.2"
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

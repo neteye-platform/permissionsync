@@ -83,7 +83,7 @@ repos:
           - -strict
           - -summary
           - -kubernetes-version
-          - "1.37.2"
+          - "1.37.3"
 
   - repo: https://github.com/DavidAnson/markdownlint-cli2
     rev: d4df4cec471ce155946474590d7b95920f623ccb # frozen: v0.24.2
