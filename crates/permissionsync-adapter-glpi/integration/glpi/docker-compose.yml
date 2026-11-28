@@ -1,6 +1,6 @@
 services:
   db:
-    image: mariadb:13.0.2@sha256:54f493ea0d60b621a5bff84e5b20100f8b86b6efa6b79158e04756c5194a5e4d
+    image: mariadb:13.1.2@sha256:b7738e01f283ab4d79d96777a587bb8dc2ad057554a11231e7c8d363a5892e6d
     environment:
       MARIADB_ROOT_PASSWORD: ${GLPI_TEST_DB_ROOT_PASSWORD:?db root password required}
       MARIADB_DATABASE: glpi
@@ -43,7 +43,7 @@ services:
       - "127.0.0.1::80"
 
   tls-proxy:
-    image: nginx:1.31.9@sha256:84f7876d21d154885f99554d7ae325d8c2213f9169726ea7ab60642f2573a787
+    image: nginx:1.31.10@sha256:a786635fd3c7b9a57ea089ab1c0713e510f3b548b65fe699ce3d59e4a926b37e
     depends_on:
       glpi:
         condition: service_healthy
@@ -55,7 +55,7 @@ services:
       - "127.0.0.1::8443"
 
   cleanup-proxy:
-    image: nginx:1.31.9@sha256:84f7876d21d154885f99554d7ae325d8c2213f9169726ea7ab60642f2573a787
+    image: nginx:1.31.10@sha256:a786635fd3c7b9a57ea089ab1c0713e510f3b548b65fe699ce3d59e4a926b37e
     depends_on:
       glpi:
         condition: service_healthy
